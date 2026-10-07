@@ -1,0 +1,188 @@
+# ==============================================================================
+# Git Ignore - Agent-Native Web Search Engine
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Server-Only Heavy Layers & Large Datasets
+# ------------------------------------------------------------------------------
+models/
+raw-dataset/
+raw_dataset/
+datasets/
+corpus/
+dumps/
+
+# Large dataset files & formats
+*.parquet
+*.arrow
+*.jsonl
+*.warc
+*.warc.gz
+*.arc
+*.cdx
+*.csv
+*.tsv
+*.sql
+*.dump
+
+# ------------------------------------------------------------------------------
+# 2. Machine Learning Weights, Checkpoints & Embeddings
+# ------------------------------------------------------------------------------
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.weights
+checkpoints/
+
+# ------------------------------------------------------------------------------
+# 3. Images, Video, Audio & Scraped Media (Resource Consuming)
+# ------------------------------------------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.ico
+*.mp4
+*.webm
+*.mkv
+*.avi
+*.mov
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.aac
+
+# Preserve UI app specific vector icons and public static assets
+!ui/src/**/*.svg
+!ui/public/**/*.svg
+!ui/public/favicon.svg
+!ui/public/icons.svg
+!ui/public/satellite.svg
+
+# ------------------------------------------------------------------------------
+# 4. Crawl Caches, Indexes, Blobs & Storage
+# ------------------------------------------------------------------------------
+blob-cache/
+blob_cache/
+raw_cache/
+crawl_cache/
+storage/
+data/
+tantivy_index/
+index/
+indices/
+qdrant_storage/
+chroma/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.wal
+
+# ------------------------------------------------------------------------------
+# 5. Compressed Archives
+# ------------------------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.zst
+*.rar
+
+# ------------------------------------------------------------------------------
+# 6. Build Artifacts, Dependencies & Virtual Envs
+# ------------------------------------------------------------------------------
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+build/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+coverage/
+.coverage
+.coverage.*
+*.lcov
+.nyc_output/
+.pytest_cache/
+
+# ------------------------------------------------------------------------------
+# 7. Environment Variables, Secrets & Logs
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.log
+logs/
+
+# ------------------------------------------------------------------------------
+# 8. OS & Editor Artifacts
+# ------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.sublime-project
+*.sublime-workspace
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
