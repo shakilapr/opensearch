@@ -151,48 +151,45 @@ projects/search/
 
 ## 6. Synchronization & Deployment Workflows
 
-To keep local development in sync with the remote VPS (`85.137.250.157`), use one of the following methods:
+The project supports fully automated, private, continuous synchronization without requiring third-party Git hosts (no GitHub/GitLab needed):
 
-### Method 1: Remote Git (GitHub / GitLab) — Recommended
-This is the standard, cleanest workflow for continuous synchronization:
-1. **Push from Local PC:**
-   ```bash
-   git remote add origin https://github.com/<your-username>/search.git
-   git branch -M main
-   git push -u origin main
-   ```
-2. **Pull on the Server (`/root/projects/search`):**
-   ```bash
-   git clone https://github.com/<your-username>/search.git /root/projects/search
-   # To sync ongoing updates:
-   cd /root/projects/search && git pull origin main
-   ```
+### Method 1: Tailscale + Syncthing (Active & Recommended)
+Continuous peer-to-peer live synchronization running directly between Windows and Ubuntu:
+* **Transport:** Encrypted WireGuard / DERP relays over Tailscale.
+* **Auto-Sync:** Syncthing watches the filesystem in real time and automatically transfers modified files, branches, commits, and `.git/` history.
+* **Ignore Configuration (`.stignore`):**
+  ```text
+  /models
+  /raw-dataset
+  node_modules
+  dist
+  .vite
+  ```
+  *(Crucially, `.git/` is synchronized while server-only heavy assets remain on the VPS).*
+* **Workflow:**
+  ```text
+  Edit file locally
+  ↓
+  Syncthing detects file changes
+  ↓
+  Source code & .git history automatically synced to VPS
+  ↓
+  VPS has an identical working tree & commit log instantly
+  ```
 
 ### Method 2: Direct Sync via SSH / Rsync
-For direct machine-to-machine synchronization:
-1. Ensure the SSH daemon is active on the VPS:
-   ```bash
-   systemctl restart ssh && ufw allow 22/tcp
-   ```
-2. Sync directly from local terminal:
-   ```bash
-   rsync -avz --exclude-from=.gitignore ./ vpsgo:/root/projects/search/
-   # Or using scp:
-   scp -r * vpsgo:/root/projects/search/
-   ```
+For explicit batch deployments or script-driven synchronization:
+```bash
+# Push updates directly to the server
+rsync -avz --exclude-from=.gitignore ./ vpsgo:/root/projects/search/
+```
 
-### Method 3: Standalone Git Bundle (Instant via Web VS Code)
-Transfer the entire repository history in a single portable file:
-1. **Create bundle locally:**
-   ```bash
-   git bundle create search.bundle --all
-   ```
-2. Drag and drop `search.bundle` into [Web VS Code](https://code.hexxica.space).
-3. **Unpack in server terminal:**
-   ```bash
-   git clone search.bundle /root/projects/search
-   rm search.bundle
-   ```
+### Method 3: Remote Git (GitHub / GitLab)
+If collaborative remote hosting is desired:
+```bash
+git push origin main    # On PC
+git pull origin main    # On Server
+```
 
 ---
 
