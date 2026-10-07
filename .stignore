@@ -1,0 +1,13 @@
+# Syncthing Ignore Patterns for Search Project
+# Server-only directories (do not sync to Windows)
+/models
+/raw-dataset
+
+# Dependencies and build caches
+node_modules
+.vite
+dist
+
+# Temporary files
+*.tmp
+*.log
