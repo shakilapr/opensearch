@@ -149,7 +149,54 @@ projects/search/
 
 ---
 
-## 6. Quick Start
+## 6. Synchronization & Deployment Workflows
+
+To keep local development in sync with the remote VPS (`85.137.250.157`), use one of the following methods:
+
+### Method 1: Remote Git (GitHub / GitLab) — Recommended
+This is the standard, cleanest workflow for continuous synchronization:
+1. **Push from Local PC:**
+   ```bash
+   git remote add origin https://github.com/<your-username>/search.git
+   git branch -M main
+   git push -u origin main
+   ```
+2. **Pull on the Server (`/root/projects/search`):**
+   ```bash
+   git clone https://github.com/<your-username>/search.git /root/projects/search
+   # To sync ongoing updates:
+   cd /root/projects/search && git pull origin main
+   ```
+
+### Method 2: Direct Sync via SSH / Rsync
+For direct machine-to-machine synchronization:
+1. Ensure the SSH daemon is active on the VPS:
+   ```bash
+   systemctl restart ssh && ufw allow 22/tcp
+   ```
+2. Sync directly from local terminal:
+   ```bash
+   rsync -avz --exclude-from=.gitignore ./ vpsgo:/root/projects/search/
+   # Or using scp:
+   scp -r * vpsgo:/root/projects/search/
+   ```
+
+### Method 3: Standalone Git Bundle (Instant via Web VS Code)
+Transfer the entire repository history in a single portable file:
+1. **Create bundle locally:**
+   ```bash
+   git bundle create search.bundle --all
+   ```
+2. Drag and drop `search.bundle` into [Web VS Code](https://code.hexxica.space).
+3. **Unpack in server terminal:**
+   ```bash
+   git clone search.bundle /root/projects/search
+   rm search.bundle
+   ```
+
+---
+
+## 7. Quick Start
 
 ### Frontend (UI)
 ```bash
@@ -166,7 +213,7 @@ npm test
 
 ---
 
-## 7. Roadmap & Build Stages
+## 8. Roadmap & Build Stages
 
 * [x] **Stage 0: Core Architecture & Specifications** (Crawler & Engine specifications drafted).
 * [ ] **Stage 1: 10K LLM Search MVP** (Tantivy index, source registry, manual seeds, BM25 + graph).
@@ -174,3 +221,4 @@ npm test
 * [ ] **Stage 3: Live Freshness Loop** (Query-triggered background refresh and live results overlay).
 * [ ] **Stage 4: Agent Navigation** (Beam search path traversal with Hermes/OpenClaw policy adapters).
 * [ ] **Stage 5: Bootstrap Scaling (100K–1M Docs)** (Parquet-based streaming imports from Common Crawl & OpenAlex).
+
