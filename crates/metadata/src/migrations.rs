@@ -13,13 +13,14 @@
 //! edit a released version.
 
 /// Highest schema version known to this build.
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// Ordered `(version, DDL)` migrations. Kept as string constants so migration
 /// `0001` is byte-exact.
 pub const MIGRATIONS: &[(u64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_watermark.sql")),
+    (3, include_str!("../migrations/0003_stage1.sql")),
 ];
 
 /// Migration ledger: records the version of every migration already applied.

@@ -13,7 +13,10 @@ pub mod migrations;
 pub mod schema;
 pub mod writer;
 
-pub use schema::{DocVersionRow, FrontierRow, IngestEventRow, ManifestRow, ResourceRow};
+pub use schema::{
+    DocVersionRow, EntityAliasRow, EntityRow, FeedRow, FrontierRow, GraphEdgeRow, IngestEventRow,
+    ManifestRow, ResourceRow, SitemapRow, SourceProfileRow, WorkRow,
+};
 pub use writer::{
     spawn_writer, spawn_writer_with, MetadataReader, MetadataWriter, Mutation, WriterHandle,
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL_MS,

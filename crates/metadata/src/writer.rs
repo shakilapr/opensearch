@@ -99,6 +99,86 @@ pub enum Mutation {
         base_segments: i64,
         created_at: i64,
     },
+    /// Update the Stage-1 freshness columns of an existing `resource` row
+    /// (migration 0003). Each field is set only when `Some`, so callers can
+    /// touch one freshness signal without clobbering the others.
+    UpdateResourceFreshness {
+        resource_id: String,
+        published_at: Option<i64>,
+        modified_at: Option<i64>,
+        fetched_at: Option<i64>,
+        verified_at: Option<i64>,
+        feed_watermark: Option<i64>,
+    },
+    /// Upsert a sitemap row (idempotent on `sitemap_id`).
+    UpsertSitemap {
+        sitemap_id: String,
+        url: String,
+        source_url: Option<String>,
+        domain_id: Option<String>,
+        is_index: bool,
+        status: String,
+        url_count: i64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        fetched_at: Option<i64>,
+    },
+    /// Upsert a feed row (idempotent on `feed_id`).
+    UpsertFeed {
+        feed_id: String,
+        url: String,
+        domain_id: Option<String>,
+        title: Option<String>,
+        feed_type: String,
+        status: String,
+        entry_count: i64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        watermark: Option<String>,
+        fetched_at: Option<i64>,
+    },
+    /// Upsert a source profile (idempotent on `source_id`). `topics`,
+    /// `entities` and `url_patterns` are JSON-encoded TEXT arrays.
+    UpsertSourceProfile {
+        source_id: String,
+        domain: String,
+        topics: String,
+        entities: String,
+        url_patterns: String,
+        authority: f64,
+        change_rate: f64,
+        js_probability: f64,
+        fetch_count: i64,
+        error_count: i64,
+    },
+    /// Upsert an entity node (idempotent on `entity_id`).
+    UpsertEntity {
+        entity_id: String,
+        name: String,
+        kind: String,
+    },
+    /// Insert an entity alias (idempotent on `(entity_id, alias)`). Requires the
+    /// referenced entity to exist (FK).
+    UpsertEntityAlias { entity_id: String, alias: String },
+    /// Upsert a typed, weighted graph edge (idempotent on
+    /// `(from_id, to_id, kind)`); the weight is updated in place. Requires both
+    /// endpoint entities to exist (FK).
+    UpsertGraphEdge {
+        from_id: String,
+        to_id: String,
+        kind: String,
+        weight: f64,
+    },
+    /// Upsert a scholarly work (idempotent on `work_id`).
+    UpsertWork {
+        work_id: String,
+        id_kind: String,
+        identifier: String,
+        title: Option<String>,
+        published_at: Option<i64>,
+        modified_at: Option<i64>,
+        resource_id: Option<String>,
+    },
 }
 
 /// Opens (or creates) the metadata database with the required pragmas and
@@ -231,7 +311,8 @@ impl MetadataReader {
             .conn
             .query_row(
                 "SELECT resource_id, url, canonical_url, domain_id, source_id, kind,
-                        status, first_seen, last_fetch
+                        status, first_seen, last_fetch,
+                        published_at, modified_at, fetched_at, verified_at, feed_watermark
                  FROM resource WHERE resource_id = ?1",
                 rusqlite::params![resource_id],
                 map_resource_row,
@@ -269,6 +350,135 @@ impl MetadataReader {
             .map_err(crate::db_err)?;
         Ok(n)
     }
+
+    // --- Stage-1 lookups (migration 0003) ---------------------------------
+
+    /// Fetch one sitemap row by `sitemap_id`.
+    pub fn sitemap_by_id(&self, sitemap_id: &str) -> AppResult<Option<crate::schema::SitemapRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT sitemap_id, url, source_url, domain_id, is_index, status,
+                        url_count, etag, last_modified, fetched_at, created_at, updated_at
+                 FROM sitemap WHERE sitemap_id = ?1",
+                rusqlite::params![sitemap_id],
+                map_sitemap_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    /// Fetch one feed row by `feed_id`.
+    pub fn feed_by_id(&self, feed_id: &str) -> AppResult<Option<crate::schema::FeedRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT feed_id, url, domain_id, title, feed_type, status,
+                        entry_count, etag, last_modified, watermark, fetched_at,
+                        created_at, updated_at
+                 FROM feed WHERE feed_id = ?1",
+                rusqlite::params![feed_id],
+                map_feed_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    /// Fetch one source profile by `source_id`.
+    pub fn source_profile_by_id(
+        &self,
+        source_id: &str,
+    ) -> AppResult<Option<crate::schema::SourceProfileRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT source_id, domain, topics, entities, url_patterns, authority,
+                        change_rate, js_probability, fetch_count, error_count,
+                        created_at, updated_at
+                 FROM source_profile WHERE source_id = ?1",
+                rusqlite::params![source_id],
+                map_source_profile_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    /// Fetch one entity node by `entity_id`.
+    pub fn entity_by_id(&self, entity_id: &str) -> AppResult<Option<crate::schema::EntityRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT entity_id, name, kind, created_at, updated_at
+                 FROM entity WHERE entity_id = ?1",
+                rusqlite::params![entity_id],
+                map_entity_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    /// Aliases registered for one entity, ordered by alias.
+    pub fn entity_aliases(&self, entity_id: &str) -> AppResult<Vec<crate::schema::EntityAliasRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT entity_id, alias, created_at
+                 FROM entity_alias WHERE entity_id = ?1 ORDER BY alias ASC",
+            )
+            .map_err(crate::db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![entity_id], map_entity_alias_row)
+            .map_err(crate::db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::db_err)?;
+        Ok(rows)
+    }
+
+    /// Fetch one graph edge by its composite key.
+    pub fn graph_edge(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        kind: &str,
+    ) -> AppResult<Option<crate::schema::GraphEdgeRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT from_id, to_id, kind, weight, created_at, updated_at
+                 FROM graph_edge WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3",
+                rusqlite::params![from_id, to_id, kind],
+                map_graph_edge_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    /// Fetch one work row by `work_id`.
+    pub fn work_by_id(&self, work_id: &str) -> AppResult<Option<crate::schema::WorkRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT work_id, id_kind, identifier, title, published_at, modified_at,
+                        resource_id, created_at, updated_at
+                 FROM work WHERE work_id = ?1",
+                rusqlite::params![work_id],
+                map_work_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
 }
 
 fn map_resource_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::ResourceRow> {
@@ -282,6 +492,106 @@ fn map_resource_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::Re
         status: r.get(6)?,
         first_seen: r.get(7)?,
         last_fetch: r.get(8)?,
+        published_at: r.get(9)?,
+        modified_at: r.get(10)?,
+        fetched_at: r.get(11)?,
+        verified_at: r.get(12)?,
+        feed_watermark: r.get(13)?,
+    })
+}
+
+fn map_sitemap_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::SitemapRow> {
+    Ok(crate::schema::SitemapRow {
+        sitemap_id: r.get(0)?,
+        url: r.get(1)?,
+        source_url: r.get(2)?,
+        domain_id: r.get(3)?,
+        is_index: r.get(4)?,
+        status: r.get(5)?,
+        url_count: r.get(6)?,
+        etag: r.get(7)?,
+        last_modified: r.get(8)?,
+        fetched_at: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
+}
+
+fn map_feed_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::FeedRow> {
+    Ok(crate::schema::FeedRow {
+        feed_id: r.get(0)?,
+        url: r.get(1)?,
+        domain_id: r.get(2)?,
+        title: r.get(3)?,
+        feed_type: r.get(4)?,
+        status: r.get(5)?,
+        entry_count: r.get(6)?,
+        etag: r.get(7)?,
+        last_modified: r.get(8)?,
+        watermark: r.get(9)?,
+        fetched_at: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
+fn map_source_profile_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::SourceProfileRow> {
+    Ok(crate::schema::SourceProfileRow {
+        source_id: r.get(0)?,
+        domain: r.get(1)?,
+        topics: r.get(2)?,
+        entities: r.get(3)?,
+        url_patterns: r.get(4)?,
+        authority: r.get(5)?,
+        change_rate: r.get(6)?,
+        js_probability: r.get(7)?,
+        fetch_count: r.get(8)?,
+        error_count: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
+}
+
+fn map_entity_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::EntityRow> {
+    Ok(crate::schema::EntityRow {
+        entity_id: r.get(0)?,
+        name: r.get(1)?,
+        kind: r.get(2)?,
+        created_at: r.get(3)?,
+        updated_at: r.get(4)?,
+    })
+}
+
+fn map_entity_alias_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::EntityAliasRow> {
+    Ok(crate::schema::EntityAliasRow {
+        entity_id: r.get(0)?,
+        alias: r.get(1)?,
+        created_at: r.get(2)?,
+    })
+}
+
+fn map_graph_edge_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::GraphEdgeRow> {
+    Ok(crate::schema::GraphEdgeRow {
+        from_id: r.get(0)?,
+        to_id: r.get(1)?,
+        kind: r.get(2)?,
+        weight: r.get(3)?,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
+    })
+}
+
+fn map_work_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::schema::WorkRow> {
+    Ok(crate::schema::WorkRow {
+        work_id: r.get(0)?,
+        id_kind: r.get(1)?,
+        identifier: r.get(2)?,
+        title: r.get(3)?,
+        published_at: r.get(4)?,
+        modified_at: r.get(5)?,
+        resource_id: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
     })
 }
 
@@ -673,6 +983,227 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                  VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5)
                  ON CONFLICT(manifest_id) DO NOTHING",
                 rusqlite::params![manifest_id, generation, doc_count, base_segments, created_at],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpdateResourceFreshness {
+            resource_id,
+            published_at,
+            modified_at,
+            fetched_at,
+            verified_at,
+            feed_watermark,
+        } => {
+            // Set only the provided signals (COALESCE keeps the rest), so a
+            // caller can refresh one field without clearing the others.
+            tx.execute(
+                "UPDATE resource SET
+                    published_at   = COALESCE(?2, published_at),
+                    modified_at    = COALESCE(?3, modified_at),
+                    fetched_at     = COALESCE(?4, fetched_at),
+                    verified_at    = COALESCE(?5, verified_at),
+                    feed_watermark = COALESCE(?6, feed_watermark)
+                 WHERE resource_id = ?1",
+                rusqlite::params![
+                    resource_id,
+                    published_at,
+                    modified_at,
+                    fetched_at,
+                    verified_at,
+                    feed_watermark
+                ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertSitemap {
+            sitemap_id,
+            url,
+            source_url,
+            domain_id,
+            is_index,
+            status,
+            url_count,
+            etag,
+            last_modified,
+            fetched_at,
+        } => {
+            tx.execute(
+                "INSERT INTO sitemap(sitemap_id, url, source_url, domain_id, is_index,
+                        status, url_count, etag, last_modified, fetched_at,
+                        created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                 ON CONFLICT(sitemap_id) DO UPDATE SET
+                    url=excluded.url, source_url=excluded.source_url,
+                    domain_id=excluded.domain_id, is_index=excluded.is_index,
+                    status=excluded.status, url_count=excluded.url_count,
+                    etag=excluded.etag, last_modified=excluded.last_modified,
+                    fetched_at=excluded.fetched_at, updated_at=excluded.updated_at",
+                rusqlite::params![
+                    sitemap_id,
+                    url,
+                    source_url,
+                    domain_id,
+                    is_index,
+                    status,
+                    url_count,
+                    etag,
+                    last_modified,
+                    fetched_at,
+                    now
+                ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertFeed {
+            feed_id,
+            url,
+            domain_id,
+            title,
+            feed_type,
+            status,
+            entry_count,
+            etag,
+            last_modified,
+            watermark,
+            fetched_at,
+        } => {
+            tx.execute(
+                "INSERT INTO feed(feed_id, url, domain_id, title, feed_type, status,
+                        entry_count, etag, last_modified, watermark, fetched_at,
+                        created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                 ON CONFLICT(feed_id) DO UPDATE SET
+                    url=excluded.url, domain_id=excluded.domain_id,
+                    title=excluded.title, feed_type=excluded.feed_type,
+                    status=excluded.status, entry_count=excluded.entry_count,
+                    etag=excluded.etag, last_modified=excluded.last_modified,
+                    watermark=excluded.watermark, fetched_at=excluded.fetched_at,
+                    updated_at=excluded.updated_at",
+                rusqlite::params![
+                    feed_id,
+                    url,
+                    domain_id,
+                    title,
+                    feed_type,
+                    status,
+                    entry_count,
+                    etag,
+                    last_modified,
+                    watermark,
+                    fetched_at,
+                    now
+                ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertSourceProfile {
+            source_id,
+            domain,
+            topics,
+            entities,
+            url_patterns,
+            authority,
+            change_rate,
+            js_probability,
+            fetch_count,
+            error_count,
+        } => {
+            tx.execute(
+                "INSERT INTO source_profile(source_id, domain, topics, entities,
+                        url_patterns, authority, change_rate, js_probability,
+                        fetch_count, error_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    domain=excluded.domain, topics=excluded.topics,
+                    entities=excluded.entities, url_patterns=excluded.url_patterns,
+                    authority=excluded.authority, change_rate=excluded.change_rate,
+                    js_probability=excluded.js_probability,
+                    fetch_count=excluded.fetch_count, error_count=excluded.error_count,
+                    updated_at=excluded.updated_at",
+                rusqlite::params![
+                    source_id,
+                    domain,
+                    topics,
+                    entities,
+                    url_patterns,
+                    authority,
+                    change_rate,
+                    js_probability,
+                    fetch_count,
+                    error_count,
+                    now
+                ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertEntity {
+            entity_id,
+            name,
+            kind,
+        } => {
+            tx.execute(
+                "INSERT INTO entity(entity_id, name, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(entity_id) DO UPDATE SET
+                    name=excluded.name, kind=excluded.kind, updated_at=excluded.updated_at",
+                rusqlite::params![entity_id, name, kind, now],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertEntityAlias { entity_id, alias } => {
+            // Alias rows are immutable identity facts: a duplicate is a no-op.
+            tx.execute(
+                "INSERT INTO entity_alias(entity_id, alias, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(entity_id, alias) DO NOTHING",
+                rusqlite::params![entity_id, alias, now],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertGraphEdge {
+            from_id,
+            to_id,
+            kind,
+            weight,
+        } => {
+            tx.execute(
+                "INSERT INTO graph_edge(from_id, to_id, kind, weight, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                    weight=excluded.weight, updated_at=excluded.updated_at",
+                rusqlite::params![from_id, to_id, kind, weight, now],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertWork {
+            work_id,
+            id_kind,
+            identifier,
+            title,
+            published_at,
+            modified_at,
+            resource_id,
+        } => {
+            tx.execute(
+                "INSERT INTO work(work_id, id_kind, identifier, title, published_at,
+                        modified_at, resource_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(work_id) DO UPDATE SET
+                    id_kind=excluded.id_kind, identifier=excluded.identifier,
+                    title=excluded.title, published_at=excluded.published_at,
+                    modified_at=excluded.modified_at,
+                    resource_id=COALESCE(excluded.resource_id, work.resource_id),
+                    updated_at=excluded.updated_at",
+                rusqlite::params![
+                    work_id,
+                    id_kind,
+                    identifier,
+                    title,
+                    published_at,
+                    modified_at,
+                    resource_id,
+                    now
+                ],
             )
             .map_err(crate::db_err)?;
         }
