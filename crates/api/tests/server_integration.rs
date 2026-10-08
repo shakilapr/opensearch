@@ -3,7 +3,7 @@
 
 use search_api::{router, AppState, IndexHit, Searcher};
 use search_core::contract::Signal;
-use search_core::{AppError, AppResult, IndexManifest, Provenance};
+use search_core::{AppError, AppResult, IndexManifest, Provenance, SearchFilters};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -26,6 +26,8 @@ impl StubSearcher {
                 title: format!("rust doc {i}"),
                 snippet: format!("snippet about rust number {i}"),
                 source_id: Some("stub".into()),
+                doc_type: Some("html".into()),
+                language: Some("en".into()),
                 published_at: Some(1_700_000_000 + i as i64),
                 modified_at: None,
                 fetched_at: 1_700_000_500,
@@ -44,12 +46,21 @@ impl StubSearcher {
 }
 
 impl Searcher for StubSearcher {
-    fn search(&self, q: &str, limit: usize) -> AppResult<Vec<IndexHit>> {
+    fn search(
+        &self,
+        q: &str,
+        limit: usize,
+        filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
         let q = q.to_lowercase();
         let mut v: Vec<IndexHit> = self
             .hits
             .iter()
             .filter(|h| h.title.to_lowercase().contains(&q))
+            .filter(|h| match filters.and_then(|f| f.source_id.as_deref()) {
+                Some(src) => h.source_id.as_deref() == Some(src),
+                None => true,
+            })
             .cloned()
             .collect();
         v.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
@@ -75,8 +86,26 @@ impl Searcher for StubSearcher {
 /// A searcher that always fails, to exercise error mapping.
 struct FailingSearcher;
 impl Searcher for FailingSearcher {
-    fn search(&self, _q: &str, _limit: usize) -> AppResult<Vec<IndexHit>> {
+    fn search(
+        &self,
+        _q: &str,
+        _limit: usize,
+        _filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
         Err(AppError::Internal("boom".into()))
+    }
+}
+
+/// A searcher that always reports `AppError::Deadline` from `search`.
+struct DeadlineSearcher;
+impl Searcher for DeadlineSearcher {
+    fn search(
+        &self,
+        _q: &str,
+        _limit: usize,
+        _filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        Err(AppError::Deadline)
     }
 }
 
@@ -85,12 +114,31 @@ struct SlowSearcher {
     inner: StubSearcher,
 }
 impl Searcher for SlowSearcher {
-    fn search(&self, q: &str, limit: usize) -> AppResult<Vec<IndexHit>> {
+    fn search(
+        &self,
+        q: &str,
+        limit: usize,
+        filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
         std::thread::sleep(std::time::Duration::from_millis(400));
-        self.inner.search(q, limit)
+        self.inner.search(q, limit, filters)
     }
     fn manifest(&self) -> AppResult<IndexManifest> {
         self.inner.manifest()
+    }
+}
+
+/// A searcher that sleeps long enough for any small deadline to be blown.
+struct SleepySearcher;
+impl Searcher for SleepySearcher {
+    fn search(
+        &self,
+        _q: &str,
+        _limit: usize,
+        _filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        Ok(Vec::new())
     }
 }
 
@@ -244,4 +292,51 @@ async fn saturating_concurrency_sheds_with_429() {
         shed >= 1,
         "a saturated server must shed load with 429 (ok={ok}, shed={shed})"
     );
+}
+
+#[tokio::test]
+async fn deadline_maps_to_504() {
+    // A searcher that reports `Deadline` maps straight to 504.
+    let addr = boot(Arc::new(DeadlineSearcher)).await;
+    let (s, b) = call(addr, "POST", "/search", Some(r#"{"query":"rust"}"#)).await;
+    assert_eq!(s, 504, "body: {b}");
+    assert!(b["error"].as_str().unwrap().contains("deadline"));
+
+    // A search that overruns its `deadline_ms` budget is turned into 504 by the
+    // API itself, not by the searcher.
+    let addr = boot(Arc::new(SleepySearcher)).await;
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","deadline_ms":1}"#),
+    )
+    .await;
+    assert_eq!(s, 504, "body: {b}");
+}
+
+#[tokio::test]
+async fn search_filters_are_applied_over_http() {
+    let addr = boot(Arc::new(StubSearcher::new(20))).await;
+    // The stub is tagged source_id "stub"; a matching filter keeps results...
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","filters":{"source_id":"stub"}}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "body: {b}");
+    assert!(!b["results"].as_array().unwrap().is_empty());
+
+    // ...and a non-matching source filter drops every hit.
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","filters":{"source_id":"nowhere"}}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "body: {b}");
+    assert!(b["results"].as_array().unwrap().is_empty());
 }

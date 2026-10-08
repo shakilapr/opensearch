@@ -24,3 +24,6 @@ tokio.workspace = true
 axum.workspace = true
 tower = { version = "0.5", features = ["limit", "load-shed"] }
 search-indexer = { path = "../indexer", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
