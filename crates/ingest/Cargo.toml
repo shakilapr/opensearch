@@ -1,0 +1,21 @@
+[package]
+name = "search-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "search_ingest"
+path = "src/lib.rs"
+
+[dependencies]
+search-core = { path = "../core" }
+search-metadata = { path = "../metadata" }
+search-indexer = { path = "../indexer" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true

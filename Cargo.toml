@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/metadata",
+    "crates/ingest",
+    "crates/frontier",
+    "crates/fetcher",
+    "crates/indexer",
+    "crates/api",
+    "crates/agent0",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+url = "2"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tantivy = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "brotli", "rustls-tls", "stream"] }
+axum = "0.7"
+scraper = "0.20"
+html-escape = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

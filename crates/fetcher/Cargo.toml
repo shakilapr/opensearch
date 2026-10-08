@@ -1,0 +1,26 @@
+[package]
+name = "search-fetcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "search_fetcher"
+path = "src/lib.rs"
+
+[dependencies]
+search-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+url.workspace = true
+reqwest.workspace = true
+scraper.workspace = true
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

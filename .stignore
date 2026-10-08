@@ -1,12 +1,24 @@
-# Syncthing Ignore Patterns for Search Project
-# Server-only directories (do not sync to Windows)
+# Syncthing Ignore Patterns — server-only, never sync runtime state
+# (WAL SQLite and Tantivy MmapDirectory corrupt if copied mid-write)
 /models
 /raw-dataset
+/data
+/blobs
+/tantivy_index
+/var
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sync-conflict-*
 
 # Dependencies and build caches
 node_modules
 .vite
 dist
+target
 
 # Temporary files
 *.tmp

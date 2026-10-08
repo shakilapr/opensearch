@@ -1,0 +1,25 @@
+[package]
+name = "search-agent0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent0"
+path = "src/main.rs"
+
+[dependencies]
+search-core = { path = "../core" }
+search-metadata = { path = "../metadata" }
+search-ingest = { path = "../ingest" }
+search-indexer = { path = "../indexer" }
+search-frontier = { path = "../frontier" }
+search-fetcher = { path = "../fetcher" }
+search-api = { path = "../api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

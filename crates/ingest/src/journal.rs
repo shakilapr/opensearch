@@ -1,0 +1,52 @@
+//! Ingest journal + state machine types (spec §3). OWNER: ingest agent.
+
+use serde::{Deserialize, Serialize};
+
+/// The strictly ordered ingestion lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IngestStage {
+    Fetched,
+    Normalized,
+    BlobWritten,
+    MetadataCommitted,
+    LexicalIndexed,
+    GraphIndexed,
+    Visible,
+}
+
+impl IngestStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IngestStage::Fetched => "FETCHED",
+            IngestStage::Normalized => "NORMALIZED",
+            IngestStage::BlobWritten => "BLOB_WRITTEN",
+            IngestStage::MetadataCommitted => "METADATA_COMMITTED",
+            IngestStage::LexicalIndexed => "LEXICAL_INDEXED",
+            IngestStage::GraphIndexed => "GRAPH_INDEXED",
+            IngestStage::Visible => "VISIBLE",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "FETCHED" => IngestStage::Fetched,
+            "NORMALIZED" => IngestStage::Normalized,
+            "BLOB_WRITTEN" => IngestStage::BlobWritten,
+            "METADATA_COMMITTED" => IngestStage::MetadataCommitted,
+            "LEXICAL_INDEXED" => IngestStage::LexicalIndexed,
+            "GRAPH_INDEXED" => IngestStage::GraphIndexed,
+            "VISIBLE" => IngestStage::Visible,
+            _ => return None,
+        })
+    }
+}
+
+/// A single idempotency key's progress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestState {
+    pub op_key: String,
+    pub resource_id: String,
+    pub docver_id: Option<String>,
+    pub stage: IngestStage,
+}
