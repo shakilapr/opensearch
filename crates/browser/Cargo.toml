@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 # Real Chromium driver. Off by default so the workspace builds without a browser.
-chromium = ["dep:chromiumoxide"]
+chromium = ["dep:chromiumoxide", "dep:futures"]
 
 [dependencies]
 search-core = { path = "../core" }
@@ -16,6 +16,7 @@ serde.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 chromiumoxide = { version = "0.7", optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
