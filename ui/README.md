@@ -62,3 +62,27 @@ npm run build
 # Preview Production Build
 npm run preview
 ```
+
+---
+
+## 🔌 API base (`VITE_API_BASE`) — build & serve
+
+The client (`src/services/hexxicaClient.ts`) resolves its API base from the Vite
+env var `VITE_API_BASE`, falling back to `http://127.0.0.1:8080`. Set it before
+`vite build` (Vite inlines `import.meta.env.*` at build time — it is **not** read
+at runtime, so changing it requires a rebuild):
+
+```bash
+# Local development: talk to a locally running search-api.
+VITE_API_BASE=http://127.0.0.1:8080 npm run dev
+
+# Production: build same-origin (empty value) and let nginx proxy /search and
+# /health to the search-api — see deploy/nginx.conf.
+VITE_API_BASE= npm run build && npm run deploy   # copies dist/* to /var/www/search
+```
+
+When deployed behind nginx, `/search` and `/health` are reverse-proxied to
+`127.0.0.1:8080`, so an empty `VITE_API_BASE` (same-origin) is the recommended
+production setting. If the UI and API live on different hosts, set
+`VITE_API_BASE` to the API origin, e.g. `https://search-api.example.com`.
+

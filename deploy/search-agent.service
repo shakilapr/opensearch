@@ -1,0 +1,30 @@
+[Unit]
+Description=Search agent — crawl/index pipeline + HTTP search-api (agent0 serve)
+Documentation=https://github.com/agent-native-search
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=search
+Group=search
+WorkingDirectory=/opt/search
+# The data root MUST live outside any synced path: WAL SQLite and Tantivy's
+# MmapDirectory corrupt if copied mid-write (see search_core::Config).
+Environment=SEARCH_DATA_DIR=/var/lib/search
+Environment=SEARCH_BIND=127.0.0.1:8080
+Environment=RUST_LOG=info
+ExecStart=/opt/search/bin/agent0 serve
+Restart=on-failure
+RestartSec=5
+
+# The index is a live mmap + WAL database: keep the sandbox tight.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/search
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

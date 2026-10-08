@@ -1,0 +1,29 @@
+[Unit]
+Description=Search HTTP API (agent0 serve) — /search and /health, fronted by nginx
+Documentation=https://github.com/agent-native-search
+After=network-online.target
+Wants=network-online.target
+# Order after the index-owning agent service when both run on one host.
+After=search-agent.service
+
+[Service]
+Type=simple
+User=search
+Group=search
+WorkingDirectory=/opt/search
+Environment=SEARCH_DATA_DIR=/var/lib/search
+Environment=SEARCH_BIND=127.0.0.1:8080
+Environment=RUST_LOG=info
+ExecStart=/opt/search/bin/agent0 serve
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/search
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

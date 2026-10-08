@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "search_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "search-mcp"
 path = "src/main.rs"
@@ -12,3 +16,6 @@ path = "src/main.rs"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The `search-mcp` binary is a thin loopback client of the HTTP search-api.
+# `blocking` gives the stdio loop a synchronous client (no async runtime here).
+reqwest = { workspace = true, features = ["blocking", "json"] }
