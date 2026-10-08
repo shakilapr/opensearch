@@ -28,6 +28,8 @@ search-sources = { path = "../sources" }
 search-retrieval = { path = "../retrieval" }
 # Stage-3 freshness scheduler wired into the crawl loop.
 search-scheduler = { path = "../scheduler" }
+# Stage-4 deep navigation (Navigator + SearchExecutor over the index).
+search-nav = { path = "../nav" }
 # `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
 # (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
 search-api = { path = "../api", features = ["real-indexer"] }

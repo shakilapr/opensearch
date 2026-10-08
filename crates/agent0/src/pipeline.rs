@@ -306,6 +306,17 @@ impl Pipeline {
         Ok(ResourceId::from_canonical_url(&canonical).into_string())
     }
 
+    /// Run `f` against the single-writer metadata connection while holding the
+    /// lock. Used by read-side queries (e.g. `read_doc`) that must not race the
+    /// writer.
+    pub(crate) fn with_meta_conn<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let w = self.meta.lock().unwrap();
+        f(w.conn())
+    }
+
     /// Run a `/search` query against the live index, through the source-first
     /// lane so results can carry a `source_first` provenance signal.
     pub async fn search(&self, q: &str, limit: usize) -> AppResult<SearchResponse> {

@@ -13,14 +13,16 @@
 //! ```
 //!
 //! The `search-mcp` binary wires [`Backend`] to the local HTTP search-api
-//! (`src/main.rs`); tests wire it to a fake backend.
+//! ([`http::HttpBackend`]); tests wire it to a fake backend.
 
 #![forbid(unsafe_code)]
 
 pub mod backend;
 pub mod error;
+pub mod http;
 pub mod protocol;
 
 pub use backend::{Backend, DeepResult, DocText, Hit};
 pub use error::McpError;
+pub use http::HttpBackend;
 pub use protocol::{handle_line, serve, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};

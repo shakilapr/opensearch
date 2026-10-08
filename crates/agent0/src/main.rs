@@ -148,7 +148,12 @@ async fn run_serve() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(e) = search_api::serve(&cfg, pipeline.searcher()).await {
+    let pipeline = std::sync::Arc::new(pipeline);
+    let searcher = pipeline.searcher();
+    // Deep search / document read are served from the same pipeline instance.
+    let deep: std::sync::Arc<dyn search_api::DeepSearcher + Send + Sync> =
+        std::sync::Arc::new(search_agent0::PipelineDeepSearcher::new(pipeline.clone()));
+    if let Err(e) = search_api::serve(&cfg, searcher, Some(deep)).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);
     }

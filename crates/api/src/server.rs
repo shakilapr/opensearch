@@ -5,9 +5,10 @@
 //! concurrency + load-shed layer bounds in-flight requests so the process can't
 //! be flooded; saturated capacity sheds with `429`.
 
-use crate::query::{self, Searcher};
+use crate::deep::{DeepSearchRequest, DeepSearchResponse, DeepSearcher, DocResponse};
+use crate::query::{self, Searcher, DEFAULT_LIMIT};
 use axum::{
-    extract::{rejection::JsonRejection, State},
+    extract::{rejection::JsonRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -15,6 +16,7 @@ use axum::{
 };
 use search_core::config::Config;
 use search_core::{AppError, AppResult, SearchRequest, SearchResponse};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,6 +31,8 @@ pub struct AppState {
 
 pub struct Inner {
     pub searcher: Arc<dyn Searcher + Send + Sync>,
+    /// Optional deep-search / document-read capability (`/search_deep`, `/read`).
+    deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     started: Instant,
 }
 
@@ -37,6 +41,21 @@ impl AppState {
         Self {
             inner: Arc::new(Inner {
                 searcher,
+                deep: None,
+                started: Instant::now(),
+            }),
+        }
+    }
+
+    /// Build state that also serves `/search_deep` and `/read`.
+    pub fn with_deep(
+        searcher: Arc<dyn Searcher + Send + Sync>,
+        deep: Arc<dyn DeepSearcher + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                searcher,
+                deep: Some(deep),
                 started: Instant::now(),
             }),
         }
@@ -44,6 +63,11 @@ impl AppState {
 
     pub fn searcher(&self) -> &(dyn Searcher + Send + Sync) {
         self.inner.searcher.as_ref()
+    }
+
+    /// The deep-search backend, when one was configured.
+    pub fn deep(&self) -> Option<&(dyn DeepSearcher + Send + Sync)> {
+        self.inner.deep.as_deref()
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -86,6 +110,14 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    /// The deep-search backend was not configured for this server.
+    fn unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "deep search is not configured on this server".to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -114,6 +146,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/search", post(search))
+        .route("/search_deep", post(search_deep))
+        .route("/read", get(read_doc))
         .layer(bounded)
         .with_state(state)
 }
@@ -148,9 +182,84 @@ async fn search(
     Ok(Json(resp))
 }
 
+/// `POST /search_deep` — navigation-driven search returning hits + trace.
+async fn search_deep(
+    State(state): State<AppState>,
+    req: Result<Json<DeepSearchRequest>, JsonRejection>,
+) -> Result<Json<DeepSearchResponse>, ApiError> {
+    let Json(req) = req.map_err(ApiError::from_rejection)?;
+
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "query must not be empty".to_string(),
+        });
+    }
+    let limit = query::normalize_limit(req.limit.unwrap_or(DEFAULT_LIMIT))
+        .map_err(ApiError::from_app)?;
+
+    let deep = state
+        .inner
+        .deep
+        .clone()
+        .ok_or_else(ApiError::unavailable)?;
+    // Navigation runs synchronous index searches: keep it off the async workers.
+    let resp = tokio::task::spawn_blocking(move || deep.deep_search(&query, limit))
+        .await
+        .map_err(|e| ApiError::internal(format!("deep search task panicked: {e}")))?
+        .map_err(ApiError::from_app)?;
+
+    Ok(Json(resp))
+}
+
+/// Query parameters for `GET /read`.
+#[derive(Debug, Deserialize)]
+struct ReadParams {
+    doc_id: Option<String>,
+}
+
+/// `GET /read?doc_id=` — the normalized text of a previously-seen document.
+async fn read_doc(
+    State(state): State<AppState>,
+    Query(params): Query<ReadParams>,
+) -> Result<Json<DocResponse>, ApiError> {
+    let doc_id = params
+        .doc_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "missing required query parameter 'doc_id'".to_string(),
+        })?;
+
+    let deep = state
+        .inner
+        .deep
+        .clone()
+        .ok_or_else(ApiError::unavailable)?;
+    let resp = tokio::task::spawn_blocking(move || deep.read(&doc_id))
+        .await
+        .map_err(|e| ApiError::internal(format!("read task panicked: {e}")))?
+        .map_err(ApiError::from_app)?;
+
+    Ok(Json(resp))
+}
+
 /// Bind and serve until the process is stopped.
-pub async fn serve(cfg: &Config, searcher: Arc<dyn Searcher + Send + Sync>) -> AppResult<()> {
-    let app = router(AppState::new(searcher));
+///
+/// `deep` optionally enables `/search_deep` and `/read`; when `None` those
+/// routes answer `503`.
+pub async fn serve(
+    cfg: &Config,
+    searcher: Arc<dyn Searcher + Send + Sync>,
+    deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
+) -> AppResult<()> {
+    let state = match deep {
+        Some(d) => AppState::with_deep(searcher, d),
+        None => AppState::new(searcher),
+    };
+    let app = router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .map_err(|e| AppError::Config(format!("failed to bind {}: {e}", cfg.bind)))?;
