@@ -19,10 +19,12 @@ use std::sync::Arc;
 #[cfg(feature = "real-indexer")]
 mod indexer_adapter;
 mod memory;
+mod sparse;
 
 #[cfg(feature = "real-indexer")]
 pub use indexer_adapter::IndexerLaneSearcher;
 pub use memory::{MemoryDoc, MemoryLaneSearcher};
+pub use sparse::SparseExpander;
 
 /// Which retrieval lane produced a candidate.
 ///
