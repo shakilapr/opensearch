@@ -338,19 +338,15 @@ impl Pipeline {
         // Publish manifest + watermark, then VISIBLE.
         let manifest = self.indexer.publish_manifest()?;
         {
-            let w = self.meta.lock().unwrap();
+            let mut w = self.meta.lock().unwrap();
             Watermark::publish(&w, manifest.generation)?;
-            let _ = w.conn().execute(
-                "INSERT INTO manifest(manifest_id, generation, published, doc_count, base_segments, created_at, published_at)
-                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5) ON CONFLICT(manifest_id) DO NOTHING",
-                params![
-                    manifest.manifest_id,
-                    manifest.generation as i64,
-                    manifest.doc_count as i64,
-                    manifest.base_segments as i64,
-                    now
-                ],
-            );
+            w.apply_batch(&[Mutation::UpsertManifest {
+                manifest_id: manifest.manifest_id.clone(),
+                generation: manifest.generation as i64,
+                doc_count: manifest.doc_count as i64,
+                base_segments: manifest.base_segments as i64,
+                created_at: now,
+            }])?;
         }
         self.record_stage(&op_key, resource_id.as_str(), IngestStage::Visible)?;
         if let Some(l) = &lease {
@@ -533,35 +529,29 @@ impl Pipeline {
             },
         ])?;
 
-        // GAP: `Mutation` has no `UpsertContent` variant, but `document_version`
-        // has an FK to `content(content_id)`. The driver inserts the content row
-        // directly on the single writer connection.
-        w.conn()
-            .execute(
-                "INSERT INTO content(content_id, exact_hash, text_path, byte_len, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(content_id) DO NOTHING",
-                params![
-                    content_id.as_str(),
-                    hex,
-                    text_path,
-                    doc.text_len as i64,
-                    now
-                ],
-            )
-            .map_err(search_metadata::db_err)?;
-
-        w.apply_batch(&[Mutation::UpsertDocumentVersion {
-            docver_id: docver_id.as_str().to_string(),
-            resource_id: resource_id.as_str().to_string(),
-            version_no: version_no as i64,
-            content_id: Some(content_id.as_str().to_string()),
-            title: doc.title.clone(),
-            body_hash: None,
-            parser_version: PARSER_VERSION.to_string(),
-            published_at: doc.published_at,
-            modified_at: doc.modified_at,
-            fetched_at: now,
-        }])?;
+        // Content must exist before its `document_version` FK resolves, so the
+        // content upsert and the version insert share one atomic batch (applied
+        // in order inside a single transaction).
+        w.apply_batch(&[
+            Mutation::UpsertContent {
+                content_id: content_id.as_str().to_string(),
+                exact_hash: hex,
+                text_path: Some(text_path),
+                byte_len: doc.text_len as i64,
+            },
+            Mutation::UpsertDocumentVersion {
+                docver_id: docver_id.as_str().to_string(),
+                resource_id: resource_id.as_str().to_string(),
+                version_no: version_no as i64,
+                content_id: Some(content_id.as_str().to_string()),
+                title: doc.title.clone(),
+                body_hash: None,
+                parser_version: PARSER_VERSION.to_string(),
+                published_at: doc.published_at,
+                modified_at: doc.modified_at,
+                fetched_at: now,
+            },
+        ])?;
         Ok(())
     }
 }
@@ -637,5 +627,36 @@ fn classify_status(status: u16, url: &str) -> AppError {
         429 => AppError::LimitExceeded(format!("HTTP 429 (rate limited) for {url}")),
         400..=499 => AppError::Network(format!("HTTP {status} (client error) for {url}")),
         _ => AppError::Network(format!("HTTP {status} (server error) for {url}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The single-writer contract: every content/manifest write must go through
+    /// the `Mutation` API, never a raw SQL statement smuggled onto
+    /// `MetadataWriter::conn()`. This compiles the driver's own source in and
+    /// asserts the forbidden raw SQL is absent.
+    #[test]
+    fn writes_content_and_manifest_only_via_mutation_api() {
+        let src = include_str!("pipeline.rs");
+        // Built from parts so this test's own literals are not self-matching.
+        let content_insert = concat!("INSERT INTO ", "content");
+        let manifest_insert = concat!("INSERT INTO ", "manifest");
+        assert!(
+            !src.contains(content_insert),
+            "content must be written via Mutation::UpsertContent, not raw SQL"
+        );
+        assert!(
+            !src.contains(manifest_insert),
+            "the manifest row must be published via Mutation::UpsertManifest, not raw SQL"
+        );
+        assert!(
+            src.contains("Mutation::UpsertContent"),
+            "the content path uses the single-writer API"
+        );
+        assert!(
+            src.contains("Mutation::UpsertManifest"),
+            "the manifest path uses the single-writer API"
+        );
     }
 }
