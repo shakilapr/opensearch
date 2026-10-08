@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Wiring to the real Tantivy indexer lives behind this feature so the default crate (and
+# the whole workspace build) never depends on the indexer/Tantivy. Off by default; the
+# adapter in src/indexer_adapter.rs is compiled only when enabled.
+real-indexer = ["dep:search-indexer"]
+
 [dependencies]
 search-core = { path = "../core" }
-search-indexer = { path = "../indexer" }
+search-indexer = { path = "../indexer", optional = true }
 search-graph = { path = "../graph" }
 thiserror.workspace = true
 tracing.workspace = true
