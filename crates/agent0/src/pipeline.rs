@@ -52,6 +52,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use url::Url;
 
 use search_api::query::{IndexHit, Searcher};
@@ -78,6 +79,10 @@ use search_parser::NormalizedDoc;
 use search_pdf::PdfLimits;
 use search_retrieval::{Candidate, Lane, LaneSearcher, RetrievalError, SourceFirst};
 use search_router::{classify, Route};
+use search_scheduler::{
+    change_probability, classify_source, is_time_sensitive, Activation, ActivationScheduler,
+    BudgetLedger, SchedulerConfig, SourceDue,
+};
 use search_sources::SourceProfile;
 
 /// Bumped when the Stage-0 HTML normalization contract changes.
@@ -92,6 +97,15 @@ const MAX_FEEDS: usize = 8;
 const MAX_DISCOVERED_RESOURCES: usize = 512;
 /// Bound on how many sources the source-first lane will scope to per query.
 const MAX_SOURCE_FIRST_SOURCES: usize = 8;
+
+/// Default Stage-3 refresh budget (units == live refresh fetches) charged before
+/// dispatch. Generous enough for a long crawl session; overridable per pipeline.
+pub const DEFAULT_REFRESH_BUDGET: u64 = 10_000;
+/// P(changed) at which the learned change model schedules a source for refresh
+/// (the inverse of [`change_probability`] gives the due horizon).
+const DUE_PROB: f64 = 0.5;
+/// Cap on the candidate URLs offered to a single query-triggered refresh.
+const MAX_REFRESH_CANDIDATES: usize = 64;
 
 /// The result of one [`Pipeline::crawl_one`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +182,28 @@ pub struct DiscoveryReport {
     pub resources: usize,
 }
 
+/// Summary of one refresh pass (one [`Pipeline::run_refresh_tick`] or
+/// [`Pipeline::query_refresh`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RefreshReport {
+    /// Activations the scheduler admitted (charged + given a fan-out slot).
+    pub admitted: usize,
+    /// Admitted activations skipped because the dispatch budget refused them.
+    pub skipped: usize,
+    /// Activations whose fetch completed (a 304 still counts here).
+    pub fetched: usize,
+    /// Completed fetches that produced no new document (304 or identical bytes).
+    pub unchanged: usize,
+    /// Completed fetches that produced a new, searchable document version.
+    pub new_documents: usize,
+    /// Early aborts whose budget unit was refunded.
+    pub refunded: usize,
+    /// URLs actually attempted, in dispatch order.
+    pub activations: Vec<String>,
+    /// `(url, error)` for aborted dispatches.
+    pub errors: Vec<(String, String)>,
+}
+
 /// The runnable pipeline.
 ///
 /// One process owns the metadata writer (`SQLite` single-writer rule): the
@@ -186,6 +222,13 @@ pub struct Pipeline {
     /// Test-only: exempt loopback targets from the SSRF guard so a hermetic
     /// local server can be crawled. Production (`open`) leaves this `false`.
     allow_loopback: bool,
+    /// Stage-3 freshness scheduler (background due work + P0 query refresh).
+    scheduler: ActivationScheduler,
+    /// Stage-3 dispatch budget. Charged *before* a live refresh fetch is
+    /// attempted and refunded on an early abort. It mirrors the scheduler's
+    /// internal charge (which `ActivationScheduler` does not expose), so the
+    /// crawl loop can implement refund-on-abort itself.
+    dispatch_budget: BudgetLedger,
 }
 
 impl Pipeline {
@@ -195,7 +238,26 @@ impl Pipeline {
     }
 
     /// Open the pipeline, optionally allowing loopback targets (tests only).
+    /// Uses [`SchedulerConfig::default`] and [`DEFAULT_REFRESH_BUDGET`].
     pub fn open_with(cfg: &Config, allow_loopback: bool) -> AppResult<Self> {
+        Self::open_with_scheduler(
+            cfg,
+            allow_loopback,
+            SchedulerConfig::default(),
+            DEFAULT_REFRESH_BUDGET,
+        )
+    }
+
+    /// Open the pipeline with an explicit Stage-3 [`SchedulerConfig`] and
+    /// dispatch-budget capacity. The default build stays hermetic and offline:
+    /// the scheduler performs no work until `run_refresh_tick`/`query_refresh`
+    /// is called.
+    pub fn open_with_scheduler(
+        cfg: &Config,
+        allow_loopback: bool,
+        scheduler_cfg: SchedulerConfig,
+        budget_capacity: u64,
+    ) -> AppResult<Self> {
         cfg.assert_not_synced().map_err(AppError::Config)?;
         cfg.ensure_dirs()?;
         cfg.limits.validate().map_err(AppError::Config)?;
@@ -222,6 +284,8 @@ impl Pipeline {
             owner: format!("agent0-{}", std::process::id()),
             validators: MemoryValidators::new(),
             allow_loopback,
+            scheduler: ActivationScheduler::new(scheduler_cfg, BudgetLedger::new(budget_capacity)),
+            dispatch_budget: BudgetLedger::new(budget_capacity),
         })
     }
 
@@ -255,6 +319,210 @@ impl Pipeline {
             filters: None,
         };
         search_api::execute(&searcher, &req)
+    }
+
+    // --------------------------------------------------------------- Stage 3
+
+    /// The Stage-3 freshness scheduler (background due work + P0 query refresh).
+    pub fn scheduler(&self) -> &ActivationScheduler {
+        &self.scheduler
+    }
+
+    /// Units charged on the dispatch ledger so far (mirrors scheduler admission).
+    pub fn budget_spent(&self) -> u64 {
+        self.dispatch_budget.spent()
+    }
+
+    /// Units still available on the dispatch ledger.
+    pub fn budget_remaining(&self) -> u64 {
+        self.dispatch_budget.remaining()
+    }
+
+    /// Build background `SourceDue` candidates from what the pipeline knows:
+    /// every indexed resource, classified HOT/WARM/COLD from its source
+    /// profile's observed change rate, with a `next_allowed_at` derived from the
+    /// learned change model ([`change_probability`]) and bounded by the class
+    /// horizon so HOT sources come due before WARM before COLD.
+    pub fn due_sources(&self, now: i64) -> AppResult<Vec<SourceDue>> {
+        let cfg = self.scheduler.config().clone();
+        let rows: Vec<(String, f64, f64, i64)> = {
+            let w = self.meta.lock().unwrap();
+            let mut stmt = w
+                .conn()
+                .prepare(
+                    "SELECT r.canonical_url,
+                            COALESCE(sp.change_rate, 0.0),
+                            COALESCE(sp.authority, 0.5),
+                            COALESCE(r.verified_at, r.fetched_at, r.last_fetch, 0)
+                       FROM resource r
+                       LEFT JOIN source_profile sp ON sp.source_id = r.source_id",
+                )
+                .map_err(search_metadata::db_err)?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(search_metadata::db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(search_metadata::db_err)?;
+            mapped
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (url, rate, authority, last_fetch) in rows {
+            let rate = rate as f32;
+            let class = classify_source(rate, authority as f32);
+            let horizon = cfg.max_age_secs(class);
+            let age = now.saturating_sub(last_fetch).max(0) as f64;
+            // The learned change model: P(changed) at this age. A source whose
+            // model gives no change signal waits a full class horizon; otherwise
+            // it is due once the model's P(changed) reaches DUE_PROB, which is
+            // the inverse of `change_probability`.
+            let p = change_probability(rate as f64, age);
+            let model_secs = if p > 0.0 {
+                secs_until_prob(rate as f64, DUE_PROB)
+                    .map(|s| s.round() as i64)
+                    .unwrap_or(horizon)
+            } else {
+                horizon
+            };
+            let secs = model_secs.clamp(1, horizon);
+            out.push(SourceDue {
+                origin: origin_of_url(&url),
+                class,
+                change_rate: rate,
+                last_fetch,
+                next_allowed_at: last_fetch.saturating_add(secs),
+                url,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run one background refresh tick: the scheduler decides the due work
+    /// (HOT before WARM before COLD, bounded per-origin and total fan-out) and
+    /// each returned activation is dispatched through the conditional-refresh
+    /// path (`crawl_one`, where a 304 is `Unchanged`). Returns a [`RefreshReport`].
+    pub async fn run_refresh_tick(
+        &self,
+        sources: &[SourceDue],
+        now: i64,
+    ) -> AppResult<RefreshReport> {
+        let activations = self.scheduler.due(sources, now);
+        let mut report = RefreshReport {
+            admitted: activations.len(),
+            ..Default::default()
+        };
+        for act in &activations {
+            self.dispatch_activation(act, &mut report).await;
+        }
+        Ok(report)
+    }
+
+    /// Query-triggered P0 refresh. For a **time-sensitive** query, spawn up to
+    /// `query_refresh_limit` P0 activations over candidates the pipeline knows
+    /// (frontier URLs not yet indexed) and dispatch them. A query that is not
+    /// time-sensitive performs no refresh work and issues zero fetches.
+    pub async fn query_refresh(&self, q: &str, now: i64) -> AppResult<RefreshReport> {
+        let mut report = RefreshReport::default();
+        if !is_time_sensitive(q, now) {
+            return Ok(report);
+        }
+        let candidates = self.refresh_candidates()?;
+        let activations = self.scheduler.on_query(q, &candidates, now);
+        report.admitted = activations.len();
+        for act in &activations {
+            self.dispatch_activation(act, &mut report).await;
+        }
+        Ok(report)
+    }
+
+    /// Search with a live-refresh preamble: when the query is time-sensitive a
+    /// P0 refresh runs first, so any newly fetched document is scored against
+    /// this query and merged into the results from the **live overlay** before
+    /// any global reindex. Base segments stay immutable; the overlay shadows
+    /// their versions and is gated by the published watermark.
+    pub async fn search_with_refresh(
+        &self,
+        q: &str,
+        limit: usize,
+        now: i64,
+    ) -> AppResult<SearchResponse> {
+        let _ = self.query_refresh(q, now).await?;
+        self.search(q, limit).await
+    }
+
+    /// Candidate `(url, origin)` pairs for a P0 refresh: frontier URLs the
+    /// pipeline knows but has not yet indexed (no `document_version` row).
+    fn refresh_candidates(&self) -> AppResult<Vec<(String, String)>> {
+        let urls: Vec<String> = {
+            let w = self.meta.lock().unwrap();
+            let mut stmt = w
+                .conn()
+                .prepare(
+                    "SELECT f.url FROM frontier_entry f
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM document_version dv
+                             WHERE dv.resource_id = f.resource_id)
+                      GROUP BY f.url
+                      ORDER BY MIN(f.priority) ASC, MIN(f.earliest_fetch_at) ASC, f.url ASC
+                      LIMIT ?1",
+                )
+                .map_err(search_metadata::db_err)?;
+            let mapped = stmt
+                .query_map(params![MAX_REFRESH_CANDIDATES as i64], |r| r.get::<_, String>(0))
+                .map_err(search_metadata::db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(search_metadata::db_err)?;
+            mapped
+        };
+        Ok(urls
+            .into_iter()
+            .map(|u| {
+                let origin = origin_of_url(&u);
+                (u, origin)
+            })
+            .filter(|(_, o)| !o.is_empty())
+            .collect())
+    }
+
+    /// Dispatch one scheduler activation through the crawl loop. The scheduler
+    /// already charged its ledger and reserved a fan-out slot before returning
+    /// the activation; here the pipeline charges its own dispatch ledger
+    /// **before** attempting the fetch, runs the conditional refresh, and
+    /// releases the slot. An early abort (guard / robots / network failure)
+    /// refunds the charge.
+    async fn dispatch_activation(&self, act: &Activation, report: &mut RefreshReport) {
+        // Charge before dispatch: a refused charge means no fetch is attempted.
+        if !self.dispatch_budget.try_charge(1) {
+            report.skipped += 1;
+            self.scheduler.release(&act.url, &act.origin);
+            return;
+        }
+        report.activations.push(act.url.clone());
+        match self.crawl_one(&act.url).await {
+            Ok(outcome) => {
+                report.fetched += 1;
+                if outcome.is_new_document() {
+                    report.new_documents += 1;
+                }
+                if outcome.is_unchanged() {
+                    report.unchanged += 1;
+                }
+            }
+            Err(e) => {
+                // Early abort: return the budget unit and free the slot.
+                self.dispatch_budget.refund(1);
+                report.refunded += 1;
+                report.errors.push((act.url.clone(), e.to_string()));
+            }
+        }
+        self.scheduler.release(&act.url, &act.origin);
     }
 
     // ------------------------------------------------------------------ discover
@@ -1255,6 +1523,46 @@ fn origin_of(u: &Url) -> String {
         (Some(host), None) => format!("{}://{}", u.scheme(), host),
         (None, _) => String::new(),
     }
+}
+
+/// Origin (scheme+host+port) of a raw URL string, or empty when it cannot be parsed.
+fn origin_of_url(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(u) => origin_of(&u),
+        Err(_) => String::new(),
+    }
+}
+
+/// Seconds until the change model says `P(changed)` has reached `target` — the
+/// inverse of [`change_probability`]'s `p = 1 - exp(-rate·age)`: `age = -ln(1-target)/rate`.
+fn secs_until_prob(rate: f64, target: f64) -> Option<f64> {
+    if rate <= 0.0 || !(0.0..1.0).contains(&target) {
+        return None;
+    }
+    Some(-(1.0 - target).ln() / rate)
+}
+
+/// Stage-3 [`SchedulerConfig`] defaults with optional environment overrides
+/// (`SEARCH_TOTAL_LIVE_FANOUT`, `SEARCH_PER_ORIGIN_FANOUT`,
+/// `SEARCH_QUERY_REFRESH_LIMIT`), so the refresh tick can be tuned without a
+/// rebuild. The default build stays hermetic and offline — nothing runs until a
+/// refresh command is invoked.
+pub fn scheduler_config_from_env() -> SchedulerConfig {
+    let mut c = SchedulerConfig::default();
+    if let Some(n) = env_usize("SEARCH_TOTAL_LIVE_FANOUT") {
+        c.total_live_fanout = n;
+    }
+    if let Some(n) = env_usize("SEARCH_PER_ORIGIN_FANOUT") {
+        c.per_origin_fanout = n;
+    }
+    if let Some(n) = env_usize("SEARCH_QUERY_REFRESH_LIMIT") {
+        c.query_refresh_limit = n;
+    }
+    c
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// Resolve a possibly-relative URL against the origin. Absolute URLs pass

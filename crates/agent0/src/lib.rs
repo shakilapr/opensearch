@@ -21,4 +21,7 @@
 
 pub mod pipeline;
 
-pub use pipeline::{DiscoveryReport, IngestOutcome, Pipeline, SourceFirstSearcher};
+pub use pipeline::{
+    scheduler_config_from_env, DiscoveryReport, IngestOutcome, Pipeline, RefreshReport,
+    SourceFirstSearcher, DEFAULT_REFRESH_BUDGET,
+};

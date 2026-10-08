@@ -33,7 +33,10 @@ async fn main() -> ExitCode {
             None => usage("agent0 search <query> [limit]"),
         },
         Some("serve") => run_serve().await,
-        _ => usage("agent0 <ingest <url> | search <query> [limit] | serve>"),
+        Some("refresh") => run_refresh().await,
+        _ => usage(
+            "agent0 <ingest <url> | search <query> [limit] | refresh | serve>",
+        ),
     }
 }
 
@@ -76,13 +79,61 @@ async fn run_search(query: &str, limit: usize) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match pipeline.search(query, limit).await {
+    // Opt-in live refresh: `SEARCH_QUERY_REFRESH=1 agent0 search "latest X"` runs
+    // a P0 query-triggered refresh before searching. Off by default (hermetic).
+    let fresh = matches!(
+        std::env::var("SEARCH_QUERY_REFRESH").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    );
+    let result = if fresh {
+        let now = search_core::time::now_unix_s();
+        pipeline.search_with_refresh(query, limit, now).await
+    } else {
+        pipeline.search(query, limit).await
+    };
+    match result {
         Ok(resp) => {
             println!("{}", serde_json::to_string_pretty(&resp).unwrap());
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("search failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// One Stage-3 background refresh tick: build the due sources the pipeline knows
+/// and dispatch the scheduler's bounded refresh work, then print the report.
+async fn run_refresh() -> ExitCode {
+    let cfg = config();
+    let pipeline = match Pipeline::open_with_scheduler(
+        &cfg,
+        false,
+        search_agent0::scheduler_config_from_env(),
+        search_agent0::DEFAULT_REFRESH_BUDGET,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to open pipeline: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let now = search_core::time::now_unix_s();
+    let sources = match pipeline.due_sources(now) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to build refresh sources: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match pipeline.run_refresh_tick(&sources, now).await {
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("refresh failed: {e}");
             ExitCode::from(1)
         }
     }
