@@ -8,6 +8,13 @@ members = [
     "crates/fetcher",
     "crates/indexer",
     "crates/parser",
+    "crates/discovery",
+    "crates/router",
+    "crates/browser",
+    "crates/pdf",
+    "crates/sources",
+    "crates/graph",
+    "crates/retrieval",
     "crates/api",
     "crates/agent0",
 ]
@@ -37,6 +44,9 @@ reqwest = { version = "0.12", default-features = false, features = ["gzip", "bro
 axum = "0.7"
 scraper = "0.20"
 html-escape = "0.2"
+quick-xml = "0.36"
+flate2 = "1"
+mime = "0.3"
 tempfile = "3"
 
 [profile.release]

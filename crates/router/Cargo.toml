@@ -1,0 +1,9 @@
+[package]
+name = "search-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+thiserror.workspace = true

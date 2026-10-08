@@ -1,0 +1,12 @@
+[package]
+name = "search-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+search-indexer = { path = "../indexer" }
+search-graph = { path = "../graph" }
+thiserror.workspace = true
+tracing.workspace = true

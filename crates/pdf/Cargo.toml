@@ -1,0 +1,13 @@
+[package]
+name = "search-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+thiserror.workspace = true
+tracing.workspace = true
+pdf-extract = "0.7"
+
+[dev-dependencies]

@@ -1,0 +1,21 @@
+[package]
+name = "search-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Real Chromium driver. Off by default so the workspace builds without a browser.
+chromium = ["dep:chromiumoxide"]
+
+[dependencies]
+search-core = { path = "../core" }
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+chromiumoxide = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
