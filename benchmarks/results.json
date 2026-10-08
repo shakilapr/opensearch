@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "generated_unix": 1791489087,
+  "generated_unix": 1791489191,
   "corpus_dir": "/root/projects/search/crates/bench/../../benchmarks/corpus",
   "queries_path": "/root/projects/search/crates/bench/../../benchmarks/queries.example.jsonl",
   "budget": {
@@ -9,7 +9,7 @@
     "k": 20,
     "ce_depth": 50,
     "embed_dim": 1024,
-    "peak_rss_kb": 18072,
+    "peak_rss_kb": 18060,
     "mean_candidates": 13.154285714285715,
     "max_candidates": 24
   },

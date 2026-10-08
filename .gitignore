@@ -191,3 +191,7 @@ $RECYCLE.BIN/
 *.sw?
 
 *.bundle
+
+# Benchmark fixtures are small, hand-labelled, and committed on purpose.
+!benchmarks/corpus/
+!benchmarks/*.jsonl
