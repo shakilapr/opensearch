@@ -20,6 +20,7 @@ members = [
     "crates/rerank",
     "crates/scheduler",
     "crates/bench",
+    "crates/nav",
     "crates/api",
     "crates/agent0",
 ]
