@@ -9,5 +9,6 @@ search-core = { path = "../core" }
 thiserror.workspace = true
 tracing.workspace = true
 pdf-extract = "0.7"
+lopdf = "0.34"
 
 [dev-dependencies]
