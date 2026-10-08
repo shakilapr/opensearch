@@ -1,16 +1,44 @@
 //! Priority dispatch queue (spec §5). OWNER: frontier agent.
 //!
 //! [`Frontier`] is a thin, thread-safe façade over the `frontier_entry` and
-//! `origin_state` tables in the metadata SQLite database. It opens its **own**
-//! connection for every operation and wraps each dispatch/reclaim in an
-//! `IMMEDIATE` transaction, so two workers can never lease the same row: SQLite
-//! serialises the write transactions and the `epoch` guard fences stale writers.
+//! `origin_state` tables in the metadata SQLite database.
+//!
+//! ## Single-writer invariant and the deliberate frontier exception
+//!
+//! Spec §4 requires **one writer per SQLite database**, driven by
+//! [`search_metadata::MetadataWriter`] through a bounded mutation channel. That
+//! works for the append/upsert projections because they are independent,
+//! idempotent statements. Frontier leasing cannot be expressed that way:
+//! **lease acquisition is an atomic read-modify-write** — select eligible rows
+//! under the per-origin concurrency gate, then reserve exactly those rows
+//! (bump `epoch`, set `owner`/`lease_until`) inside one transaction so two
+//! workers can never receive the same row. `complete`/`fail` are likewise
+//! fence-checked read-modify-writes. A fire-and-forget mutation batch has no
+//! return value and no ordering guarantee, so it cannot express this.
+//!
+//! Rather than a broken abstraction, frontier therefore owns **exactly one**
+//! dedicated writer connection to the same database file, opened lazily on
+//! first use, held behind a [`Mutex`], and configured like every other writer
+//! (`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`,
+//! `foreign_keys=ON`). All frontier operations — `push`, `lease`, `complete`,
+//! `fail`, `release_expired`, `observe_error`, `set_origin_concurrency` — are
+//! serialised through that single connection, so `frontier_entry` and
+//! `origin_state` have exactly one writer inside this process, restoring the
+//! invariant for those tables. The connection is reused (not reopened per
+//! operation), so SQLite's WAL writer lock is held by one handle and
+//! `busy_timeout` absorbs any contention with the metadata writer.
+//!
+//! At distributed scale (Stage 10) this becomes a dedicated frontier service:
+//! the atomic select-then-reserve would be a single RPC against a queue store,
+//! and `epoch` remains the fencing token. Until then, one owned connection is
+//! the honest, correct boundary.
 //!
 //! Dispatch is priority-first, then earliest-deadline, but is always gated by
 //! per-origin concurrency so a single host is never hammered.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use search_core::{AppError, AppResult};
@@ -108,9 +136,18 @@ impl Default for FrontierConfig {
     }
 }
 
+/// The single frontier writer connection, opened lazily on first use.
+struct Inner {
+    path: PathBuf,
+    conn: Option<rusqlite::Connection>,
+}
+
 /// The frontier. Dispatch goes through per-origin gates, never FIFO.
+///
+/// Owns exactly one writer connection (see the module docs for why this is a
+/// documented exception to the batched-mutation single-writer path).
 pub struct Frontier {
-    db_path: PathBuf,
+    inner: Mutex<Inner>,
     cfg: FrontierConfig,
 }
 
@@ -118,15 +155,15 @@ impl Frontier {
     /// Open the frontier over the metadata database at `path`. The database is
     /// created/migrated on first use by the metadata crate's `open`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            db_path: path.into(),
-            cfg: FrontierConfig::default(),
-        }
+        Self::with_config(path, FrontierConfig::default())
     }
 
     pub fn with_config(path: impl Into<PathBuf>, cfg: FrontierConfig) -> Self {
         Self {
-            db_path: path.into(),
+            inner: Mutex::new(Inner {
+                path: path.into(),
+                conn: None,
+            }),
             cfg,
         }
     }
@@ -135,10 +172,17 @@ impl Frontier {
         self.cfg
     }
 
-    /// Open a fresh read-write connection. `rusqlite::Connection` is not `Sync`,
-    /// so every operation opens its own; a shared `&Frontier` is `Send + Sync`.
-    fn conn(&self) -> AppResult<rusqlite::Connection> {
-        search_metadata::writer::open(&self.db_path)
+    /// Lock the frontier's single connection, opening and migrating it on first
+    /// use. `rusqlite::Connection` is `!Sync`, so the mutex makes `&Frontier`
+    /// safe to share across threads while guaranteeing one handle at a time.
+    fn lock(&self) -> AppResult<MutexGuard<'_, Inner>> {
+        // A poisoned lock only means a previous operation panicked; the
+        // connection itself is still usable, so recover rather than propagate.
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.conn.is_none() {
+            guard.conn = Some(search_metadata::writer::open(&guard.path)?);
+        }
+        Ok(guard)
     }
 
     // ------------------------------------------------------------------ push
@@ -147,7 +191,8 @@ impl Frontier {
     /// (`status`, `attempt`, `epoch`) is preserved so a re-crawl does not
     /// discard an in-flight lease.
     pub fn push(&self, entry: FrontierEntry) -> AppResult<()> {
-        let conn = self.conn()?;
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
         conn.execute(
             "INSERT INTO frontier_entry
                  (resource_id, url, domain_id, priority, earliest_fetch_at,
@@ -185,7 +230,8 @@ impl Frontier {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let mut conn = self.conn()?;
+        let mut guard = self.lock()?;
+        let conn = guard.conn.as_mut().expect("connection opened by lock()");
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(search_metadata::db_err)?;
@@ -293,12 +339,13 @@ impl Frontier {
     /// Mark a leased resource as successfully fetched. Rejects stale leases
     /// (fencing) with [`AppError::LeaseFenced`].
     pub fn complete(&self, lease: &Lease, now: i64) -> AppResult<()> {
-        let mut conn = self.conn()?;
+        let mut guard = self.lock()?;
+        let conn = guard.conn.as_mut().expect("connection opened by lock()");
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(search_metadata::db_err)?;
 
-        let (epoch, owner, domain_id, status) = self.load_row(&tx, &lease.resource_id)?;
+        let (epoch, owner, domain_id, status) = Self::load_row(&tx, &lease.resource_id)?;
         check_fence(epoch, owner.as_deref(), &status, lease)?;
 
         tx.execute(
@@ -320,12 +367,13 @@ impl Frontier {
     /// exponential backoff; otherwise it becomes terminal (`FAILED`). Rejects
     /// stale leases with [`AppError::LeaseFenced`].
     pub fn fail(&self, lease: &Lease, now: i64, retryable: bool) -> AppResult<()> {
-        let mut conn = self.conn()?;
+        let mut guard = self.lock()?;
+        let conn = guard.conn.as_mut().expect("connection opened by lock()");
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(search_metadata::db_err)?;
 
-        let (epoch, owner, domain_id, status) = self.load_row(&tx, &lease.resource_id)?;
+        let (epoch, owner, domain_id, status) = Self::load_row(&tx, &lease.resource_id)?;
         check_fence(epoch, owner.as_deref(), &status, lease)?;
 
         if retryable {
@@ -367,9 +415,13 @@ impl Frontier {
 
     /// Reclaim zombie leases (`status = FETCHING` and `lease_until < now`) back
     /// to `READY` for crash recovery. Stale epochs remain stale, so a revived
-    /// zombie worker's writes are still fenced. Returns rows reclaimed.
+    /// zombie worker's writes are still fenced. Also recomputes
+    /// `origin_state.active_leases` for every origin from the live
+    /// `frontier_entry` rows, restoring the counter if it drifted. Returns rows
+    /// reclaimed.
     pub fn release_expired(&self, now: i64) -> AppResult<usize> {
-        let mut conn = self.conn()?;
+        let mut guard = self.lock()?;
+        let conn = guard.conn.as_mut().expect("connection opened by lock()");
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(search_metadata::db_err)?;
@@ -402,9 +454,10 @@ impl Frontier {
     /// Record a fetch outcome for a domain and adapt politeness. `error_rate`
     /// is an EWMA; `adaptive_delay` doubles on error and halves on success. On
     /// error the origin is also paused via `next_allowed_at` so the very next
-    /// `lease` skips it.
+    /// `lease` skips it. `active_leases` is preserved.
     pub fn observe_error(&self, domain_id: &str, is_error: bool) -> AppResult<()> {
-        let conn = self.conn()?;
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
         let current = conn
             .query_row(
                 "SELECT error_rate, adaptive_delay FROM origin_state WHERE domain_id = ?1",
@@ -459,7 +512,8 @@ impl Frontier {
     }
 
     fn try_should_throttle(&self, domain_id: &str) -> AppResult<bool> {
-        let conn = self.conn()?;
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
         let row = conn
             .query_row(
                 "SELECT error_rate, adaptive_delay, next_allowed_at
@@ -479,7 +533,8 @@ impl Frontier {
 
     /// Set the per-origin concurrency cap (creates the `origin_state` row).
     pub fn set_origin_concurrency(&self, domain_id: &str, concurrency: i64) -> AppResult<()> {
-        let conn = self.conn()?;
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
         conn.execute(
             "INSERT INTO origin_state
                  (domain_id, concurrency, next_allowed_at, error_rate, adaptive_delay, active_leases)
@@ -494,7 +549,6 @@ impl Frontier {
     // ------------------------------------------------------------------ internals
 
     fn load_row(
-        &self,
         tx: &Transaction<'_>,
         resource_id: &str,
     ) -> AppResult<(i64, Option<String>, String, String)> {

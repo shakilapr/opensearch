@@ -267,3 +267,85 @@ fn polite_delay_defers_dispatch() {
     assert!(f.lease("w1", 9_999, 1).unwrap().is_empty());
     assert_eq!(f.lease("w1", 10_000, 1).unwrap().len(), 1);
 }
+
+// ── (f) migrate-only DB: full lease lifecycle with no runtime DDL ─────────────
+
+fn table_list(db: &PathBuf) -> Vec<String> {
+    let conn = search_metadata::writer::open(db).expect("open");
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+              WHERE type='table' AND name NOT LIKE 'sqlite_%'
+              ORDER BY name",
+        )
+        .unwrap();
+    let v = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    v
+}
+
+/// After a database created purely by migrations, leasing/complete/fail work
+/// and the frontier performs no runtime DDL: the `sqlite_master` table set is
+/// identical before and after, and `origin_state.active_leases` tracks the
+/// lifecycle exactly.
+#[test]
+fn frontier_works_on_migrate_only_db_without_runtime_ddl() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("meta.db");
+
+    // Schema from migrations alone (opens the writer, applies migrations).
+    drop(search_metadata::writer::open(&db).expect("migrate"));
+    let before = table_list(&db);
+    assert!(
+        before.contains(&"frontier_entry".to_string())
+            && before.contains(&"origin_state".to_string()),
+        "frontier tables must come from migrations, got {before:?}"
+    );
+
+    let f = Frontier::new(&db);
+    f.push(entry("r1", "d.com", Priority::Normal, 0)).unwrap();
+
+    // Lease -> one active lease recorded on the origin.
+    let lease = f.lease("w1", 1_000, 1).unwrap().remove(0);
+    let active: i64 = {
+        let conn = search_metadata::writer::open(&db).unwrap();
+        conn.query_row(
+            "SELECT active_leases FROM origin_state WHERE domain_id = 'd.com'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(active, 1, "lease increments origin_state.active_leases");
+    assert_eq!(read_str(&db, "r1", "status"), "FETCHING");
+
+    // Complete -> slot released.
+    f.complete(&lease, 1_000).unwrap();
+    assert_eq!(read_str(&db, "r1", "status"), "DONE");
+    let active: i64 = {
+        let conn = search_metadata::writer::open(&db).unwrap();
+        conn.query_row(
+            "SELECT active_leases FROM origin_state WHERE domain_id = 'd.com'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(active, 0, "complete decrements origin_state.active_leases");
+
+    // Fail (retryable) -> READY, slot released too.
+    f.push(entry("r2", "d.com", Priority::Normal, 0)).unwrap();
+    let l2 = f.lease("w1", 2_000, 1).unwrap().remove(0);
+    f.fail(&l2, 2_000, true).unwrap();
+    assert_eq!(read_str(&db, "r2", "status"), "READY");
+
+    // No runtime DDL: the table set is unchanged by all of the above.
+    let after = table_list(&db);
+    assert_eq!(
+        before, after,
+        "frontier must not create/drop tables at runtime"
+    );
+}
