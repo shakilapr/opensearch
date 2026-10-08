@@ -344,6 +344,95 @@ fn document_version_round_trips() {
     assert_eq!(count, 1, "duplicate docver insert must be a no-op");
 }
 
+/// `Mutation::UpsertContent` is idempotent and satisfies the `document_version`
+/// FK to `content(content_id)`.
+#[test]
+fn upsert_content_is_idempotent_and_satisfies_fk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+    let mut w = MetadataWriter::from_path(&path).unwrap();
+
+    w.apply_batch(&[
+        domain("d1"),
+        resource("r1", "d1"),
+        Mutation::UpsertContent {
+            content_id: "cnt_a".into(),
+            exact_hash: "exh".into(),
+            text_path: Some("/t/a".into()),
+            byte_len: 11,
+        },
+        // Same content_id again: a no-op; the first row wins.
+        Mutation::UpsertContent {
+            content_id: "cnt_a".into(),
+            exact_hash: "different".into(),
+            text_path: None,
+            byte_len: 9999,
+        },
+        // The FK now resolves because the content row exists.
+        Mutation::UpsertDocumentVersion {
+            docver_id: "r1:1".into(),
+            resource_id: "r1".into(),
+            version_no: 1,
+            content_id: Some("cnt_a".into()),
+            title: Some("T".into()),
+            body_hash: None,
+            parser_version: "p1".into(),
+            published_at: None,
+            modified_at: None,
+            fetched_at: 1000,
+        },
+    ])
+    .unwrap();
+
+    let r = MetadataReader::from_path(&path).unwrap();
+    let (hash, len): (String, i64) = r
+        .conn()
+        .query_row(
+            "SELECT exact_hash, byte_len FROM content WHERE content_id='cnt_a'",
+            [],
+            |x| Ok((x.get(0)?, x.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(hash, "exh", "duplicate content upsert must not overwrite");
+    assert_eq!(len, 11, "duplicate content upsert must not overwrite");
+    let count: i64 = r
+        .conn()
+        .query_row("SELECT COUNT(*) FROM content", [], |x| x.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "content upsert is idempotent");
+    assert!(
+        r.doc_by_docver("r1:1").unwrap().is_some(),
+        "document_version FK to content resolved"
+    );
+}
+
+/// `Mutation::UpsertManifest` projects a published manifest and is idempotent.
+#[test]
+fn upsert_manifest_projects_and_is_idempotent() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+    let mut w = MetadataWriter::from_path(&path).unwrap();
+    let manifest = || Mutation::UpsertManifest {
+        manifest_id: "gen-1".into(),
+        generation: 1,
+        doc_count: 4,
+        base_segments: 2,
+        created_at: 100,
+    };
+    w.apply_batch(&[manifest(), manifest()]).unwrap();
+
+    let r = MetadataReader::from_path(&path).unwrap();
+    let vis = r.visible_manifest().unwrap().expect("a published manifest");
+    assert_eq!(vis.generation, 1);
+    assert_eq!(vis.doc_count, 4);
+    assert_eq!(vis.base_segments, 2);
+    let count: i64 = r
+        .conn()
+        .query_row("SELECT COUNT(*) FROM manifest", [], |x| x.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "duplicate manifest publish is a no-op");
+}
+
 /// visible_manifest returns only the highest published generation.
 #[test]
 fn visible_manifest_returns_highest_published() {

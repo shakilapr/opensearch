@@ -67,6 +67,15 @@ pub enum Mutation {
         state: String,
         at: i64,
     },
+    /// Insert an immutable content row (idempotent on `content_id`). Content is
+    /// content-addressed, so a re-ingest of the same bytes is a no-op — the
+    /// stored `exact_hash`/`text_path`/`byte_len` of the first write win.
+    UpsertContent {
+        content_id: String,
+        exact_hash: String,
+        text_path: Option<String>,
+        byte_len: i64,
+    },
     /// Insert an immutable document version (idempotent on `docver_id`). A
     /// re-ingest of the same `(resource_id, version_no)` is a no-op.
     UpsertDocumentVersion {
@@ -80,6 +89,15 @@ pub enum Mutation {
         published_at: Option<i64>,
         modified_at: Option<i64>,
         fetched_at: i64,
+    },
+    /// Publish a manifest row (idempotent on `manifest_id`). A re-publish of
+    /// the same generation is a no-op, so the read-side projection is stable.
+    UpsertManifest {
+        manifest_id: String,
+        generation: i64,
+        doc_count: i64,
+        base_segments: i64,
+        created_at: i64,
     },
 }
 
@@ -588,6 +606,22 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
             )
             .map_err(crate::db_err)?;
         }
+        Mutation::UpsertContent {
+            content_id,
+            exact_hash,
+            text_path,
+            byte_len,
+        } => {
+            // Content is content-addressed and immutable: a duplicate
+            // content_id is a no-op (the first write wins).
+            tx.execute(
+                "INSERT INTO content(content_id, exact_hash, text_path, byte_len, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(content_id) DO NOTHING",
+                rusqlite::params![content_id, exact_hash, text_path, byte_len, now],
+            )
+            .map_err(crate::db_err)?;
+        }
         Mutation::UpsertDocumentVersion {
             docver_id,
             resource_id,
@@ -621,6 +655,24 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     fetched_at,
                     now
                 ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertManifest {
+            manifest_id,
+            generation,
+            doc_count,
+            base_segments,
+            created_at,
+        } => {
+            // Published manifest projection: a duplicate manifest_id is a
+            // no-op, so re-publishing a generation is idempotent.
+            tx.execute(
+                "INSERT INTO manifest(manifest_id, generation, published, doc_count,
+                        base_segments, created_at, published_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(manifest_id) DO NOTHING",
+                rusqlite::params![manifest_id, generation, doc_count, base_segments, created_at],
             )
             .map_err(crate::db_err)?;
         }
