@@ -232,3 +232,41 @@ async fn read_doc_returns_normalized_text_and_missing_is_not_found() {
     let err = p.read_doc("res_does_not_exist").unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// (5) configured JSONL trace: PolicyTrace appends, read_trace reads it back
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deep_search_appends_jsonl_trace_readable_by_read_trace() {
+    let base = spawn_fixture().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = test_config(dir.path());
+    let mut p = search_agent0::Pipeline::open_with(&cfg, true).unwrap();
+
+    // Configure the real STAGE8 PolicyTrace sink.
+    let trace_path = dir.path().join("trace.jsonl");
+    p.set_trace_jsonl(&trace_path).unwrap();
+
+    let url = format!("{base}/page");
+    assert!(p.crawl_one(&url).await.unwrap().is_ingested());
+
+    let report = p.deep_search_report("zephyrquokka", 5, now()).unwrap();
+    assert!(!report.result.hits.is_empty(), "the crawled doc is searchable");
+
+    // The events the pipeline appended are the frozen STAGE8 wire form.
+    let events = search_trace::read_trace(&trace_path).unwrap();
+    assert!(!events.is_empty(), "configured trace sink wrote events");
+    assert!(
+        events.iter().any(|e| e.phase == search_agent0::Phase::Query),
+        "a Query phase event is recorded"
+    );
+    assert!(
+        events.iter().any(|e| e.phase == search_agent0::Phase::Answer),
+        "an Answer phase event is recorded"
+    );
+    assert!(
+        events.iter().all(|e| !e.query_id.is_empty()),
+        "every event carries the PolicyTrace query id"
+    );
+}

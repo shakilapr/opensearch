@@ -21,3 +21,18 @@ pub use server::{router, serve, AppState, ApiError, DEFAULT_MAX_CONCURRENCY};
 
 #[cfg(feature = "real-indexer")]
 pub use indexer_adapter::IndexerSearcher;
+
+/// Initialise the process-wide tracing subscriber.
+///
+/// Honours `RUST_LOG` (via `EnvFilter`), defaulting to `info` when unset or
+/// invalid. Idempotent: a second call is a no-op, so a binary can call this and
+/// [`serve`] can call it again safely. Logs go to stderr; no credentials or
+/// document bodies are ever logged by this crate.
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}

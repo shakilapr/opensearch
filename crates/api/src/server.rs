@@ -174,11 +174,19 @@ async fn search(
 
     // Search is CPU/IO bound; keep it off the async runtime's worker threads.
     let searcher = state.inner.searcher.clone();
+    let query_len = req.query.len();
+    let limit = req.limit;
     let resp = tokio::task::spawn_blocking(move || query::execute(searcher.as_ref(), &req))
         .await
         .map_err(|e| ApiError::internal(format!("search task panicked: {e}")))?
         .map_err(ApiError::from_app)?;
 
+    tracing::debug!(
+        query_len,
+        limit,
+        hits = resp.results.len(),
+        "POST /search served"
+    );
     Ok(Json(resp))
 }
 
@@ -255,6 +263,9 @@ pub async fn serve(
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
 ) -> AppResult<()> {
+    // Ensure a subscriber exists even when the caller (e.g. an embedding binary)
+    // forgot to initialise one. Idempotent.
+    crate::init_tracing();
     let state = match deep {
         Some(d) => AppState::with_deep(searcher, d),
         None => AppState::new(searcher),

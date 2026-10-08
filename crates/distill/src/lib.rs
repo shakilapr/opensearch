@@ -7,11 +7,11 @@
 //! trace fixture. Any artifact-backed path returns [`DistillError::Unavailable`] instead of
 //! inventing numbers. Measured accuracy is returned verbatim, even when it is below 1.0.
 //!
-//! Trace dependency note: `search-trace` (Stage 8) is being written concurrently and exposes no
-//! reader API yet, so this crate does **not** import its types. It parses the trace JSONL with a
-//! small local [`TraceRecord`] shape (a subset of `search_trace::TraceEvent`: `detail` +
-//! `policy_tier`), gated behind this local type. When Stage 8's `read_trace` lands, the parse
-//! can be swapped for it without touching the public signatures here.
+//! Trace dependency: `distill_from_trace` reads the trace with the Stage-8
+//! `search_trace::read_trace` reader (the frozen `TraceEvent` wire form), not a local parser. The
+//! committed Stage-9 fixture predates the frozen snake_case `phase` tag (it writes `"Route"`), so
+//! a tiny adapter normalises the phase casing and re-reads through `read_trace`; the trace schema
+//! itself is never weakened.
 
 #![forbid(unsafe_code)]
 
@@ -23,82 +23,6 @@ use serde_json::Value;
 /// Number of features produced by [`features_from_state`]. Fixed so the policy's weight vector
 /// has a stable shape.
 pub const FEATURE_DIM: usize = 6;
-
-/// A minimal, local view of a trace event, used only for distillation. Mirrors the fields of
-/// `search_trace::TraceEvent` that matter here (`detail` map + `policy_tier` label).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceRecord {
-    pub query_id: String,
-    pub policy_tier: Option<String>,
-    /// `detail` parsed into a plain string map (trace details are string-typed).
-    pub detail: std::collections::BTreeMap<String, String>,
-}
-
-impl TraceRecord {
-    /// Parse one JSONL trace line into a [`TraceRecord`]. Missing optional fields default to
-    /// empty; a non-object line is an error.
-    pub fn from_json_line(line: &str) -> Result<Self, DistillError> {
-        let v: Value =
-            serde_json::from_str(line).map_err(|e| DistillError::Parse(e.to_string()))?;
-        Self::from_value(&v)
-    }
-
-    fn from_value(v: &Value) -> Result<Self, DistillError> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| DistillError::Parse("trace line is not a JSON object".to_string()))?;
-        let query_id = obj
-            .get("query_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let policy_tier = obj
-            .get("policy_tier")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut detail = std::collections::BTreeMap::new();
-        if let Some(map) = obj.get("detail").and_then(Value::as_object) {
-            for (k, val) in map {
-                let s = match val {
-                    Value::String(s) => s.clone(),
-                    Value::Null => continue,
-                    other => other.to_string(),
-                };
-                detail.insert(k.clone(), s);
-            }
-        }
-        Ok(Self {
-            query_id,
-            policy_tier,
-            detail,
-        })
-    }
-
-    fn detail_f32(&self, key: &str) -> f32 {
-        self.detail
-            .get(key)
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0)
-    }
-
-    fn detail_u8(&self, key: &str) -> u8 {
-        self.detail
-            .get(key)
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0)
-    }
-
-    fn detail_usize(&self, key: &str) -> usize {
-        self.detail
-            .get(key)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    }
-
-    fn detail_str(&self, key: &str) -> &str {
-        self.detail.get(key).map(String::as_str).unwrap_or("")
-    }
-}
 
 /// Errors surfaced by distillation.
 #[derive(Debug, thiserror::Error)]
@@ -271,23 +195,18 @@ const DISTILL_LR: f32 = 0.5;
 /// set (sorted, so class order is deterministic) and scores it on the same fixture. Returns
 /// [`DistillError::Empty`] when no labelled samples are present.
 pub fn distill_from_trace(path: &Path) -> Result<f32, DistillError> {
-    let text = std::fs::read_to_string(path)?;
+    let events = read_trace_compat(path)?;
     let mut samples: Vec<(Vec<f32>, String)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let rec = TraceRecord::from_json_line(line)?;
-        let label = match &rec.policy_tier {
+    for ev in &events {
+        let label = match &ev.policy_tier {
             Some(l) if !l.is_empty() => l.clone(),
             _ => continue,
         };
         let x = features_from_state(
-            rec.detail_str("query"),
-            rec.detail_u8("hops"),
-            rec.detail_usize("candidates"),
-            rec.detail_f32("ambiguity"),
+            ev.detail.get("query").map(String::as_str).unwrap_or(""),
+            detail_u8(ev, "hops"),
+            detail_usize(ev, "candidates"),
+            detail_f32(ev, "ambiguity"),
         );
         samples.push((x, label));
     }
@@ -306,6 +225,90 @@ pub fn distill_from_trace(path: &Path) -> Result<f32, DistillError> {
         .filter(|(x, y)| &policy.predict(x) == y)
         .count();
     Ok(correct as f32 / samples.len() as f32)
+}
+
+fn detail_f32(ev: &search_trace::TraceEvent, key: &str) -> f32 {
+    ev.detail
+        .get(key)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0)
+}
+
+fn detail_u8(ev: &search_trace::TraceEvent, key: &str) -> u8 {
+    ev.detail
+        .get(key)
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0)
+}
+
+fn detail_usize(ev: &search_trace::TraceEvent, key: &str) -> usize {
+    ev.detail
+        .get(key)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Read a trace through the frozen [`search_trace::read_trace`].
+///
+/// The committed Stage-9 fixture predates the frozen wire form: it tags `phase`
+/// as PascalCase (`"Route"`) whereas `search_trace::Phase` deserialises the
+/// snake_case form (`"route"`). Rather than duplicate a parser or weaken the
+/// schema, this adapter normalises only the `phase` casing and hands the
+/// canonical JSONL back to `read_trace`. A trace that is canonical to begin with
+/// is read directly.
+fn read_trace_compat(path: &Path) -> Result<Vec<search_trace::TraceEvent>, DistillError> {
+    match search_trace::read_trace(path) {
+        Ok(events) => Ok(events),
+        Err(first_err) => {
+            let text = std::fs::read_to_string(path)?;
+            let mut normalized = String::with_capacity(text.len());
+            let mut changed = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match normalize_phase_case(trimmed) {
+                    Some(fixed) => {
+                        changed = true;
+                        normalized.push_str(&fixed);
+                    }
+                    None => normalized.push_str(trimmed),
+                }
+                normalized.push('\n');
+            }
+            if !changed {
+                // Not a phase-casing difference: the file is genuinely malformed
+                // for the frozen schema. Surface the original read error.
+                return Err(DistillError::Io(first_err));
+            }
+            let tmp = std::env::temp_dir().join(format!(
+                "search_distill_trace_{}_{}.jsonl",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::write(&tmp, normalized)?;
+            let result = search_trace::read_trace(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            Ok(result?)
+        }
+    }
+}
+
+/// Rewrite a trace line's `phase` tag to lowercase when it is PascalCase.
+/// Returns `None` when the line needs no change (or is not a JSON object).
+fn normalize_phase_case(line: &str) -> Option<String> {
+    let mut v: Value = serde_json::from_str(line).ok()?;
+    let phase = v.get("phase")?.as_str()?.to_string();
+    let lowered = phase.to_ascii_lowercase();
+    if lowered == phase {
+        return None;
+    }
+    *v.get_mut("phase")? = Value::String(lowered);
+    serde_json::to_string(&v).ok()
 }
 
 /// Artifact-backed distillation is **unavailable** in this environment.
@@ -376,5 +379,40 @@ mod tests {
         let p = dir.join("empty.jsonl");
         std::fs::write(&p, "\n\n").unwrap();
         assert!(matches!(distill_from_trace(&p), Err(DistillError::Empty)));
+    }
+
+    #[test]
+    fn canonical_trace_parses_through_read_trace() {
+        // A trace in the frozen STAGE8 wire form (snake_case phase) is read by
+        // `search_trace::read_trace` with no adapter, and distils.
+        use std::collections::BTreeMap;
+        let dir = std::env::temp_dir().join("search_distill_canonical_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("canonical.jsonl");
+        let mut lines = String::new();
+        for (tier, ambiguity) in [("cheap", 0.0f32), ("deep", 1.0f32)] {
+            for i in 0..4 {
+                let detail = BTreeMap::from([
+                    ("query".to_string(), "alpha beta".to_string()),
+                    ("hops".to_string(), "0".to_string()),
+                    ("candidates".to_string(), "1".to_string()),
+                    ("ambiguity".to_string(), ambiguity.to_string()),
+                ]);
+                let ev = search_trace::TraceEvent {
+                    ts_ms: 0,
+                    query_id: format!("q-{tier}-{i}"),
+                    phase: search_trace::Phase::Route,
+                    action: "choose_tier".to_string(),
+                    detail,
+                    policy_tier: Some(tier.to_string()),
+                    cost_ms: 0,
+                };
+                lines.push_str(&serde_json::to_string(&ev).unwrap());
+                lines.push('\n');
+            }
+        }
+        std::fs::write(&p, lines).unwrap();
+        let acc = distill_from_trace(&p).unwrap();
+        assert!(acc > 0.5, "canonical trace distils, got {acc}");
     }
 }

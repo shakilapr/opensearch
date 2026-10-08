@@ -22,12 +22,15 @@
 //! ## Trace emission (`PolicyTrace`)
 //!
 //! `docs/STAGE8_SPEC.md` freezes `search_trace::{Phase, TraceEvent, PolicyTrace}`.
-//! The `search-trace` crate is still a stub at the time of writing, so — as the
-//! integration brief permits — the emit call is defined behind the small local
-//! trait [`PhaseEmitter`] (with [`NoopEmitter`] as the default). When
-//! `search-trace` lands, an adapter `impl PhaseEmitter for search_trace::PolicyTrace`
-//! (mapping [`PhaseEvent`] → `TraceEvent`) replaces the local types without
-//! touching the navigation code.
+//! Emission goes through the small trait [`PhaseEmitter`]; the event type
+//! [`PhaseEvent`] **is** `search_trace::TraceEvent` (a type alias) and
+//! [`Phase`] **is** `search_trace::Phase` (re-exported), so a configured
+//! `search_trace::PolicyTrace` appends canonical JSONL that
+//! `search_trace::read_trace` reads back losslessly. [`NoopEmitter`] is the
+//! default sink (hermetic build); `impl PhaseEmitter for search_trace::PolicyTrace`
+//! makes the real tracer usable anywhere an emitter is accepted, and
+//! [`Pipeline::deep_search`](crate::Pipeline::deep_search) uses it when a trace
+//! path is configured.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,54 +48,29 @@ use search_nav::{
 use crate::pipeline::Pipeline;
 
 // ---------------------------------------------------------------------------
-// Trace emission (STAGE8 `PolicyTrace` interface, behind a local trait)
+// Trace emission (STAGE8 `PolicyTrace`)
 // ---------------------------------------------------------------------------
 
-/// Phase of one navigation request (mirrors `search_trace::Phase`,
-/// `docs/STAGE8_SPEC.md`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Query,
-    Analyze,
-    Route,
-    Retrieve,
-    Refresh,
-    Rerank,
-    Navigate,
-    Answer,
-}
+/// Phase of one navigation request. Re-exported from `search_trace` so the
+/// pipeline emits the frozen wire type directly (`docs/STAGE8_SPEC.md`).
+pub use search_trace::{Phase, TraceEvent};
 
-impl Phase {
-    /// Stable lowercase tag (matches the STAGE8 wire form).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Phase::Query => "query",
-            Phase::Analyze => "analyze",
-            Phase::Route => "route",
-            Phase::Retrieve => "retrieve",
-            Phase::Refresh => "refresh",
-            Phase::Rerank => "rerank",
-            Phase::Navigate => "navigate",
-            Phase::Answer => "answer",
-        }
-    }
-}
+/// One structured phase event — this **is** `search_trace::TraceEvent`, the
+/// STAGE8 wire type. Keeping the alias means traces emitted here round-trip
+/// through `search_trace::read_trace` verbatim.
+pub type PhaseEvent = TraceEvent;
 
-/// One structured phase event (mirrors `search_trace::TraceEvent`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhaseEvent {
-    pub ts_ms: u64,
-    pub query_id: String,
-    pub phase: Phase,
-    pub action: String,
-    pub detail: BTreeMap<String, String>,
-    pub policy_tier: Option<String>,
-    pub cost_ms: u64,
-}
-
-/// The one method a trace sink needs (mirrors `search_trace::PolicyTrace`).
+/// The one method a trace sink needs. Implemented by [`NoopEmitter`] (the
+/// hermetic default) and by `search_trace::PolicyTrace` (the real JSONL tracer).
 pub trait PhaseEmitter: Send + Sync {
     fn emit(&self, ev: &PhaseEvent);
+    /// Mint and install a fresh query id for the events that follow. Sinks that
+    /// own query identity (like `search_trace::PolicyTrace`) override this; the
+    /// default is a no-op, because most sinks tag events from the caller-set
+    /// `query_id` field.
+    fn new_query_id(&self) -> String {
+        String::new()
+    }
 }
 
 /// Discards every event; the default sink for the hermetic build.
@@ -100,6 +78,23 @@ pub struct NoopEmitter;
 
 impl PhaseEmitter for NoopEmitter {
     fn emit(&self, _ev: &PhaseEvent) {}
+}
+
+/// Adapter shim: the real `search_trace::PolicyTrace` is a `PhaseEmitter`, so it
+/// can be passed anywhere an emitter is accepted (including
+/// `Pipeline::deep_search_report_with`).
+///
+/// The frozen `PolicyTrace::emit(phase, action, cost_ms)` interface carries only
+/// phase/action/cost; the richer `detail`/`policy_tier` fields remain available
+/// on the [`PhaseEvent`] for other sinks.
+impl PhaseEmitter for search_trace::PolicyTrace {
+    fn emit(&self, ev: &PhaseEvent) {
+        search_trace::PolicyTrace::emit(self, ev.phase, ev.action.clone(), ev.cost_ms);
+    }
+
+    fn new_query_id(&self) -> String {
+        search_trace::PolicyTrace::new_query_id(self)
+    }
 }
 
 /// A deterministic query id (no randomness, so traces are reproducible).
@@ -388,6 +383,10 @@ pub fn run_deep_search(
     emitter: &dyn PhaseEmitter,
 ) -> AppResult<DeepSearchReport> {
     let qid = query_id(query, now);
+    // Ask the sink to start a fresh query (the real `PolicyTrace` mints its own
+    // process-unique id; `NoopEmitter` and other sinks keep the deterministic
+    // `qid` above that tags the caller-supplied events).
+    emitter.new_query_id();
     let emit = |phase: Phase, action: &str, tier: Option<&str>, cost_ms: u64, detail: &[(&str, String)]| {
         let mut d = BTreeMap::new();
         for (k, v) in detail {
@@ -411,6 +410,12 @@ pub fn run_deep_search(
     // `plan_budget` gives a tight budget (`max_actions == 2`) exactly for a
     // simple query; anything larger is treated as multi-hop.
     let multihop = budget.max_actions > 2;
+    tracing::debug!(
+        target: "agent0::deep",
+        multihop,
+        max_actions = budget.max_actions,
+        "deep search classified query"
+    );
     emit(
         Phase::Analyze,
         if multihop { "multihop" } else { "simple" },
@@ -469,6 +474,15 @@ pub fn run_deep_search(
 
     let trace: Vec<String> = outcome.trace.iter().map(|s| s.reason.clone()).collect();
     let model_calls = calls.load(Ordering::SeqCst) as u32;
+
+    tracing::info!(
+        target: "agent0::deep",
+        stop = stop_tag(outcome.stop),
+        steps = outcome.trace.len(),
+        hits = hits.len(),
+        model_calls,
+        "deep search completed"
+    );
 
     emit(
         Phase::Answer,
@@ -536,7 +550,10 @@ impl Pipeline {
         limit: usize,
         now: i64,
     ) -> AppResult<DeepSearchReport> {
-        run_deep_search(self.searcher(), query, limit, now, &NoopEmitter)
+        match self.trace.as_deref() {
+            Some(trace) => run_deep_search(self.searcher(), query, limit, now, trace),
+            None => run_deep_search(self.searcher(), query, limit, now, &NoopEmitter),
+        }
     }
 
     /// Like [`Pipeline::deep_search_report`] with an explicit trace emitter

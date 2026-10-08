@@ -33,7 +33,9 @@ pub use deep::{
     run_deep_search, DeepHit, DeepResult, DeepSearchReport, DocText, NoopEmitter, Phase,
     PhaseEmitter, PhaseEvent, PipelineDeepSearcher,
 };
+pub use search_api::init_tracing;
 pub use search_nav::StopReason;
+pub use search_trace::{JsonlTraceSink, PolicyTrace, TraceEvent};
 pub use pipeline::{
     scheduler_config_from_env, DiscoveryReport, IngestOutcome, Pipeline, RefreshReport,
     SourceFirstSearcher, DEFAULT_REFRESH_BUDGET,

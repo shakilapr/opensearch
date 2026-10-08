@@ -30,6 +30,8 @@ search-retrieval = { path = "../retrieval" }
 search-scheduler = { path = "../scheduler" }
 # Stage-4 deep navigation (Navigator + SearchExecutor over the index).
 search-nav = { path = "../nav" }
+# Stage-8 PolicyTrace (real JSONL trace emitter/reader).
+search-trace = { path = "../trace" }
 # `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
 # (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
 search-api = { path = "../api", features = ["real-indexer"] }

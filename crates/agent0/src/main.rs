@@ -16,6 +16,9 @@ use search_core::config::Config;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Honour RUST_LOG (default `info`); without this the deploy unit's RUST_LOG
+    // produces no output at all.
+    search_agent0::init_tracing();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("ingest") => match args.get(2) {

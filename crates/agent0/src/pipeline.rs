@@ -84,6 +84,7 @@ use search_scheduler::{
     BudgetLedger, SchedulerConfig, SourceDue,
 };
 use search_sources::SourceProfile;
+use search_trace::PolicyTrace;
 
 /// Bumped when the Stage-0 HTML normalization contract changes.
 const PARSER_VERSION: &str = "stage0-html-v1";
@@ -229,6 +230,11 @@ pub struct Pipeline {
     /// internal charge (which `ActivationScheduler` does not expose), so the
     /// crawl loop can implement refund-on-abort itself.
     dispatch_budget: BudgetLedger,
+    /// Optional real `search_trace::PolicyTrace` (STAGE8). `None` (the default)
+    /// keeps the hermetic no-op emitter; a JSONL path configured through
+    /// `SEARCH_TRACE_PATH` (or [`Pipeline::set_trace_jsonl`]) makes every
+    /// `deep_search` append canonical trace events.
+    pub(crate) trace: Option<Arc<PolicyTrace>>,
 }
 
 impl Pipeline {
@@ -274,6 +280,22 @@ impl Pipeline {
             .build()
             .map_err(|e| AppError::Internal(format!("failed to build http client: {e}")))?;
 
+        // STAGE8 trace sink: only when explicitly configured. A missing or
+        // unopenable path degrades to the no-op emitter (with a warning) rather
+        // than failing startup.
+        let trace = match std::env::var("SEARCH_TRACE_PATH") {
+            Ok(path) if !path.trim().is_empty() => {
+                match search_trace::JsonlTraceSink::new(path.clone()) {
+                    Ok(sink) => Some(Arc::new(PolicyTrace::new(Box::new(sink)))),
+                    Err(e) => {
+                        tracing::warn!(path = %path, error = %e, "trace sink unavailable; continuing without traces");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Ok(Self {
             cfg: cfg.clone(),
             meta: Mutex::new(writer),
@@ -286,7 +308,19 @@ impl Pipeline {
             allow_loopback,
             scheduler: ActivationScheduler::new(scheduler_cfg, BudgetLedger::new(budget_capacity)),
             dispatch_budget: BudgetLedger::new(budget_capacity),
+            trace,
         })
+    }
+
+    /// Configure a real `search_trace::PolicyTrace` JSONL sink: every subsequent
+    /// `deep_search` appends its phase events to `path` (created, appending if
+    /// present). Additive; the default build keeps the no-op emitter. Returns the
+    /// I/O error if the file cannot be opened.
+    pub fn set_trace_jsonl(&mut self, path: impl Into<PathBuf>) -> AppResult<()> {
+        let sink = search_trace::JsonlTraceSink::new(path.into())
+            .map_err(|e| AppError::Internal(format!("failed to open trace sink: {e}")))?;
+        self.trace = Some(Arc::new(PolicyTrace::new(Box::new(sink))));
+        Ok(())
     }
 
     /// The searcher the HTTP API should be wired to (real Tantivy indexer behind
@@ -329,7 +363,16 @@ impl Pipeline {
             deadline_ms: None,
             filters: None,
         };
-        search_api::execute(&searcher, &req)
+        let resp = search_api::execute(&searcher, &req)?;
+        tracing::info!(
+            target: "agent0::search",
+            query_len = q.len(),
+            limit,
+            hits = resp.results.len(),
+            timing_ms = resp.timing_ms,
+            "search served"
+        );
+        Ok(resp)
     }
 
     // --------------------------------------------------------------- Stage 3
@@ -512,10 +555,12 @@ impl Pipeline {
         // Charge before dispatch: a refused charge means no fetch is attempted.
         if !self.dispatch_budget.try_charge(1) {
             report.skipped += 1;
+            tracing::warn!(target: "agent0::refresh", url = %redact(&act.url), "refresh skipped: dispatch budget exhausted");
             self.scheduler.release(&act.url, &act.origin);
             return;
         }
         report.activations.push(act.url.clone());
+        tracing::info!(target: "agent0::refresh", url = %redact(&act.url), priority = ?act.priority, "dispatching refresh activation");
         match self.crawl_one(&act.url).await {
             Ok(outcome) => {
                 report.fetched += 1;
@@ -689,6 +734,8 @@ impl Pipeline {
         let origin = origin_of(&parsed);
         let robots_url = format!("{origin}/robots.txt");
 
+        tracing::debug!(target: "agent0::crawl", url = %redact(&canonical), "crawl_one start");
+
         // (2) SSRF guard BEFORE any network I/O.
         self.guard(&canonical).await?;
         self.guard(&robots_url).await?;
@@ -714,6 +761,7 @@ impl Pipeline {
             if let Some(l) = &lease {
                 let _ = self.frontier.fail(l, now, false);
             }
+            tracing::info!(target: "agent0::crawl", url = %redact(&canonical), "robots.txt denied crawl");
             return Ok(IngestOutcome::Denied {
                 url: canonical,
                 resource_id: resource_id.into_string(),
@@ -734,6 +782,7 @@ impl Pipeline {
         };
 
         if outcome.status == 304 {
+            tracing::info!(target: "agent0::crawl", url = %redact(&canonical), "not modified (304): reusing previous version");
             self.observe_source(&host, true, false)?;
             self.persist_freshness(&resource_id, None, None, now, None)?;
             if let Some(l) = &lease {
@@ -775,6 +824,7 @@ impl Pipeline {
             if let Some(l) = &lease {
                 let _ = self.frontier.complete(l, now);
             }
+            tracing::debug!(target: "agent0::crawl", url = %redact(&canonical), route = "feed", discovered, "routed response to feed");
             return Ok(IngestOutcome::Routed {
                 url: canonical,
                 resource_id: resource_id.into_string(),
@@ -809,6 +859,7 @@ impl Pipeline {
                 }
                 let dv = DocVerId::from_parts(&resource_id, *vno).into_string();
                 let rid = resource_id.into_string();
+                tracing::info!(target: "agent0::crawl", url = %redact(&canonical), "content unchanged: no new document version");
                 return Ok(IngestOutcome::Unchanged {
                     url: canonical,
                     resource_id: rid,
@@ -905,6 +956,13 @@ impl Pipeline {
             now,
         );
         self.indexer.index_overlay(index_doc)?;
+        tracing::debug!(
+            target: "agent0::index",
+            doc_id = resource_id.as_str(),
+            version = version_no,
+            generation,
+            "indexed overlay document"
+        );
         self.record_stage(&op_key, resource_id.as_str(), IngestStage::LexicalIndexed)?;
 
         // GRAPH_INDEXED — recorded no-op: no graph projection wired yet.
@@ -912,6 +970,12 @@ impl Pipeline {
 
         // Publish manifest + watermark, then VISIBLE.
         let manifest = self.indexer.publish_manifest()?;
+        tracing::info!(
+            target: "agent0::index",
+            generation = manifest.generation,
+            doc_count = manifest.doc_count,
+            "published index manifest"
+        );
         {
             let mut w = self.meta.lock().unwrap();
             Watermark::publish(&w, manifest.generation)?;
@@ -928,6 +992,13 @@ impl Pipeline {
             let _ = self.frontier.complete(l, now);
         }
 
+        tracing::info!(
+            target: "agent0::crawl",
+            url = %redact(&canonical),
+            version = version_no,
+            kind,
+            "ingested new document version"
+        );
         Ok(IngestOutcome::Ingested {
             url: canonical,
             resource_id: resource_id.into_string(),
@@ -1541,6 +1612,20 @@ fn origin_of_url(raw: &str) -> String {
     match Url::parse(raw) {
         Ok(u) => origin_of(&u),
         Err(_) => String::new(),
+    }
+}
+
+/// Log-safe form of a URL: any embedded userinfo (`user:pass@`) is stripped so
+/// credentials can never reach the log. An unparseable URL collapses to a fixed
+/// placeholder rather than being echoed verbatim.
+fn redact(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string()
+        }
+        Err(_) => "<unparseable-url>".to_string(),
     }
 }
 
