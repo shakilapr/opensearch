@@ -25,6 +25,9 @@ dumps/
 *.sql
 *.dump
 
+# Migrations are source, not data: never ignore the schema DDL.
+!crates/metadata/migrations/*.sql
+
 # ------------------------------------------------------------------------------
 # 2. Machine Learning Weights, Checkpoints & Embeddings
 # ------------------------------------------------------------------------------
