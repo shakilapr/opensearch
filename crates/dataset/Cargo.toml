@@ -11,3 +11,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 quick-xml.workspace = true
 flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,5 @@
+{"url":"https://example.com/a","status":"200","mime":"text/html","title":"Example A","text":"Alpha page body text about search engines at scale.","timestamp":"20240102030405","languages":"eng"}
+{"url":"https://example.com/b","status":"200","mime":"text/html","title":"Example B","text":"Beta page body about crawling the open web.","timestamp":"20240103040506","languages":"eng"}
+{"url":"https://example.org/c","status":"404","mime":"text/html","title":"Missing C","content":"Not found page body.","timestamp":"20240104050607","languages":"eng"}
+{"url":"https://example.org/d","status":"200","mime":"text/plain","title":"Notes D","text":"Delta notes on dataset packs and stable checksums.","timestamp":"20240105100000"}
+{"url":"https://example.net/e","status":"200","mime":"text/html","title":"Post E","text":"Epsilon post about release packs and manifests.","timestamp":"20240106120000","languages":"eng,fra"}

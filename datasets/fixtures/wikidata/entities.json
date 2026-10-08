@@ -1,0 +1,31 @@
+[
+  {
+    "id": "Q42",
+    "type": "item",
+    "labels": { "en": { "language": "en", "value": "Douglas Adams" }, "de": { "language": "de", "value": "Douglas Adams" } },
+    "descriptions": { "en": { "language": "en", "value": "English writer and humorist" } },
+    "sitelinks": { "enwiki": { "site": "enwiki", "title": "Douglas Adams" } },
+    "claims": { "P31": [ {} ], "P106": [ {}, {} ] }
+  },
+  {
+    "id": "Q5",
+    "type": "item",
+    "labels": { "en": { "language": "en", "value": "human" } },
+    "descriptions": { "en": { "language": "en", "value": "common name for a person" } },
+    "sitelinks": { "enwiki": { "site": "enwiki", "title": "Human" } },
+    "claims": { "P31": [ {} ] }
+  },
+  {
+    "id": "Q1",
+    "type": "item",
+    "labels": { "fr": { "language": "fr", "value": "Univers" } },
+    "descriptions": { "fr": { "language": "fr", "value": "ensemble de tout ce qui existe" } }
+  },
+  {
+    "id": "P31",
+    "type": "property",
+    "datatype": "wikibase-item",
+    "labels": { "en": { "language": "en", "value": "instance of" } },
+    "descriptions": { "en": { "language": "en", "value": "class of which this subject is an instance" } }
+  }
+]

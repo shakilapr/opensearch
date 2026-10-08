@@ -1,0 +1,31 @@
+{
+  "meta": { "count": 3, "db_response_time_ms": 12, "page": 1, "per_page": 25, "next_cursor": null },
+  "results": [
+    {
+      "id": "https://openalex.org/W1",
+      "doi": "https://doi.org/10.1/abc",
+      "display_name": "Search Engines at Scale",
+      "publication_date": "2021-05-01",
+      "type": "article",
+      "cited_by_count": 42,
+      "abstract_inverted_index": { "Search": [0], "engines": [1], "at": [2], "scale": [3], "index": [4], "the": [5], "web": [6] },
+      "primary_location": { "landing_page_url": "https://journal.example.com/w1", "source": { "display_name": "Journal of Search" } }
+    },
+    {
+      "id": "https://openalex.org/W2",
+      "display_name": "Crawling the Web",
+      "publication_date": "2019-11-20",
+      "type": "preprint",
+      "cited_by_count": 7,
+      "primary_location": { "landing_page_url": "https://arxiv.org/abs/1234.5678" }
+    },
+    {
+      "id": "https://openalex.org/W3",
+      "doi": "https://doi.org/10.2/xyz",
+      "title": "Dataset Packs",
+      "publication_date": "2023-02-15",
+      "type": "dataset",
+      "cited_by_count": 0
+    }
+  ]
+}

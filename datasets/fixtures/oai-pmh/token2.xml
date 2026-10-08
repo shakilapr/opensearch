@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"
+         xmlns:oai_dc="http://www.openarchives.org/OAI/2.0/oai_dc/"
+         xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <responseDate>2024-01-01T00:00:01Z</responseDate>
+  <request verb="ListRecords">https://repo.example.com/oai</request>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:repo.example.com:3</identifier>
+        <datestamp>2024-01-04T00:00:00Z</datestamp>
+      </header>
+      <metadata>
+        <oai_dc:dc>
+          <dc:title>Third Article</dc:title>
+          <dc:identifier>https://repo.example.com/items/3</dc:identifier>
+          <dc:description>A third abstract about datasets.</dc:description>
+        </oai_dc:dc>
+      </metadata>
+    </record>
+    <record>
+      <header>
+        <identifier>oai:repo.example.com:4</identifier>
+        <datestamp>2024-01-05T00:00:00Z</datestamp>
+      </header>
+      <metadata>
+        <oai_dc:dc>
+          <dc:title>Fourth Article</dc:title>
+          <dc:identifier>https://repo.example.com/items/4</dc:identifier>
+          <dc:description>A fourth abstract about validation.</dc:description>
+        </oai_dc:dc>
+      </metadata>
+    </record>
+    <resumptionToken completeListSize="5" cursor="2">token3</resumptionToken>
+  </ListRecords>
+</OAI-PMH>

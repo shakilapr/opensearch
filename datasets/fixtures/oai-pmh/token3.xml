@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"
+         xmlns:oai_dc="http://www.openarchives.org/OAI/2.0/oai_dc/"
+         xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <responseDate>2024-01-01T00:00:02Z</responseDate>
+  <request verb="ListRecords">https://repo.example.com/oai</request>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:repo.example.com:5</identifier>
+        <datestamp>2024-01-06T00:00:00Z</datestamp>
+      </header>
+      <metadata>
+        <oai_dc:dc>
+          <dc:title>Fifth Article</dc:title>
+          <dc:identifier>https://repo.example.com/items/5</dc:identifier>
+          <dc:description>A final abstract; the resumption token is exhausted.</dc:description>
+        </oai_dc:dc>
+      </metadata>
+    </record>
+    <resumptionToken completeListSize="5" cursor="4"/>
+  </ListRecords>
+</OAI-PMH>

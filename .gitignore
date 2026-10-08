@@ -8,7 +8,7 @@
 models/
 raw-dataset/
 raw_dataset/
-datasets/
+datasets/*
 corpus/
 dumps/
 
@@ -195,3 +195,7 @@ $RECYCLE.BIN/
 # Benchmark fixtures are small, hand-labelled, and committed on purpose.
 !benchmarks/corpus/
 !benchmarks/*.jsonl
+
+# Dataset adapters' offline fixtures are small and committed on purpose.
+!datasets/fixtures/
+!datasets/fixtures/**
