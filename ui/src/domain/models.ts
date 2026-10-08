@@ -16,6 +16,13 @@ export interface SearchSitelink {
   readonly snippet: string;
 }
 
+/** One named provenance signal behind a result ("Why this result?"). */
+export interface SearchSignal {
+  readonly name: string;
+  readonly value: number;
+  readonly note: string;
+}
+
 export interface SearchResult {
   readonly id: string;
   readonly title: string;
@@ -29,6 +36,10 @@ export interface SearchResult {
   readonly tags: readonly string[];
   readonly imageUrl?: string;
   readonly sitelinks?: readonly SearchSitelink[];
+  /** Per-signal provenance from the API (`bm25`, `freshness`, ...). */
+  readonly signals?: readonly SearchSignal[];
+  /** True when the result came from the recent overlay window. */
+  readonly liveOverlay?: boolean;
   readonly aerospaceTelemetry?: {
     readonly mission: string;
     readonly orbitAltitudeKm?: number;
