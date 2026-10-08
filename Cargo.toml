@@ -21,6 +21,11 @@ members = [
     "crates/scheduler",
     "crates/bench",
     "crates/nav",
+    "crates/dedup",
+    "crates/tiers",
+    "crates/patterns",
+    "crates/dataset",
+    "crates/mcp",
     "crates/api",
     "crates/agent0",
 ]
