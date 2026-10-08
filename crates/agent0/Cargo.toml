@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "search_agent0"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent0"
 path = "src/main.rs"
@@ -15,7 +19,10 @@ search-ingest = { path = "../ingest" }
 search-indexer = { path = "../indexer" }
 search-frontier = { path = "../frontier" }
 search-fetcher = { path = "../fetcher" }
-search-api = { path = "../api" }
+search-parser = { path = "../parser" }
+# `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
+# (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
+search-api = { path = "../api", features = ["real-indexer"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,3 +30,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+url.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
