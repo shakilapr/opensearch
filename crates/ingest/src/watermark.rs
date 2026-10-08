@@ -12,10 +12,11 @@
 //! whose `visible_generation <= Watermark::visible()`. Raising the watermark is
 //! therefore the atomic publish step that makes a whole generation searchable.
 //!
-//! The watermark is stored in the `published_watermark` table (a single row,
-//! created lazily by this module because it is owned by the ingest/publish
-//! path). It is **monotonic**: `publish` never lowers it, so a stale publisher
-//! cannot make already-visible documents disappear.
+//! The watermark lives in the `published_watermark` table (a single row). The
+//! **schema is owned by metadata** and created by migration
+//! `crates/metadata/migrations/0002_watermark.sql` — this module never runs DDL.
+//! The watermark is **monotonic**: `publish` never lowers it, so a stale
+//! publisher cannot make already-visible documents disappear.
 
 use search_core::{AppError, AppResult};
 use search_metadata::{db_err, MetadataReader, MetadataWriter};
@@ -23,24 +24,12 @@ use search_metadata::{db_err, MetadataReader, MetadataWriter};
 /// Publication watermark barrier.
 ///
 /// Persisted as a single row in `published_watermark`:
-/// `(singleton INTEGER PRIMARY KEY CHECK(singleton = 1), generation, updated_at)`.
+/// `(id INTEGER PRIMARY KEY CHECK(id = 1), generation, published_at)`.
 pub struct Watermark;
 
 impl Watermark {
     /// Sentinel row id; the table holds exactly one row.
     const SINGLETON: i64 = 1;
-
-    fn ensure_table(conn: &rusqlite::Connection) -> AppResult<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS published_watermark (
-                 singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 generation INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );",
-        )
-        .map_err(db_err)?;
-        Ok(())
-    }
 
     /// Publish `generation` as the new visible watermark.
     ///
@@ -53,14 +42,13 @@ impl Watermark {
     /// owns the writer).
     pub fn publish(writer: &MetadataWriter, generation: u64) -> AppResult<()> {
         let conn = writer.conn();
-        Self::ensure_table(conn)?;
         let now = search_core::time::now_unix_s();
         conn.execute(
-            "INSERT INTO published_watermark(singleton, generation, updated_at)
+            "INSERT INTO published_watermark(id, generation, published_at)
              VALUES (?1, ?2, ?3)
-             ON CONFLICT(singleton) DO UPDATE SET
+             ON CONFLICT(id) DO UPDATE SET
                  generation = MAX(published_watermark.generation, excluded.generation),
-                 updated_at = excluded.updated_at",
+                 published_at = excluded.published_at",
             rusqlite::params![Self::SINGLETON, generation as i64, now],
         )
         .map_err(db_err)?;
@@ -70,24 +58,14 @@ impl Watermark {
 
     /// The highest generation currently visible to search.
     ///
-    /// Returns `0` when nothing has been published yet (nothing is visible), or
-    /// when the table has not been created.
+    /// Returns `0` when nothing has been published yet (nothing is visible).
+    /// The table always exists — it is created by migration 0002 — so a missing
+    /// row simply means \"no publish yet\".
     pub fn visible(reader: &MetadataReader) -> AppResult<u64> {
         let conn = reader.conn();
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'published_watermark'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(db_err)?;
-        if exists == 0 {
-            return Ok(0);
-        }
         let g: i64 = conn
             .query_row(
-                "SELECT generation FROM published_watermark WHERE singleton = ?1",
+                "SELECT generation FROM published_watermark WHERE id = ?1",
                 rusqlite::params![Self::SINGLETON],
                 |r| r.get(0),
             )

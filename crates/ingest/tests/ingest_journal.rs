@@ -192,6 +192,48 @@ fn watermark_is_monotonic_and_gates_visibility() {
     assert!(Watermark::check_publish(10, 9).is_ok());
 }
 
+/// Watermark works against a database created purely by migrations: the
+/// `published_watermark` table exists before any watermark call, so the module
+/// performs no lazy DDL.
+#[test]
+fn watermark_works_on_migrated_db_without_lazy_ddl() {
+    let db = Db::new();
+
+    // Create the schema the only supported way: the migration runner.
+    let conn = search_metadata::writer::open(&db.path).unwrap();
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name = 'published_watermark'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        present, 1,
+        "published_watermark must come from migration 0002, not lazy creation"
+    );
+    // No row yet: nothing is published, nothing visible.
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM published_watermark", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "fresh watermark table starts empty");
+    drop(conn);
+
+    let w = db.writer();
+    let r = db.reader();
+    assert_eq!(Watermark::visible(&r).unwrap(), 0);
+
+    Watermark::publish(&w, 11).unwrap();
+    assert_eq!(Watermark::visible(&r).unwrap(), 11);
+    assert!(Watermark::is_visible(11, 11));
+    assert!(!Watermark::is_visible(12, 11));
+
+    // Publishing a lower generation stays monotonic.
+    Watermark::publish(&w, 4).unwrap();
+    assert_eq!(Watermark::visible(&r).unwrap(), 11);
+}
+
 /// Stage ordering helpers behave strictly.
 #[test]
 fn stage_order_helpers() {
