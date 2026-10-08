@@ -1,0 +1,13 @@
+[package]
+name = "search-rerank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+search-retrieval = { path = "../retrieval" }
+search-graph = { path = "../graph" }
+serde.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
