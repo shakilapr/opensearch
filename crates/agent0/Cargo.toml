@@ -20,6 +20,12 @@ search-indexer = { path = "../indexer" }
 search-frontier = { path = "../frontier" }
 search-fetcher = { path = "../fetcher" }
 search-parser = { path = "../parser" }
+# Stage-1 components wired into the pipeline.
+search-discovery = { path = "../discovery" }
+search-router = { path = "../router" }
+search-pdf = { path = "../pdf" }
+search-sources = { path = "../sources" }
+search-retrieval = { path = "../retrieval" }
 # `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
 # (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
 search-api = { path = "../api", features = ["real-indexer"] }
@@ -33,6 +39,7 @@ anyhow.workspace = true
 url.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

@@ -138,5 +138,14 @@ fn outcome_json(o: &search_agent0::IngestOutcome) -> serde_json::Value {
         } => serde_json::json!({
             "status": "denied", "url": url, "resource_id": resource_id, "reason": reason,
         }),
+        Routed {
+            url,
+            resource_id,
+            route,
+            discovered,
+        } => serde_json::json!({
+            "status": "routed", "url": url, "resource_id": resource_id,
+            "route": route, "discovered": discovered,
+        }),
     }
 }

@@ -21,4 +21,4 @@
 
 pub mod pipeline;
 
-pub use pipeline::{IngestOutcome, Pipeline};
+pub use pipeline::{DiscoveryReport, IngestOutcome, Pipeline, SourceFirstSearcher};
