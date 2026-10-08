@@ -8,11 +8,7 @@
 use crate::query::{IndexHit, Searcher};
 use search_core::{AppResult, IndexManifest, SearchFilters, SearchResult};
 use search_indexer::Indexer;
-use std::path::Path;
 use std::sync::Arc;
-
-/// The manifest file the indexer writes on every publish (`indexer::store`).
-const MANIFEST_FILE: &str = "_manifest.json";
 
 /// Adapts [`search_indexer::Indexer`] to the API's [`Searcher`] trait.
 pub struct IndexerSearcher {
@@ -46,18 +42,15 @@ impl Searcher for IndexerSearcher {
     }
 
     fn manifest(&self) -> AppResult<IndexManifest> {
-        // Read-side gap: `search_indexer::Indexer` exposes no `manifest()`
-        // getter, only `publish_manifest()` (write side) plus the public
-        // `visible_generation()`/`overlay_watermark()`/`base_dir()` accessors.
-        // It DOES persist the current published manifest as `_manifest.json`
-        // under the public `base_dir()`, so we read that file back here. If the
-        // indexer ever grows an in-memory getter, use it instead.
-        let path = self.indexer.base_dir().join(MANIFEST_FILE);
-        if path.exists() {
-            return read_manifest(&path);
+        // Read the published manifest through the indexer's own read-side API.
+        // No file-path coupling: the persisted manifest location stays private
+        // to the indexer crate.
+        if let Some(m) = self.indexer.manifest()? {
+            return Ok(m);
         }
         // Nothing published yet: report the honest unpublished state, carrying
-        // the current visible generation from the public read API.
+        // the current visible generation from the public read API. A generation
+        // of 0 makes `execute` mark the response `index_unpublished`.
         let generation = self.indexer.visible_generation();
         Ok(IndexManifest {
             manifest_id: if generation == 0 {
@@ -75,13 +68,6 @@ impl Searcher for IndexerSearcher {
             published_at: None,
         })
     }
-}
-
-/// Deserialize a persisted manifest file. `IndexManifest` is `Deserialize` (the
-/// indexer uses the same type), so this is a faithful read of the published row.
-fn read_manifest(path: &Path) -> AppResult<IndexManifest> {
-    let bytes = std::fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Build the indexer query from the user text plus pushed-down field filters.
