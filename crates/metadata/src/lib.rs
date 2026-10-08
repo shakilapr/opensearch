@@ -13,7 +13,11 @@ pub mod migrations;
 pub mod schema;
 pub mod writer;
 
-pub use writer::{MetadataReader, MetadataWriter, Mutation};
+pub use schema::{DocVersionRow, FrontierRow, IngestEventRow, ManifestRow, ResourceRow};
+pub use writer::{
+    spawn_writer, spawn_writer_with, MetadataReader, MetadataWriter, Mutation, WriterHandle,
+    DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL_MS,
+};
 
 /// Map a rusqlite error into the shared taxonomy. Lives here (not in core) to
 /// keep `core` free of storage dependencies.
