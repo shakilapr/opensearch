@@ -18,6 +18,8 @@ members = [
     "crates/eval",
     "crates/embed",
     "crates/rerank",
+    "crates/scheduler",
+    "crates/bench",
     "crates/api",
     "crates/agent0",
 ]

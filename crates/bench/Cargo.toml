@@ -1,0 +1,24 @@
+[package]
+name = "search-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+search-core = { path = "../core" }
+search-indexer = { path = "../indexer" }
+search-parser = { path = "../parser" }
+search-eval = { path = "../eval" }
+search-embed = { path = "../embed" }
+search-rerank = { path = "../rerank" }
+search-retrieval = { path = "../retrieval" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
