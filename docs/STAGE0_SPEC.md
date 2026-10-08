@@ -32,6 +32,7 @@ projects/search/
 │   ├── ingest/                # journal + state machine + projection coordination
 │   ├── frontier/              # per-origin queues, leases, backpressure
 │   ├── fetcher/               # HTTP, URL canon, robots, CrawlPolicy, SSRF guard
+│   ├── parser/                # response normalization (HTML -> NormalizedDoc)
 │   ├── indexer/               # Tantivy base + overlay, manifest publish
 │   ├── api/                   # POST /search, GET /health
 │   └── agent0/                # Stage-0 driver binary (crawl + serve)
@@ -48,6 +49,19 @@ projects/search/
 `.stignore`. A WAL SQLite database or a Tantivy MmapDirectory copied mid-write
 is corrupt, and WAL does not work over a network filesystem. Both are already
 handled by `.stignore` + a gitignored `data/`.
+
+Migrations are numbered files under `crates/metadata/migrations/` applied in
+order by `crates/metadata/src/migrations.rs`; every migration must be idempotent
+(`IF NOT EXISTS`) so a replay is safe. All tables the system needs — including
+`published_watermark` — must be created by a migration, never lazily at runtime,
+so a fresh database created from migrations alone is complete.
+
+Frontier lease acquisition is a deliberate single-connection exception to the
+batched metadata writer: acquiring a lease is an atomic read-modify-write
+(`SELECT` eligible rows then `UPDATE` them in one transaction) that a batched
+mutation queue cannot express without either losing atomicity or serializing all
+work behind one channel. The frontier therefore owns one connection with WAL and
+`busy_timeout`; at distributed scale this is the layer that would be replaced.
 
 ## 2. Identity model
 
