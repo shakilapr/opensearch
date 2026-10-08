@@ -53,6 +53,83 @@ fn migrations_are_idempotent() {
     assert_eq!(n, 1, "schema present after repeated migration");
 }
 
+/// (a2) Applying migrations twice is idempotent AND migration 0002 has created
+/// the `published_watermark` table. Every table the Stage-0 schema needs is
+/// present in `sqlite_master` after migrations alone — no lazy `CREATE TABLE`.
+#[test]
+fn migrations_create_watermark_and_all_expected_tables() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+
+    // `open` runs migrations; run the runner twice more to prove idempotency.
+    let conn = search_metadata::writer::open(&path).unwrap();
+    search_metadata::migrations::apply(&conn).unwrap();
+    search_metadata::migrations::apply(&conn).unwrap();
+
+    // Migration ledger records exactly the known versions, once each.
+    let versions: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migration ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(versions, vec![1, 2], "each migration applied exactly once");
+
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+
+    let mut expected = vec![
+        "content",
+        "crawl_policy",
+        "document_version",
+        "domain",
+        "fetch_observation",
+        "frontier_entry",
+        "ingest_event",
+        "ingest_op",
+        "manifest",
+        "origin_state",
+        "published_watermark",
+        "resource",
+        "robots_cache",
+        "schema_migration",
+        "source",
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        tables,
+        expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "sqlite_master table set after migrations"
+    );
+
+    // The watermark table is really the 0002 single-row shape: the CHECK(id=1)
+    // constraint must reject a second row.
+    conn.execute(
+        "INSERT INTO published_watermark(id, generation, published_at) VALUES (1, 0, 0)",
+        [],
+    )
+    .unwrap();
+    let dup = conn.execute(
+        "INSERT INTO published_watermark(id, generation, published_at) VALUES (2, 0, 0)",
+        [],
+    );
+    assert!(dup.is_err(), "published_watermark must hold exactly one row");
+}
+
 /// (b) apply_batch of 3 mutations commits atomically and rows are readable.
 #[test]
 fn apply_batch_commits_atomically_and_is_readable() {
