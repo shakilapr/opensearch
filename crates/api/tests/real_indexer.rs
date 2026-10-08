@@ -96,7 +96,18 @@ async fn real_indexer_search_returns_indexed_docs_through_the_router() {
     assert_eq!(d1["source_id"], "news");
     assert_eq!(d1["lane"], "lexical_base");
     assert_eq!(d1["provenance"], "snapshot");
-    assert!(d1["signals"].as_array().map(|s| !s.is_empty()).unwrap_or(false));
+    let signals = d1["signals"].as_array().expect("signals array");
+    assert!(!signals.is_empty());
+    let names: Vec<&str> = signals.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    for want in [
+        "bm25",
+        "source_authority",
+        "freshness",
+        "entity_match",
+        "graph_expansion",
+    ] {
+        assert!(names.contains(&want), "missing signal {want}: {names:?}");
+    }
     assert!(d1["version"].as_u64().unwrap() >= 1);
 
     // Reproducibility tuple is populated from the real published manifest.
@@ -144,6 +155,36 @@ async fn real_indexer_honours_source_and_doc_type_filters() {
     .await;
     assert_eq!(s, 200, "body: {b}");
     assert_eq!(b["results"].as_array().unwrap().len(), 2, "both are html: {b}");
+}
+
+#[tokio::test]
+async fn real_indexer_overlay_result_is_marked_live() {
+    let (_dir, indexer) = seed_indexer();
+    // Write a fresh overlay doc (not yet folded into the immutable base).
+    indexer
+        .index_overlay(
+            IndexDoc::new(
+                "d3",
+                "res_d3",
+                "https://example.test/rust-live",
+                "Rust live overlay",
+                "a rust document served from the recent overlay window",
+            )
+            .with_source("live"),
+        )
+        .unwrap();
+    let addr = boot(Arc::new(IndexerSearcher::new(indexer))).await;
+
+    let (s, b) = call(addr, "POST", "/search", Some(r#"{"query":"rust"}"#)).await;
+    assert_eq!(s, 200, "body: {b}");
+    let results = b["results"].as_array().unwrap();
+    let d3 = results
+        .iter()
+        .find(|r| r["doc_id"] == "d3")
+        .expect("overlay doc returned");
+    // `live_overlay` on the UI is derived from these frozen fields.
+    assert_eq!(d3["lane"], "lexical_overlay");
+    assert_eq!(d3["provenance"], "overlay");
 }
 
 #[tokio::test]

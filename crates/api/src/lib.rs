@@ -10,7 +10,7 @@ pub mod server;
 #[cfg(feature = "real-indexer")]
 pub mod indexer_adapter;
 
-pub use query::{analyze, execute, IndexHit, Searcher, DEFAULT_LIMIT, MAX_LIMIT};
+pub use query::{analyze, build_signals, execute, IndexHit, Searcher, DEFAULT_LIMIT, MAX_LIMIT};
 pub use server::{router, serve, AppState, ApiError, DEFAULT_MAX_CONCURRENCY};
 
 #[cfg(feature = "real-indexer")]

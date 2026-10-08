@@ -208,7 +208,24 @@ async fn search_returns_ranked_results() {
         assert!(score <= prev, "scores must be non-increasing");
         prev = score;
         assert_eq!(r["provenance"], "snapshot");
-        assert!(r["signals"].as_array().map(|s| !s.is_empty()).unwrap_or(false));
+        let signals = r["signals"].as_array().expect("signals array");
+        assert!(!signals.is_empty());
+        // The API guarantees the five Stage-1 signals for "Why this result?".
+        let names: Vec<&str> = signals
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        for want in [
+            "bm25",
+            "source_authority",
+            "freshness",
+            "entity_match",
+            "graph_expansion",
+        ] {
+            assert!(names.contains(&want), "missing signal {want}: {names:?}");
+        }
+        // `live_overlay` is derived from the frozen lane/provenance fields.
+        assert_eq!(r["lane"], "lexical_base");
     }
     assert_eq!(results[0]["score"].as_f64().unwrap(), 150.0);
 

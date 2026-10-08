@@ -67,10 +67,11 @@ impl From<IndexHit> for SearchResult {
     fn from(h: IndexHit) -> Self {
         let mut signals = h.signals;
         if signals.is_empty() {
-            // Every result must carry at least one Signal so "Why this result?"
-            // works from Stage 0 (spec §7).
+            // Minimal fallback: every result must carry at least one Signal so
+            // "Why this result?" works (spec §7). `execute` overwrites this with
+            // the full per-signal provenance via [`build_signals`].
             signals.push(Signal {
-                name: "lexical_score".to_string(),
+                name: "bm25".to_string(),
                 value: h.score,
                 note: format!("bm25 lexical score in lane {}", h.lane),
             });
@@ -94,6 +95,143 @@ impl From<IndexHit> for SearchResult {
             signals,
         }
     }
+}
+
+/// Build the per-signal provenance vector ("Why this result?") for one hit.
+///
+/// Always emits the five Stage-1 signals, in a stable order, so the UI panel has
+/// real data even when the searcher supplied none:
+///
+///   * `bm25` — lexical relevance, taken from the searcher's own `bm25` signal
+///     when it provided one, otherwise from the hit score.
+///   * `source_authority` — a bounded prior derived from observable URL/source
+///     signals (scheme, presence of a source id, institutional TLD).
+///   * `freshness` — recency of the document's publication (or fetch) time.
+///   * `entity_match` — fraction of the query's extracted entities present in
+///     the result title+snippet.
+///   * `graph_expansion` — `1.0` when the hit arrived via a graph lane, else
+///     `0.0` (an honest "not expanded" rather than a fabricated boost).
+///
+/// Any additional signal names the searcher already produced are appended
+/// verbatim (never dropped), so richer searchers keep their provenance.
+///
+/// Whether a result came from the recent overlay window rather than the
+/// immutable base is carried by the frozen `lane` (`lexical_overlay`) /
+/// `provenance` (`overlay`) fields — see `SearchResult`, which is frozen and
+/// needs no `live_overlay` field added.
+pub fn build_signals(hit: &IndexHit, entities: &[String]) -> Vec<Signal> {
+    let bm25 = hit
+        .signals
+        .iter()
+        .find(|s| s.name == "bm25")
+        .map(|s| s.value)
+        .unwrap_or(hit.score);
+
+    let (freshness_value, freshness_note) =
+        freshness(hit.published_at.or(hit.modified_at).unwrap_or(hit.fetched_at));
+
+    let (entity_value, entity_note) = entity_match(entities, &hit.title, &hit.snippet);
+
+    let mut signals = vec![
+        Signal {
+            name: "bm25".to_string(),
+            value: bm25,
+            note: format!("lexical relevance (bm25) in lane {}", hit.lane),
+        },
+        Signal {
+            name: "source_authority".to_string(),
+            value: source_authority(hit.source_id.as_deref(), &hit.url),
+            note: match &hit.source_id {
+                Some(s) => format!("authority prior for source '{s}'"),
+                None => "authority prior (source unknown)".to_string(),
+            },
+        },
+        Signal {
+            name: "freshness".to_string(),
+            value: freshness_value,
+            note: freshness_note,
+        },
+        Signal {
+            name: "entity_match".to_string(),
+            value: entity_value,
+            note: entity_note,
+        },
+        Signal {
+            name: "graph_expansion".to_string(),
+            value: if hit.lane.contains("graph") { 1.0 } else { 0.0 },
+            note: if hit.lane.contains("graph") {
+                "reached via graph expansion".to_string()
+            } else {
+                "direct match (no graph expansion)".to_string()
+            },
+        },
+    ];
+
+    // Preserve any extra searcher-provided signals not already covered.
+    for s in &hit.signals {
+        if !signals.iter().any(|x| x.name == s.name) {
+            signals.push(s.clone());
+        }
+    }
+    signals
+}
+
+/// Smoothed authority prior in `(0, 1)` from the observable source/URL bytes.
+///
+/// Stage 1 has no populated `SourceProfile` registry in the API's dependency
+/// graph, so this is the honest proxy the API can compute: HTTPS, a known
+/// source id, and an institutional TLD each raise the prior, clamped short of
+/// certainty. Deterministic and side-effect free.
+fn source_authority(source_id: Option<&str>, url: &str) -> f32 {
+    let mut a = 0.5_f32;
+    if url.starts_with("https://") {
+        a += 0.1;
+    }
+    let host = source_id.unwrap_or("").to_ascii_lowercase();
+    if !host.is_empty() {
+        a += 0.1;
+    }
+    if host.ends_with(".edu")
+        || host.ends_with(".gov")
+        || host.ends_with(".org")
+        || host.ends_with(".int")
+    {
+        a += 0.15;
+    }
+    a.clamp(0.0, 0.98)
+}
+
+/// Exponential recency decay (~180-day half-life) on the document's timestamp.
+/// Returns `(value, note)`; an unknown/zero timestamp yields `0.0`.
+fn freshness(ts: i64) -> (f32, String) {
+    if ts <= 0 {
+        return (0.0, "no publication timestamp".to_string());
+    }
+    let age_secs = (now_unix_s() - ts).max(0) as f32;
+    let age_days = age_secs / 86_400.0;
+    let value = 0.5_f32.powf(age_days / 180.0).clamp(0.0, 1.0);
+    (value, format!("{age_days:.0}d old"))
+}
+
+/// Fraction of query entities that appear (case-insensitively) in the result
+/// text. Returns `(value, note)`.
+fn entity_match(entities: &[String], title: &str, snippet: &str) -> (f32, String) {
+    if entities.is_empty() {
+        return (0.0, "no query entities extracted".to_string());
+    }
+    let haystack = format!("{title} {snippet}").to_lowercase();
+    let matched: Vec<&str> = entities
+        .iter()
+        .filter(|e| !e.is_empty() && haystack.contains(&e.to_lowercase()))
+        .map(|e| e.as_str())
+        .collect();
+    let value = matched.len() as f32 / entities.len() as f32;
+    let note = if matched.is_empty() {
+        "no entities matched".to_string()
+    } else {
+        format!("matched: {}", matched.join(", "))
+    };
+    (value, note)
 }
 
 /// The one thing the API needs from retrieval. Kept intentionally tiny so it is
@@ -188,7 +326,14 @@ pub fn execute(searcher: &dyn Searcher, req: &SearchRequest) -> AppResult<Search
         .into_iter()
         .skip(req.offset)
         .take(limit)
-        .map(SearchResult::from)
+        .map(|h| {
+            // Compute the full per-signal provenance from the hit + the query's
+            // extracted entities before the hit is consumed into a SearchResult.
+            let signals = build_signals(&h, &analysis.entities);
+            let mut r = SearchResult::from(h);
+            r.signals = signals;
+            r
+        })
         .collect();
 
     // Deadline: if the whole procedure ran past the caller's budget, report it
@@ -840,6 +985,83 @@ mod tests {
         // doc_type/language facets are enforced when the hit is known.
         let f2 = SearchFilters { doc_type: Some("pdf".into()), ..Default::default() };
         assert!(execute(&stub, &req("rust", 10, Some(f2))).unwrap().results.is_empty());
+    }
+
+    #[test]
+    fn execute_populates_per_signal_provenance() {
+        // The searcher supplies no signals: the API must still fill all five.
+        let mut h = hit("a", 2.5, "doc.rust-lang.org", 1_700_000_000);
+        h.title = "Tokio async runtime guide".into();
+        h.snippet = "tokio is an asynchronous runtime for rust".into();
+        h.signals = vec![];
+        let stub = Stub {
+            hits: vec![h],
+            ..Default::default()
+        };
+
+        // "guide to Tokio" -> "Tokio" is a mid-sentence capitalized entity.
+        let resp = execute(&stub, &req("guide to Tokio", 10, None)).unwrap();
+        let r = &resp.results[0];
+        let sig = |name: &str| {
+            r.signals
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing signal {name}"))
+        };
+
+        assert_eq!(sig("bm25").value, 2.5, "bm25 comes from the hit score");
+        assert_eq!(
+            sig("bm25").note,
+            "lexical relevance (bm25) in lane lexical_base"
+        );
+
+        let sa = sig("source_authority");
+        assert!(sa.value > 0.0 && sa.value <= 1.0, "authority in (0,1]: {}", sa.value);
+
+        let fr = sig("freshness");
+        assert!((0.0..=1.0).contains(&fr.value), "freshness bounded: {}", fr.value);
+
+        let em = sig("entity_match");
+        assert_eq!(em.value, 1.0, "query entity 'Tokio' is in the title");
+        assert!(em.note.contains("Tokio"));
+
+        assert_eq!(sig("graph_expansion").value, 0.0, "base lane is not graph expansion");
+
+        // The five canonical signals appear first, in a stable order.
+        let names: Vec<&str> = r.signals.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            &names[..5],
+            &["bm25", "source_authority", "freshness", "entity_match", "graph_expansion"]
+        );
+    }
+
+    #[test]
+    fn build_signals_prefers_searcher_bm25_and_keeps_extras() {
+        let mut h = hit("a", 1.0, "s", 100);
+        h.lane = "graph_expand".into();
+        h.signals = vec![
+            Signal {
+                name: "bm25".into(),
+                value: 7.5,
+                note: "searcher".into(),
+            },
+            Signal {
+                name: "custom".into(),
+                value: 0.25,
+                note: "extra".into(),
+            },
+        ];
+        let sigs = build_signals(&h, &[]);
+        assert_eq!(sigs.iter().find(|s| s.name == "bm25").unwrap().value, 7.5);
+        assert_eq!(
+            sigs.iter().find(|s| s.name == "graph_expansion").unwrap().value,
+            1.0,
+            "a graph lane sets graph_expansion"
+        );
+        assert!(
+            sigs.iter().any(|s| s.name == "custom"),
+            "searcher extras are preserved"
+        );
     }
 
     #[test]
