@@ -1,0 +1,10 @@
+[package]
+name = "search-ann"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+serde.workspace = true
+thiserror.workspace = true

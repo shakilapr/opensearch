@@ -1,0 +1,12 @@
+[package]
+name = "search-distill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+search-core = { path = "../core" }
+search-trace = { path = "../trace" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

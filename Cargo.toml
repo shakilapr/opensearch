@@ -26,6 +26,11 @@ members = [
     "crates/patterns",
     "crates/dataset",
     "crates/mcp",
+    "crates/trace",
+    "crates/cache",
+    "crates/ann",
+    "crates/distill",
+    "crates/acceptance",
     "crates/api",
     "crates/agent0",
 ]
