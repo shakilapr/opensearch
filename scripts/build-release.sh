@@ -98,7 +98,9 @@ if [[ "$VERIFY" -eq 1 ]]; then
     echo
     echo "==> verifying staged checksums"
     while read -r name size sum; do
-        [[ "$name" == \#* || -z "$name" ]] && continue
+        # Skip the comment header and the key=value metadata lines; only
+        # "<bin>  <size>  <sha256>" rows have all three fields.
+        [[ "$name" == \#* || "$name" == *=* || -z "$name" || -z "$size" || -z "$sum" ]] && continue
         actual="$(sha256sum "$BIN_DIR/$name" | awk '{print $1}')"
         if [[ "$actual" != "$sum" ]]; then
             echo "error: checksum mismatch for $name ($sum != $actual)" >&2
