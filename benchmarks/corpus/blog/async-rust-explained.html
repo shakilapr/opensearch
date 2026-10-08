@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Async Rust, explained - a blog post</title>
+</head><body>
+<h1>Async Rust, explained - a blog post</h1>
+<p>This post explains that async Rust is built on futures, which are state machines that suspend at await points</p><p>A runtime polls a future and the future registers a waker to be notified when it can make progress</p><p>There is no built-in executor in the standard library, so you bring your own runtime</p><p>Understanding poll and wakers demystifies why async functions behave the way they do.</p>
+</body></html>

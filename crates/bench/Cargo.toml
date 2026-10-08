@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "search_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bench"
 path = "src/main.rs"
@@ -19,6 +23,7 @@ search-retrieval = { path = "../retrieval" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

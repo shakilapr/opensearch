@@ -1,0 +1,31 @@
+# Stage-2 smoke query set for benchmarks/corpus (25 cases).
+# Labels are HAND-JUDGED against the 30-doc fixture corpus; this is a smoke set, not a research benchmark.
+# Schema: search_eval::QueryCase (id, query, class, relevant, graded, observed_at).
+# Source-qualified queries name the source in natural language (github/docs/community/blog); the
+# source-routing lane uses those hints, plain BM25 cannot. Labels are never derived from routing.
+# classes: short_factual | long_semantic | ambiguous_entity | current | papers | docs | github | community | multi_hop
+{"id":"q_attention","query":"scaled dot product self attention transformer encoder decoder","class":"papers","relevant":["arxiv/attention"],"graded":[],"observed_at":null}
+{"id":"q_rlhf","query":"reinforcement learning from human feedback preference reward model","class":"papers","relevant":["arxiv/rlhf"],"graded":[],"observed_at":null}
+{"id":"q_cot","query":"chain of thought prompting intermediate reasoning steps","class":"papers","relevant":["arxiv/chain-of-thought"],"graded":[],"observed_at":null}
+{"id":"q_rag","query":"retrieval augmented generation dense passage retriever index","class":"papers","relevant":["arxiv/rag"],"graded":[],"observed_at":null}
+{"id":"q_tokio_repo","query":"github tokio async runtime","class":"github","relevant":["github/tokio"],"graded":[],"observed_at":null}
+{"id":"q_llamacpp_repo","query":"github llama.cpp gguf quantized models","class":"github","relevant":["github/llama-cpp"],"graded":[],"observed_at":null}
+{"id":"q_tantivy_repo","query":"github rust search engine inverted index library","class":"github","relevant":["github/tantivy"],"graded":[],"observed_at":null}
+{"id":"q_vllm_repo","query":"github serving engine paged attention kv cache","class":"github","relevant":["github/vllm"],"graded":[],"observed_at":null}
+{"id":"q_hnswlib_repo","query":"github library approximate nearest neighbor search","class":"github","relevant":["github/hnswlib"],"graded":[],"observed_at":null}
+{"id":"q_k8s_docs","query":"docs kubernetes rolling update deployment replicaset","class":"docs","relevant":["docs/kubernetes-deployments"],"graded":[],"observed_at":null}
+{"id":"q_rust_ownership","query":"docs rust ownership borrowing lifetimes","class":"docs","relevant":["docs/rust-ownership"],"graded":[],"observed_at":null}
+{"id":"q_tokio_docs","query":"docs tokio tutorial spawn await","class":"docs","relevant":["docs/tokio-tutorial"],"graded":[],"observed_at":null}
+{"id":"q_hnsw_algo","query":"docs hnsw layered graph algorithm efsearch","class":"docs","relevant":["docs/hnsw-algorithm"],"graded":[],"observed_at":null}
+{"id":"q_pg_indexes","query":"docs postgresql b-tree gin index scan","class":"docs","relevant":["docs/postgres-indexes"],"graded":[],"observed_at":null}
+{"id":"q_reddit_finetune","query":"community reddit fine tuning llm single gpu vram","class":"community","relevant":["community/reddit-llm-finetuning"],"graded":[],"observed_at":null}
+{"id":"q_vecdb","query":"community hacker news vector database comparison","class":"community","relevant":["community/hn-vector-db"],"graded":[],"observed_at":null}
+{"id":"q_so_bm25","query":"community stack overflow bm25 scoring idf k1","class":"community","relevant":["community/stackoverflow-bm25"],"graded":[],"observed_at":null}
+{"id":"q_local_llm","query":"community reddit running llama.cpp locally","class":"community","relevant":["community/reddit-local-llm"],"graded":[],"observed_at":null}
+{"id":"q_lora","query":"low-rank adaptation freezes pretrained weights","class":"long_semantic","relevant":["arxiv/lora"],"graded":[],"observed_at":null}
+{"id":"q_async_blog","query":"async rust futures state machines poll wakers","class":"long_semantic","relevant":["blog/async-rust-explained"],"graded":[],"observed_at":null}
+{"id":"q_vec_guide","query":"blog practical guide vector search embeddings","class":"long_semantic","relevant":["blog/vector-search-guide"],"graded":[],"observed_at":null}
+{"id":"q_k8s_history","query":"blog history kubernetes borg containers","class":"current","relevant":["blog/kubernetes-history"],"graded":[],"observed_at":null}
+{"id":"q_multihop","query":"rust async runtime and approximate nearest neighbor libraries","class":"multi_hop","relevant":["github/tokio","github/hnswlib"],"graded":[["github/tokio",2],["github/hnswlib",2]],"observed_at":null}
+{"id":"q_what_is_rlhf","query":"what is rlhf reward model preference","class":"short_factual","relevant":["blog/what-is-rlhf"],"graded":[],"observed_at":null}
+{"id":"q_tantivy","query":"tantivy","class":"ambiguous_entity","relevant":["github/tantivy"],"graded":[],"observed_at":null}

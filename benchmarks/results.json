@@ -1,0 +1,250 @@
+{
+  "version": "0.1.0",
+  "generated_unix": 1791489087,
+  "corpus_dir": "/root/projects/search/crates/bench/../../benchmarks/corpus",
+  "queries_path": "/root/projects/search/crates/bench/../../benchmarks/queries.example.jsonl",
+  "budget": {
+    "docs": 30,
+    "queries": 25,
+    "k": 20,
+    "ce_depth": 50,
+    "embed_dim": 1024,
+    "peak_rss_kb": 18072,
+    "mean_candidates": 13.154285714285715,
+    "max_candidates": 24
+  },
+  "notes": [
+    "SMOKE SET, NOT A RESEARCH CLAIM: 30-doc fixture corpus + 25 hand-labelled queries.",
+    "Dense lane: HashEmbedder (deterministic hashed bag-of-words), NOT a semantic model.",
+    "UNAVAILABLE: real BGE-small weights (feature `bge`) are not bundled in this environment; the dense lane proves the path, it is not a semantic embedding.",
+    "UNAVAILABLE: a trained cross-encoder; the LexicalCrossEncoder (deterministic lexical overlap) is used as an honest proxy.",
+    "Source routing uses lexical source hints in the query text (e.g. \"github\", \"reddit\", \"docs\") and never reads class or relevance labels."
+  ],
+  "ablations": [
+    {
+      "name": "bm25",
+      "note": "global lexical BM25 over the Tantivy index (base lane)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9701992109430119,
+        "mrr": 0.96,
+        "recall_at_10": 1.0,
+        "p50_ms": 0,
+        "p95_ms": 0
+      },
+      "mean_candidates": 9.88,
+      "max_candidates": 20
+    },
+    {
+      "name": "bm25+dense",
+      "note": "RRF(bm25, HashEmbedder top-k over title+body)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9701992109430119,
+        "mrr": 0.96,
+        "recall_at_10": 1.0,
+        "p50_ms": 1,
+        "p95_ms": 1
+      },
+      "mean_candidates": 21.16,
+      "max_candidates": 24
+    },
+    {
+      "name": "bm25+dense+sparse",
+      "note": "RRF(bm25, dense, source-routed BM25 lane)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9849620208001535,
+        "mrr": 0.98,
+        "recall_at_10": 1.0,
+        "p50_ms": 1,
+        "p95_ms": 1
+      },
+      "mean_candidates": 21.16,
+      "max_candidates": 24
+    },
+    {
+      "name": "source-routing",
+      "note": "source-routed BM25 only; no global lane (empty when no source hint)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.64,
+        "mrr": 0.64,
+        "recall_at_10": 0.64,
+        "p50_ms": 0,
+        "p95_ms": 0
+      },
+      "mean_candidates": 1.32,
+      "max_candidates": 5
+    },
+    {
+      "name": "source-routing+global",
+      "note": "RRF(source-routed, global BM25)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9842104097621082,
+        "mrr": 0.98,
+        "recall_at_10": 1.0,
+        "p50_ms": 0,
+        "p95_ms": 0
+      },
+      "mean_candidates": 7.52,
+      "max_candidates": 20
+    },
+    {
+      "name": "bm25+ce-on",
+      "note": "bm25 top-50 reranked by LexicalCrossEncoder (ce-off == bm25 row)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9412022732722372,
+        "mrr": 0.92,
+        "recall_at_10": 1.0,
+        "p50_ms": 11,
+        "p95_ms": 21
+      },
+      "mean_candidates": 9.88,
+      "max_candidates": 20
+    },
+    {
+      "name": "bm25+dense+sparse+ce-on",
+      "note": "full hybrid top-50 reranked by LexicalCrossEncoder (ce-off == bm25+dense+sparse row)",
+      "metrics": {
+        "n": 25,
+        "ndcg_at_10": 0.9412022732722372,
+        "mrr": 0.92,
+        "recall_at_10": 1.0,
+        "p50_ms": 23,
+        "p95_ms": 25
+      },
+      "mean_candidates": 21.16,
+      "max_candidates": 24
+    }
+  ],
+  "per_case": [
+    {
+      "case_id": "q_attention",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_rlhf",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_cot",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_rag",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_tokio_repo",
+      "bm25_rank": 2,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_llamacpp_repo",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_tantivy_repo",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_vllm_repo",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_hnswlib_repo",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_k8s_docs",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_rust_ownership",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_tokio_docs",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_hnsw_algo",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_pg_indexes",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_reddit_finetune",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_vecdb",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_so_bm25",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_local_llm",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_lora",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_async_blog",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_vec_guide",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_k8s_history",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_multihop",
+      "bm25_rank": 2,
+      "hybrid_rank": 2
+    },
+    {
+      "case_id": "q_what_is_rlhf",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    },
+    {
+      "case_id": "q_tantivy",
+      "bm25_rank": 1,
+      "hybrid_rank": 1
+    }
+  ]
+}
