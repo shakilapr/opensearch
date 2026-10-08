@@ -27,11 +27,11 @@ fn count(conn: &rusqlite::Connection, table: &str) -> i64 {
         .unwrap()
 }
 
-/// Migration 0003 present: applying all migrations twice is idempotent and the
-/// ledger is exactly [1, 2, 3]; SCHEMA_VERSION is bumped to 3.
+/// Migration 0004 present: applying all migrations twice is idempotent and the
+/// ledger is exactly [1, 2, 3, 4]; SCHEMA_VERSION is bumped to 4.
 #[test]
 fn migrations_idempotent_and_ledger_is_1_2_3() {
-    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 3);
+    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 4);
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta.db");
     let conn = search_metadata::writer::open(&path).unwrap();
@@ -48,7 +48,7 @@ fn migrations_idempotent_and_ledger_is_1_2_3() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3], "ledger has each version once");
+    assert_eq!(versions, vec![1, 2, 3, 4], "ledger has each version once");
 }
 
 /// Every Stage-1 table exists with its expected columns.

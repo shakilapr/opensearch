@@ -179,6 +179,9 @@ pub enum Mutation {
         modified_at: Option<i64>,
         resource_id: Option<String>,
     },
+    /// Set the storage tier (`hot`/`warm`/`cold`) of an existing `resource` row
+    /// (migration 0004). Drives the Stage-5 tier move planner.
+    UpdateStorageTier { resource_id: String, tier: String },
 }
 
 /// Opens (or creates) the metadata database with the required pragmas and
@@ -474,6 +477,24 @@ impl MetadataReader {
                  FROM work WHERE work_id = ?1",
                 rusqlite::params![work_id],
                 map_work_row,
+            )
+            .optional()
+            .map_err(crate::db_err)?;
+        Ok(row)
+    }
+
+    // --- Stage-5 lookups (migration 0004) ---------------------------------
+
+    /// The storage tier of a resource (`hot`/`warm`/`cold`, migration 0004), or `None` if no
+    /// such resource exists.
+    pub fn resource_tier(&self, resource_id: &str) -> AppResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT storage_tier FROM resource WHERE resource_id = ?1",
+                rusqlite::params![resource_id],
+                |r| r.get::<_, String>(0),
             )
             .optional()
             .map_err(crate::db_err)?;
@@ -1204,6 +1225,13 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     resource_id,
                     now
                 ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpdateStorageTier { resource_id, tier } => {
+            tx.execute(
+                "UPDATE resource SET storage_tier = ?2 WHERE resource_id = ?1",
+                rusqlite::params![resource_id, tier],
             )
             .map_err(crate::db_err)?;
         }

@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adaptive;
 pub mod budget;
 pub mod change;
 pub mod class;
@@ -21,6 +22,7 @@ pub mod priority;
 pub mod scheduler;
 pub mod time_sensitive;
 
+pub use adaptive::{next_delay_secs, ChangeHistory};
 pub use budget::BudgetLedger;
 pub use change::change_probability;
 pub use class::{classify_source, SourceClass};
