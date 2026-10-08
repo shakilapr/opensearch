@@ -10,6 +10,11 @@ serde_json.workspace = true
 [dev-dependencies]
 search-agent0 = { path = "../agent0" }
 search-api = { path = "../api" }
+search-core = { path = "../core" }
 search-mcp = { path = "../mcp" }
-search-dataset = { path = "../dataset" }
+search-scheduler = { path = "../scheduler" }
+axum.workspace = true
+tokio.workspace = true
+url.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
