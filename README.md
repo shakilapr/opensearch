@@ -1,221 +1,153 @@
 # Agent-Native Local Web Search Engine
 
-An open-source, autonomous search engine designed natively for **AI agents** (such as OpenClaw, Nous Hermes, and custom autonomous agents) and human users. 
+An open-source, self-hosted search engine built for **AI agents** (Hermes, OpenClaw, and
+custom autonomous agents) and human users. It runs on a single standard VPS (16 vCPU /
+64 GB RAM, **no GPU**) with **no commercial search API**.
 
-Built to run entirely self-hosted on standard VPS hardware (e.g., 16 vCPUs, 64 GB RAM, zero GPU dependency) with **no commercial search API subscriptions**.
-
----
-
-## 1. Core Philosophy
-
-Traditional search engines attempt to archive the entire internet. This project takes the opposite approach:
-
-> **A compact semantic map of where useful information exists.**
-
-The engine acts as a **resource-allocation engine** rather than a blunt downloader. It does not ask *"Can I download this?"*—it asks *"How much will knowing or refreshing this resource improve search quality?"*
+> **A compact semantic map of where useful information exists** — not a web archive.
+> Every fetch answers *"how much will knowing or refreshing this resource improve search?"*
 
 ```text
-┌────────────────────┐
-│       AGENT        │  ──►  Judgment (interprets ambiguity, navigates difficult paths)
-└─────────┬──────────┘
-          │
-┌─────────▼──────────┐
-│    SEARCH ENGINE   │  ──►  Reflexes (query planner, dual-lane retrieval, candidate fusion)
-└─────────┬──────────┘
-          │
-┌─────────▼──────────┐
-│     WEB MEMORY     │  ──►  Memory (Tantivy lexical index, entity-concept graph, source profiles)
-└─────────┬──────────┘
-          │
-┌─────────▼──────────┐
-│      CRAWLER       │  ──►  Senses (adaptive politeness, discovery frontier, freshness monitoring)
-└─────────┬──────────┘
-          │
-┌─────────▼──────────┐
-│      LIVE WEB      │  ──►  External Reality
-└────────────────────┘
+AGENT        ->  Judgment   (interprets ambiguity, navigates hard queries)
+SEARCH ENGINE->  Reflexes   (query planner, lanes, candidate fusion, reranking)
+WEB MEMORY   ->  Memory     (Tantivy lexical index, entity/source graph, source profiles)
+CRAWLER      ->  Senses     (politeness, discovery frontier, freshness monitoring)
+LIVE WEB     ->  Reality
 ```
 
----
-
-## 2. System Architecture
-
-The project is structured across three functional planes:
-
-```text
-                  ┌──────────────────────┐
-                  │     DATA BUILDER     │
-                  │  (Server-Side Heavy) │
-                  │ Common Crawl/Parquet │
-                  │ OpenAlex, arXiv, OAI │
-                  └──────────┬───────────┘
-                             │
-                             ▼
-                  ┌──────────────────────┐
-                  │      WEB MEMORY      │
-                  │ Entities & Concepts  │
-                  │ Sources & Work IDs   │
-                  │ Tantivy BM25 + Graph │
-                  └──────────┬───────────┘
-                             │
-                             ▼
-                  ┌──────────────────────┐
-                  │    SEARCH RUNTIME    │
-                  │ Query Decomposition  │
-                  │ Parallel Retrieval   │
-                  │ Live Freshness Check │
-                  └──────────┬───────────┘
-                             │
-                  ┌──────────┴───────────┐
-                  ▼                      ▼
-             SEARCH UI              AGENT API
-         (Vite/React/TS)           (HTTP & MCP)
-```
-
-### Key Subsystems:
-
-* **[crawler/](crawler/) — Universal Crawling & Scraping Subsystem:**
-  * **RFC 9309 Compliant:** Centralized policy cache for robots.txt rules.
-  * **Adaptive Politeness:** Per-origin queues with exponential backoff and dynamic concurrency. Concurrency comes from crawling *many origins*, not hammering one.
-  * **Content Routing:** Direct pipeline handling for HTML, PDFs (GROBID/text), feeds (RSS/Atom), sitemaps, JSON/XML APIs, and git repositories.
-  * **Escalation Path:** Lightweight HTTP fetch by default; isolates Chromium/Playwright contexts strictly as an escalation path for JS-rendered shells.
-  * **Deduplication:** Content hashing, SimHash/MinHash near-duplicate detection.
-
-* **[engine/](engine/) — Search Algorithm & Retrieval Core:**
-  * **Parallel Dual-Lane Retrieval:** Executes global document retrieval and source-routing in parallel so a mistaken source route never drops viable answers.
-  * **Hybrid Indexing:** Fast mmap-backed Tantivy lexical search (BM25) combined with dense embeddings and an entity-concept-source knowledge graph.
-  * **Query-Triggered Freshness:** Active queries (e.g. *"latest PyTorch release"*) dynamically spawn high-priority refresh jobs for stale sources.
-  * **Calibrated Agent Policy:** Structured actions (`FOLLOW`, `KEEP`, `WIDEN`, `STOP`) with beam search for ambiguous entities (e.g., distinguishing Apple Inc. vs. apple fruit).
-
-* **[ui/](ui/) — Modern Web Search Frontend:**
-  * Interactive React 18 + Vite + TypeScript interface.
-  * Real-time search telemetry, source authority metrics, and category filtering (All, Web, Papers, Code, News).
-  * Direct inspection of retrieval provenance and ranking signals.
-
-* **[docs/](docs/) — Architecture & Specifications:**
-  * Complete reference specifications for the crawler, engine, and storage models.
-
----
-
-## 3. Core Data Model (The 5 IDs)
-
-Everything in the engine resolves to 5 foundational identities:
-
-1. **`DomainID`:** Hostname metadata (e.g. `arxiv.org`, `github.com`), crawl statistics, and robots policy.
-2. **`SourceID`:** Logical collection unit targeted by semantic routing (e.g. `docs.python.org/asyncio`, `github.com/ggerganov/llama.cpp`).
-3. **`ResourceID`:** Lightweight fetchable address (URL, sitemap, feed, PDF link).
-4. **`WorkID`:** Logical intellectual object (e.g. a research paper across preprint, publisher, and author repository).
-5. **`ContentID`:** Deduplicated payload identity across syndications, mirrors, and print views.
-
----
-
-## 4. Search Complexity Modes
-
-| Mode | Target Latency | Workflow |
-| :--- | :--- | :--- |
-| **`fast`** | < 50 ms | Pure local Tantivy & graph retrieval. No network I/O, no LLM inference. |
-| **`auto`** | 100–300 ms | Hybrid local retrieval + source freshness verification + bounded live fetch if stale. *(Default)* |
-| **`deep`** | Multi-step | Query decomposition, beam search over candidate graph paths, agent navigation, and evidence verification. |
-
----
-
-## 5. Repository & Workspace Topology
-
-To ensure fast local development while handling massive datasets, the project enforces a clear split between local code and server-side storage:
+## Repository layout
 
 ```text
 projects/search/
-├── crawler/                # [LOCAL & SERVER] Universal crawler implementation
-│   ├── ARCHITECTURE.md
-│   └── UNIVERSAL_CRAWLER_ARCHITECTURE.md
-├── docs/                   # [LOCAL & SERVER] Design specs & algorithm RFCs
-│   ├── AGENT_NATIVE_SEARCH_ENGINE.md
-│   ├── ARCHITECTURE.md
-│   └── UNIVERSAL_CRAWLER_ARCHITECTURE.md
-├── engine/                 # [LOCAL & SERVER] Retrieval, ranking & query engine
-│   ├── ARCHITECTURE.md
-│   └── engine-architecture.md
-├── ui/                     # [LOCAL & SERVER] Search web application (Vite / React)
-│   ├── src/
-│   ├── package.json
-│   └── ...
-├── models/                 # [SERVER-ONLY] Model weights, GGUF/ONNX checkpoints
-├── raw-dataset/            # [SERVER-ONLY] Bulk Common Crawl, Parquet dumps & WARCs
-├── .gitignore              # Ignores large datasets, caches, models & media
-└── README.md               # Project overview & guide
+├── Cargo.toml            # Rust workspace (32 members)
+├── crates/               # the engine + crawler (Rust)
+├── ui/                   # search frontend (Vite + React + TypeScript)
+├── deploy/               # systemd units + nginx (see deploy/README.md)
+├── benchmarks/           # Stage-2 smoke set: corpus/ + queries.example.jsonl + results.json
+├── datasets/fixtures/    # Stage-6 adapter fixtures (committed, hermetic)
+├── docs/                 # specs + architecture (see below)
+├── scripts/              # build-release.sh, publish-pack.sh, backup.sh
+├── raw-dataset/          # [server-only, gitignored] scraped data & dumps
+├── models/               # [server-only, gitignored] model weights
+└── work-plan.md          # the 11-stage build plan
 ```
 
-> **Note:** Heavy datasets (`raw-dataset/`), embeddings, model weights (`models/`), and large media files are strictly ignored by Git and reside exclusively on the production server.
+## The pipeline
 
----
+Everything resolves to **five semantic IDs** (`crates/core`): `DomainId`, `SourceId`,
+`ResourceId`, `WorkId`, `ContentId`. Ingestion is an append-only, idempotent state machine
+(`crates/ingest`):
 
-## 6. Synchronization & Deployment Workflows
-
-The project supports fully automated, private, continuous synchronization without requiring third-party Git hosts (no GitHub/GitLab needed):
-
-### Method 1: Tailscale + Syncthing (Active & Recommended)
-Continuous peer-to-peer live synchronization running directly between Windows and Ubuntu:
-* **Transport:** Encrypted WireGuard / DERP relays over Tailscale.
-* **Auto-Sync:** Syncthing watches the filesystem in real time and automatically transfers modified files, branches, commits, and `.git/` history.
-* **Ignore Configuration (`.stignore`):**
-  ```text
-  /models
-  /raw-dataset
-  node_modules
-  dist
-  .vite
-  ```
-  *(Crucially, `.git/` is synchronized while server-only heavy assets remain on the VPS).*
-* **Workflow:**
-  ```text
-  Edit file locally
-  ↓
-  Syncthing detects file changes
-  ↓
-  Source code & .git history automatically synced to VPS
-  ↓
-  VPS has an identical working tree & commit log instantly
-  ```
-
-### Method 2: Direct Sync via SSH / Rsync
-For explicit batch deployments or script-driven synchronization:
-```bash
-# Push updates directly to the server
-rsync -avz --exclude-from=.gitignore ./ vpsgo:/root/projects/search/
+```text
+seed URL -> robots -> frontier lease -> HTTP fetch -> normalize -> ContentId
+        -> DocumentVersion -> ingest journal -> Tantivy commit -> manifest publish -> /search
 ```
 
-### Method 3: Remote Git (GitHub / GitLab)
-If collaborative remote hosting is desired:
-```bash
-git push origin main    # On PC
-git pull origin main    # On Server
+Search exposes a document only once it is below a published watermark/manifest, so the
+index is always rebuildable from metadata + blobs + the journal. The workspace crates:
+
+| crate | package | owns |
+| :--- | :--- | :--- |
+| `core` | `search-core` | 5 IDs, config, error taxonomy, `IndexManifest`, safety `Limits`, time (no I/O) |
+| `metadata` | `search-metadata` | SQLite **single-writer** subsystem, migrations, batched `Mutation` writer |
+| `ingest` | `search-ingest` | ingestion state machine + append-only journal (consistency boundary) |
+| `frontier` | `search-frontier` | per-origin priority dispatch, leases + epoch fencing |
+| `fetcher` | `search-fetcher` | HTTP client, URL canonicalization, SSRF guard, robots, `CrawlPolicy` |
+| `parser` | `search-parser` | response normalization (HTML → `NormalizedDoc`) |
+| `indexer` | `search-indexer` | Tantivy base + overlay, manifest publish |
+| `discovery` | `search-discovery` | sitemap + RSS/Atom feed discovery |
+| `router` | `search-router` | MIME-based response routing |
+| `browser` | `search-browser` | browser escalation (hermetic mock; real Chromium behind `chromium`) |
+| `pdf` | `search-pdf` | PDF pipeline (size → hash → text-layer → classify) |
+| `sources` | `search-sources` | source registry + Bayesian-ish priors |
+| `graph` | `search-graph` | entity / concept / source graph, scholarly `WorkId` resolution |
+| `retrieval` | `search-retrieval` | retrieval lanes (BM25, source-first, sparse expander) |
+| `eval` | `search-eval` | metrics, dataset loading, ablation runner |
+| `embed` | `search-embed` | embedding lane (`HashEmbedder` default; BGE behind `bge`) |
+| `rerank` | `search-rerank` | RRF fusion, feature ranker, cross-encoder iface, MMR, disambiguation |
+| `scheduler` | `search-scheduler` | freshness classes, change model, budget ledger, activation scheduler |
+| `bench` | `search-bench` | ablation harness — binary `bench` |
+| `nav` | `search-nav` | `SearchState`, action frontier, policy tiers, provider adapters |
+| `dedup` | `search-dedup` | SimHash64, MinHash + LSH, shingling |
+| `tiers` | `search-tiers` | HOT/WARM/COLD storage tiers + move planner |
+| `patterns` | `search-patterns` | URL templatization + pattern learning |
+| `dataset` | `search-dataset` | Common Crawl / Wikidata / OpenAlex / OAI-PMH adapters + release packs |
+| `mcp` | `search-mcp` | stdio MCP server — binary `search-mcp` |
+| `trace` | `search-trace` | `PolicyTrace` + JSONL sink |
+| `cache` | `search-cache` | TTL + LRU caches with generation invalidation |
+| `ann` | `search-ann` | int8 quantization, IVF, HNSW-lite |
+| `distill` | `search-distill` | deterministic linear policy distillation |
+| `acceptance` | `search-acceptance` | workspace acceptance tests (see gaps) |
+| `api` | `search-api` | HTTP API (`POST /search`, `GET /health`); library, served by `agent0` |
+| `agent0` | `search-agent0` | the driver binary — `agent0` |
+
+## Quick start
+
+```sh
+# 1. Build everything.
+cargo build --workspace                 # release binaries: scripts/build-release.sh
+
+# 2. Ingest a URL (prints IngestOutcome JSON), then query it.
+agent0 ingest https://example.com/doc
+agent0 search "rust async runtime" 5
+
+# 3. Serve the HTTP API (this is what the systemd units run).
+agent0 serve                            # POST /search, GET /health on 127.0.0.1:8080
+curl -fsS http://127.0.0.1:8080/health
+
+# 4. One background refresh tick (Stage-3 freshness loop).
+agent0 refresh
+
+# 5. Benchmark the retrieval lanes.
+cargo run -p search-bench --release     # writes benchmarks/results.json
+
+# 6. UI.
+cd ui && npm ci && npm test && npm run build
 ```
 
----
+Configuration is via the environment (`crates/core::Config::from_env`):
+`SEARCH_DATA_DIR` (default `/var/lib/search`), `SEARCH_BIND` (default
+`127.0.0.1:8080`), `SEARCH_USER_AGENT`, `RUST_LOG`. `SEARCH_QUERY_REFRESH=1 agent0 search
+"latest X"` opts into a P0 query-triggered refresh. See `docs/OPERATIONS.md`.
 
-## 7. Quick Start
+## Service surfaces
 
-### Frontend (UI)
-```bash
-cd ui
-npm install
-npm run dev
-```
+* **HTTP API** — `POST /search` (the `SearchResponse` contract in `docs/STAGE0_SPEC.md` §7)
+  and `GET /health` (`generation`, `index_manifest_id`, uptime). Served by `agent0 serve`.
+* **MCP server** — `search-mcp`, JSON-RPC 2.0 over stdio, for MCP clients (Hermes, Claude
+  Desktop). Register it with `command`/`args`; see [`docs/MCP.md`](docs/MCP.md).
 
-### Running Tests
-```bash
-cd ui
-npm test
-```
+## Data & server-only paths
 
----
+`raw-dataset/` (scraped blobs, WARC/Parquet, extracted text), `models/` (weights), built
+packs, and the runtime data root `/var/lib/search` (WAL SQLite + Tantivy mmap + blobs +
+text) are **gitignored and server-only**. A WAL SQLite database or a Tantivy
+`MmapDirectory` copied mid-write is corrupt — the data root must live outside any synced
+path (`Config::assert_not_synced` enforces this). See `docs/DISTRIBUTION.md`.
 
-## 8. Roadmap & Build Stages
+## Where the specs live
 
-* [x] **Stage 0: Core Architecture & Specifications** (Crawler & Engine specifications drafted).
-* [ ] **Stage 1: 10K LLM Search MVP** (Tantivy index, source registry, manual seeds, BM25 + graph).
-* [ ] **Stage 2: Search Quality & Benchmarks** (Hybrid search evaluation against a 500+ query testbed).
-* [ ] **Stage 3: Live Freshness Loop** (Query-triggered background refresh and live results overlay).
-* [ ] **Stage 4: Agent Navigation** (Beam search path traversal with Hermes/OpenClaw policy adapters).
-* [ ] **Stage 5: Bootstrap Scaling (100K–1M Docs)** (Parquet-based streaming imports from Common Crawl & OpenAlex).
+`docs/` is the authority. If code and a spec disagree, the spec wins until a commit says
+otherwise.
 
+| doc | covers |
+| :--- | :--- |
+| `work-plan.md` | the 11-stage build plan |
+| `docs/STAGE0_SPEC.md` … `docs/STAGE10_SPEC.md` | the frozen contract for each stage |
+| `docs/ARCHITECTURE.md`, `docs/AGENT_NATIVE_SEARCH_ENGINE.md`, `docs/UNIVERSAL_CRAWLER_ARCHITECTURE.md` | the original architecture documents |
+| `docs/MCP.md` | MCP server registration, tools, protocol |
+| `docs/DISTRIBUTION.md` | what ships, pack format/versioning, server-only paths |
+| `docs/OPERATIONS.md` | runbook: services, refresh, backup/restore, bounds |
+| `docs/ROADMAP.md` | stage status + honest remaining gaps |
+| `docs/CONTRIBUTING.md` | build/test commands and the per-stage workflow |
+| `deploy/README.md`, `benchmarks/README.md`, `ui/README.md` | deployment, bench, UI |
+
+## Status
+
+The build stages and their real status are in [`docs/ROADMAP.md`](docs/ROADMAP.md). In
+short: the single-box spine (Stages 0–10) is implemented and covered by hermetic tests;
+Stages 7 and 8 are **partial** (MCP `deep_search`/`fetch_doc` are not yet backed by the
+HTTP API; the Stage-8 `acceptance` crate is empty); distributed crawl is not started.
+Known gaps include no real BGE/SPLADE weights, no trained cross-encoder (deterministic
+lexical proxies are used and labelled as such), single-box only, and a frontier
+single-writer exception. Read that file before relying on a stage.
