@@ -1,8 +1,12 @@
 # Work Plan — Agent-Native Local Web Search Engine
 
 Status: build plan derived from the four architecture documents in this repo. This is a
-construction plan, not a status report. Nothing below is built yet except the UI shell
-(`ui/`), which currently runs against mock/synthesized data.
+construction plan, not a status report. The UI shell (`ui/`) exists and currently runs
+against mock/synthesized data. The Rust workspace skeleton now exists and compiles
+(`Cargo.toml`, `crates/core`, `crates/metadata`, typed stubs for
+`ingest`/`frontier`/`fetcher`/`indexer`/`api`/`agent0`); the frozen Stage-0 contract is
+`docs/STAGE0_SPEC.md`. See "Stage-0 review deltas" below for the changes folded in from
+the architecture/consistency review.
 
 Source documents this plan must satisfy (deduped by content):
 
@@ -25,7 +29,53 @@ Observed on the target VPS (`85.137.250.157`, 16 vCPU / 64 GB RAM / 665 GB free,
 
 - Node.js v26.7.0, npm 11.19.0 — present
 - Python 3.14.7 — present
-- Rust / cargo — **not installed** (no `~/.cargo`)
+- Rust / cargo — **installed** (rustup, Rust 1.99.0, `/root/.cargo/bin`); C toolchain
+  (`build-essential`, `pkg-config`, `libssl-dev`, `clang`, `lld`, `zlib1g-dev`) installed;
+  crates.io reachable and Tantivy 0.22 fetch verified.
+
+---
+
+## Stage-0 review deltas (folded into this plan)
+
+These were added before Stage 0 because they are painful to retrofit once the crawler is
+producing data. The authoritative, frozen form is `docs/STAGE0_SPEC.md`.
+
+1. **Consistency model + append-only ingestion journal.** `crates/ingest` is the sole owner
+   of the ingestion consistency boundary. An operational `ingest_op` / `ingest_seq` (NOT a
+   sixth semantic identity beside the five IDs) records every transition; every projection
+   is idempotent. Lifecycle:
+   `FETCHED → NORMALIZED → BLOB_WRITTEN → METADATA_COMMITTED → LEXICAL_INDEXED →
+   GRAPH_INDEXED → VISIBLE`. Search exposes only versions below a published
+   watermark/manifest, so Tantivy and the graph can be rebuilt from metadata.
+2. **SQLite is a single-writer subsystem from day one.** WAL, one writer, all mutations
+   flow through a bounded queue (`crates/metadata`) that batches transactions. Crawler
+   tasks never contend on the DB directly.
+3. **Tantivy is designed around batches, not individual updates.** Two-level index:
+   immutable-ish **base** + small **recent overlay**; new/live docs hit the overlay,
+   a builder periodically folds them into base segments.
+4. **Frontier leases + backpressure.** Every dispatched job carries `lease_until`,
+   `attempt`, `owner`, and a monotonic `epoch` fencing token; a crashed worker's job
+   becomes eligible again after expiry. All channels bounded (fetch→parse→index→graph);
+   fetchers shed load when parsing lags.
+5. **All safety/resource bounds are Stage-0 acceptance criteria**, not Stage-5 work:
+   max response bytes, decompressed bytes, redirects, parse time, archive expansion,
+   post-redirect DNS/IP validation, PDF size/pages, browser runtime.
+6. **Exact RFC 9309 robots semantics, including failure modes:** a successfully fetched
+   file's rules are obeyed; 4xx/unavailable MAY crawl; 5xx or network failure MUST
+   disallow; cached robots ≤24h; parse limit ≥500 KiB. Covered by named tests, not a
+   generic `allowed()` boolean.
+7. **Benchmark from Stage 0/1:** 30–50 golden queries in Stage 0, 100–200 in Stage 1,
+   growing into the serious 500–2,000-query set at Stage 2.
+9. **CrawlPolicy ≠ RobotsPolicy** — kept as separate types in `crates/fetcher`.
+10. **QueryAnalysis is a frozen contract** in `crates/core`.
+12. **No vector DB yet** — dense lane deferred until the sparse/lexical base is measured.
+13. **Pack versioning** for dataset packs (builder + `packs/`).
+14. **Observability:** `tracing` + Prometheus; OTLP optional (OTel Rust is Beta).
+
+Revised Stage-0 acceptance test: seed URL → robots → frontier lease → HTTP fetch →
+normalize → ContentId → DocumentVersion → journal → Tantivy commit → manifest publish →
+`/search`; then restart and confirm the same result, and re-ingest and confirm no
+duplicate version.
 
 `engine/ARCHITECTURE.md` §34 recommends Rust for the core. That is the right call for the
 runtime (Tantivy, mmap indexes, frontier throughput), but it is a prerequisite to install,
