@@ -10,6 +10,10 @@
 
 pub mod journal;
 pub mod pipeline;
+pub mod watermark;
 
 pub use journal::{IngestStage, IngestState};
-pub use pipeline::IngestCoordinator;
+pub use pipeline::{
+    ingest_once, journal_event_count, resume, IngestCoordinator, IngestStateView,
+};
+pub use watermark::Watermark;

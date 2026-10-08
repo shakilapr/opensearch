@@ -40,10 +40,34 @@ impl IngestStage {
             _ => return None,
         })
     }
+
+    /// Every stage, in strict lifecycle order. `ALL` is the canonical walk used
+    /// by the idempotency driver.
+    pub const ALL: [IngestStage; 7] = [
+        IngestStage::Fetched,
+        IngestStage::Normalized,
+        IngestStage::BlobWritten,
+        IngestStage::MetadataCommitted,
+        IngestStage::LexicalIndexed,
+        IngestStage::GraphIndexed,
+        IngestStage::Visible,
+    ];
+
+    /// The next stage in the strict order, or `None` at `VISIBLE`.
+    pub fn next(self) -> Option<IngestStage> {
+        let idx = self.ordinal() as usize;
+        IngestStage::ALL.get(idx + 1).copied()
+    }
+
+    /// Zero-based position in the strict order. Backwards/duplicate detection
+    /// uses this ordering (`IngestStage` also derives `Ord`).
+    pub fn ordinal(self) -> u8 {
+        self as u8
+    }
 }
 
 /// A single idempotency key's progress.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestState {
     pub op_key: String,
     pub resource_id: String,
