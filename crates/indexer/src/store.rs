@@ -359,6 +359,17 @@ impl Indexer {
         self.visible_generation()
     }
 
+    /// The last published manifest, read back from the persisted
+    /// `_manifest.json` the indexer writes atomically on every publish.
+    ///
+    /// Returns `None` until the first publish — an unpublished index has no
+    /// manifest and callers must not fabricate one. This is the read-side
+    /// counterpart to [`Indexer::publish_manifest`], so other crates never
+    /// need to know the on-disk manifest location.
+    pub fn manifest(&self) -> AppResult<Option<IndexManifest>> {
+        load_manifest(&self.base_dir)
+    }
+
     /// Search base + overlay, dedupe by `doc_id` keeping the newest version,
     /// drop tombstones and not-yet-visible docs, tag each hit with provenance.
     pub fn search(&self, query: &str, limit: usize) -> AppResult<Vec<SearchResult>> {
@@ -801,6 +812,41 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "d1");
         assert!(idx2.visible_generation() >= 1, "manifest persisted across reopen");
+    }
+
+    #[test]
+    fn manifest_getter_none_before_publish_then_published() {
+        let (_t, idx) = tmp();
+        // Nothing published yet: the honest read-side state is `None`.
+        assert!(
+            idx.manifest().unwrap().is_none(),
+            "no manifest before the first publish"
+        );
+
+        idx.index_batch(vec![doc("d1", "Title", "some body text")])
+            .unwrap();
+        let published = idx.publish_manifest().unwrap();
+        let read = idx.manifest().unwrap().expect("manifest after publish");
+        assert_eq!(read.manifest_id, published.manifest_id);
+        assert_eq!(read.generation, published.generation);
+        assert_eq!(read.doc_count, published.doc_count);
+        assert_eq!(read.base_segments, published.base_segments);
+        // The getter agrees with the watermark accessors.
+        assert_eq!(read.generation, idx.visible_generation());
+    }
+
+    #[test]
+    fn manifest_getter_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let cfg = IndexerConfig::new(dir.path().join("tantivy"));
+        {
+            let idx = Indexer::open(cfg.clone()).unwrap();
+            assert!(idx.manifest().unwrap().is_none());
+            idx.publish_manifest().unwrap();
+        }
+        let idx2 = Indexer::open(cfg).unwrap();
+        let m = idx2.manifest().unwrap().expect("manifest persisted across reopen");
+        assert!(m.generation >= 1);
     }
 
     #[test]
