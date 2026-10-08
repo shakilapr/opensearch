@@ -15,6 +15,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 /// Smoothing factor for the change-rate exponential moving average.
@@ -144,6 +147,105 @@ impl SourceProfile {
 impl Default for SourceProfile {
     fn default() -> Self {
         Self::new(String::new(), String::new())
+    }
+}
+
+/// Default prior for a source with no observations yet.
+pub const DEFAULT_SOURCE_PRIOR: f32 = 0.5;
+
+/// Pseudo-count weight of [`DEFAULT_SOURCE_PRIOR`] in the blend (higher = trust the default
+/// more before data accumulates).
+const PRIOR_DEFAULT_WEIGHT: f64 = 4.0;
+
+/// A source's blended quality estimate as surfaced by [`PriorTable::priors`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePrior {
+    pub source_id: String,
+    /// Blended quality in `[0, 1]` (never NaN).
+    pub quality: f32,
+    /// Number of observations folded in.
+    pub samples: u64,
+}
+
+/// Running observation accumulator for one source.
+#[derive(Debug, Clone, Copy, Default)]
+struct Accum {
+    sum: f64,
+    samples: u64,
+}
+
+impl Accum {
+    /// Sample-weighted blend of the observed mean toward [`DEFAULT_SOURCE_PRIOR`]. Bounded to
+    /// `[0, 1]` and guaranteed finite.
+    fn blended(&self) -> f32 {
+        let n = self.samples as f64;
+        let denom = n + PRIOR_DEFAULT_WEIGHT;
+        if !denom.is_finite() || denom <= 0.0 {
+            return DEFAULT_SOURCE_PRIOR;
+        }
+        let value = (self.sum + DEFAULT_SOURCE_PRIOR as f64 * PRIOR_DEFAULT_WEIGHT) / denom;
+        if !value.is_finite() {
+            return DEFAULT_SOURCE_PRIOR;
+        }
+        value.clamp(0.0, 1.0) as f32
+    }
+}
+
+/// Per-source quality priors learned from observations (plan Stage 8).
+///
+/// Each source's estimate is a Bayesian-ish blend: with few samples it hugs
+/// [`DEFAULT_SOURCE_PRIOR`]; as observations accumulate it moves toward the observed mean.
+/// Interior mutability (`Mutex`) lets a `&self` table be shared. Observations of non-finite
+/// quality are ignored so the estimate is never NaN.
+#[derive(Debug, Default)]
+pub struct PriorTable {
+    inner: Mutex<HashMap<String, Accum>>,
+}
+
+impl PriorTable {
+    /// An empty table (every source reads [`DEFAULT_SOURCE_PRIOR`]).
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fold one quality observation (expected in `[0, 1]`; values are clamped) into
+    /// `source_id`'s estimate. Non-finite qualities are ignored.
+    pub fn observe(&self, source_id: impl Into<String>, quality: f32) {
+        if !quality.is_finite() {
+            return;
+        }
+        let q = quality.clamp(0.0, 1.0) as f64;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let acc = inner.entry(source_id.into()).or_default();
+        acc.sum += q;
+        acc.samples = acc.samples.saturating_add(1);
+    }
+
+    /// Blended quality estimate for `source_id`, in `[0, 1]`. Returns [`DEFAULT_SOURCE_PRIOR`]
+    /// for a source never observed.
+    pub fn prior_for(&self, source_id: impl AsRef<str>) -> f32 {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.get(source_id.as_ref()) {
+            Some(acc) => acc.blended(),
+            None => DEFAULT_SOURCE_PRIOR,
+        }
+    }
+
+    /// All observed sources as [`SourcePrior`]s, sorted deterministically by `source_id`.
+    pub fn priors(&self) -> Vec<SourcePrior> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<SourcePrior> = inner
+            .iter()
+            .map(|(source_id, acc)| SourcePrior {
+                source_id: source_id.clone(),
+                quality: acc.blended(),
+                samples: acc.samples,
+            })
+            .collect();
+        out.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        out
     }
 }
 
@@ -380,5 +482,90 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: SourceProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn prior_default_when_unseen() {
+        let table = PriorTable::new();
+        assert_eq!(table.prior_for("never_seen"), DEFAULT_SOURCE_PRIOR);
+        assert!(table.priors().is_empty());
+    }
+
+    #[test]
+    fn prior_blends_toward_observed_quality_as_samples_grow() {
+        let table = PriorTable::new();
+
+        // One perfect observation → just above the default (weighted by PRIOR_DEFAULT_WEIGHT).
+        table.observe("s", 1.0);
+        let few = table.prior_for("s");
+        assert!(few > DEFAULT_SOURCE_PRIOR, "few={few} should exceed default");
+        assert!(few < 1.0, "few={few} should stay below 1.0");
+
+        // Many more perfect observations → closer to 1.0 and monotonic increase.
+        for _ in 0..200 {
+            table.observe("s", 1.0);
+        }
+        let many = table.prior_for("s");
+        assert!(many > few, "many={many} should exceed few={few}");
+        assert!(many > 0.95, "many={many} should be close to 1.0");
+
+        // Observations of poor quality pull toward 0.
+        let down = PriorTable::new();
+        for _ in 0..200 {
+            down.observe("s", 0.0);
+        }
+        assert!(down.prior_for("s") < DEFAULT_SOURCE_PRIOR);
+        assert!(down.prior_for("s") < 0.05);
+    }
+
+    #[test]
+    fn prior_is_bounded_and_never_nan() {
+        let table = PriorTable::new();
+
+        // Out-of-range and non-finite inputs are clamped/ignored.
+        table.observe("s", 5.0);
+        table.observe("s", -3.0);
+        table.observe("s", f32::NAN);
+        table.observe("s", f32::INFINITY);
+        let p = table.prior_for("s");
+        assert!(p.is_finite(), "prior {p} must be finite");
+        assert!((0.0..=1.0).contains(&p), "prior {p} out of [0,1]");
+
+        for _ in 0..1000 {
+            table.observe("hi", 1.0);
+            table.observe("lo", 0.0);
+        }
+        for id in ["s", "hi", "lo", "unseen"] {
+            let v = table.prior_for(id);
+            assert!(v.is_finite(), "prior {v} for {id} must be finite");
+            assert!((0.0..=1.0).contains(&v), "prior {v} for {id} out of [0,1]");
+        }
+    }
+
+    #[test]
+    fn priors_are_sorted_and_deterministic() {
+        let table = PriorTable::new();
+        table.observe("zeta", 0.9);
+        table.observe("alpha", 0.2);
+        table.observe("alpha", 0.4);
+        table.observe("mike", 0.5);
+
+        let priors = table.priors();
+        let ids: Vec<&str> = priors.iter().map(|p| p.source_id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+
+        // Samples are recorded; quality matches prior_for and is bounded.
+        let alpha = priors.iter().find(|p| p.source_id == "alpha").unwrap();
+        assert_eq!(alpha.samples, 2);
+        assert_eq!(alpha.quality, table.prior_for("alpha"));
+        assert!((0.0..=1.0).contains(&alpha.quality));
+
+        // Stable across repeated calls.
+        assert_eq!(table.priors(), priors);
+
+        // SourcePrior round-trips through serde.
+        let json = serde_json::to_string(&priors).unwrap();
+        let back: Vec<SourcePrior> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, priors);
     }
 }
