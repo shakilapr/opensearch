@@ -19,9 +19,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::{AllQuery, QueryParser};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::query::{AllQuery, QueryParser, TermQuery};
 use tantivy::schema::{Field, Schema, TantivyDocument, Value};
 use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Searcher, Term};
+
+/// Characters kept from a query-relevant fragment (the UI and the answerer both
+/// read this). First-N-of-body was tried first and reads as boilerplate.
+const SNIPPET_CHARS: usize = 300;
 
 /// Writer arena budget per index. Tantivy needs >= a few MiB per thread.
 const WRITER_BUDGET: usize = 50_000_000;
@@ -119,6 +124,9 @@ struct Candidate {
     url: String,
     title: String,
     body: String,
+    /// Query-relevant excerpt of `body`, set by `collect`; empty means "not
+    /// generated" and falls back to the leading characters of the body.
+    snippet: String,
     source_id: Option<String>,
     published_at: Option<i64>,
     modified_at: Option<i64>,
@@ -168,6 +176,7 @@ impl Candidate {
             url: text(f.url),
             title: text(f.title),
             body: text(f.body),
+            snippet: String::new(),
             source_id: opt(f.source_id),
             published_at: i64_opt(f.published_at),
             modified_at: i64_opt(f.modified_at),
@@ -198,7 +207,11 @@ impl Candidate {
             Provenance::Overlay => "lexical_overlay",
             Provenance::Snapshot => "lexical_base",
         };
-        let snippet = make_snippet(&self.body);
+        let snippet = if self.snippet.trim().is_empty() {
+            make_snippet(&self.body)
+        } else {
+            self.snippet
+        };
         SearchResult {
             doc_id: self.doc_id,
             version: self.version,
@@ -435,8 +448,35 @@ impl Indexer {
             Err(_) => return Ok(()),
         };
         let top = searcher.search(&parsed, &TopDocs::with_limit(fetch)).ix()?;
+        // Query-relevant fragments: the first characters of a page are usually
+        // navigation/boilerplate, which reads as "just headers" to a downstream
+        // answerer. When Tantivy can build a snippet generator for the query, the
+        // stored body is excerpted around the matched terms instead.
+        // The fragment must be built from a field that is BOTH indexed with
+        // positions and STORED, because `snippet_from_doc` re-reads the value
+        // from the retrieved document: `body_boost` (the field the parser
+        // searches) is not STORED, so the generator is built from a `body`-only
+        // parse of the same query. No body parse -> no fragment -> head fallback.
+        let mut body_parser = QueryParser::for_index(index, vec![self.fields.body]);
+        let body_query = body_parser.parse_query(query).ok();
+        let mut generator = match body_query {
+            Some(q) => SnippetGenerator::create(&searcher, &q, self.fields.body)
+                .ok()
+                .map(|mut g| {
+                    g.set_max_num_chars(SNIPPET_CHARS);
+                    g
+                }),
+            None => None,
+        };
         for (score, addr) in top {
-            let cand = Candidate::from_doc(&searcher, addr, &self.fields, score, provenance)?;
+            let mut cand = Candidate::from_doc(&searcher, addr, &self.fields, score, provenance)?;
+            if let Some(g) = generator.as_mut() {
+                let stored: TantivyDocument = searcher.doc(addr).ix()?;
+                let fragment = g.snippet_from_doc(&stored).to_html();
+                if !fragment.trim().is_empty() {
+                    cand.snippet = fragment;
+                }
+            }
             match out.get(&cand.doc_id) {
                 Some(existing) if !cand.beats(existing) => {}
                 _ => {
@@ -494,6 +534,36 @@ impl Indexer {
             out.push(Candidate::from_doc(&searcher, addr, &self.fields, 0.0, provenance)?);
         }
         Ok(out)
+    }
+
+    /// The stored body text of one document, if this index holds it.
+    ///
+    /// The overlay is consulted first (a newer version wins), then the base. A
+    /// tombstoned row is reported as absent. Used by the answer path, which must
+    /// read real content rather than a leading-characters fragment; the caller
+    /// bounds how much of the returned text it uses.
+    pub fn doc_text(&self, doc_id: &str) -> AppResult<Option<String>> {
+        for reader in [&self.overlay_reader, &self.base_reader] {
+            reader.reload().ix()?;
+            let searcher = reader.searcher();
+            let term = Term::from_field_text(self.fields.doc_id, doc_id);
+            let query =
+                TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            let top = searcher.search(&query, &TopDocs::with_limit(1)).ix()?;
+            let Some((_, addr)) = top.first() else {
+                continue;
+            };
+            if fast_u64(&searcher, *addr, "tombstone") != 0 {
+                return Ok(None);
+            }
+            let doc: TantivyDocument = searcher.doc(*addr).ix()?;
+            let body = doc
+                .get_first(self.fields.body)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            return Ok(Some(body.to_string()));
+        }
+        Ok(None)
     }
 
     /// Every live (non-tombstoned, visible) document in base ∪ overlay as full
@@ -763,6 +833,57 @@ mod tests {
         let hits = idx.search("async", 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.doc_id == "d1" || h.doc_id == "d2"));
+    }
+
+    #[test]
+    fn snippet_is_excerpted_around_the_match_not_the_page_head() {
+        let (_t, idx) = tmp();
+        // Leading boilerplate, the matched term far into the body.
+        let filler = "nav home about contact ".repeat(120);
+        let body = format!("{filler} the transformer architecture dominates modern language modelling");
+        idx.index_batch(vec![doc("d1", "Transformers", &body)])
+            .unwrap();
+
+        let hits = idx.search("transformer", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(
+            snippet.to_lowercase().contains("transformer"),
+            "snippet must contain the matched term: {snippet}"
+        );
+        // The head fallback would be the first 200 chars of the body, which
+        // here contain no occurrence of the term at all.
+        assert_ne!(
+            snippet,
+            &make_snippet(&body),
+            "snippet fell back to the page head instead of the match window"
+        );
+        assert!(
+            snippet.chars().count() <= SNIPPET_CHARS + 32,
+            "fragment must respect the character cap: {} chars",
+            snippet.chars().count()
+        );
+    }
+
+    #[test]
+    fn doc_text_returns_stored_body_and_none_for_unknown() {
+        let (_t, idx) = tmp();
+        let body = "concrete detail about retrieval augmented generation pipelines";
+        idx.index_batch(vec![doc("d1", "RAG", body)]).unwrap();
+
+        assert_eq!(idx.doc_text("d1").unwrap().as_deref(), Some(body));
+        assert_eq!(idx.doc_text("nope").unwrap(), None);
+
+        // A newer overlay version wins, and a tombstone reads as absent.
+        idx.index_overlay(
+            IndexDoc::new("d1", "res_d1", "https://example.com/d1", "RAG", "newer body text")
+                .with_version(2),
+        )
+        .unwrap();
+        assert_eq!(idx.doc_text("d1").unwrap().as_deref(), Some("newer body text"));
+
+        idx.delete("d1").unwrap();
+        assert_eq!(idx.doc_text("d1").unwrap(), None);
     }
 
     #[test]
