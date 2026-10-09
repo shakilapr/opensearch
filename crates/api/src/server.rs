@@ -182,7 +182,59 @@ impl IntoResponse for ApiError {
 }
 
 /// Build the application router.
+/// Build the CORS layer from `SEARCH_CORS_ORIGIN` (comma-separated origins).
+///
+/// **Off by default, and deliberately narrow.** The API binds loopback and holds no
+/// authentication, so accepting any origin would let any web page the user visits drive their
+/// local index (a classic localhost/DNS-rebinding surface). Only the origins named here are
+/// allowed, and only the two methods and one header the UI actually sends. The production shape
+/// is same-origin — serve the built UI from the same host (`deploy/nginx.conf`) — which needs no
+/// CORS at all.
+fn cors_layer_from_env() -> Option<tower_http::cors::CorsLayer> {
+    let raw = std::env::var("SEARCH_CORS_ORIGIN").ok()?;
+    let names: Vec<String> = raw.split(',').map(|o| o.trim().to_string()).collect();
+    match cors_layer_from_origins(&names) {
+        Some(layer) => {
+            tracing::info!(origins = %raw, "CORS enabled for the named origins");
+            Some(layer)
+        }
+        None => {
+            tracing::warn!("SEARCH_CORS_ORIGIN set but no origin parsed; CORS stays off");
+            None
+        }
+    }
+}
+
+/// Build the CORS layer for an explicit origin list, or `None` when the list is empty.
+///
+/// Public so tests exercise *this* construction rather than a hand-rolled approximation — which
+/// matters, because the two are not equivalent: `CorsLayer::allow_origin` with a **single**
+/// `HeaderValue` emits that value for every request, while a **list** matches the request's
+/// `Origin` and sends nothing when it is not on it. Only the list form enforces the allow-list.
+pub fn cors_layer_from_origins(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    use tower_http::cors::CorsLayer;
+    let allowed: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
+        .collect();
+    if allowed.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(allowed)
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+            .allow_headers([axum::http::header::CONTENT_TYPE]),
+    )
+}
+
+/// The routes with no CORS layer (same-origin deployments, and tests).
 pub fn router(state: AppState) -> Router {
+    router_with_cors(state, None)
+}
+
+/// The routes, with an optional CORS layer (see [`cors_layer_from_env`]).
+pub fn router_with_cors(state: AppState, cors: Option<tower_http::cors::CorsLayer>) -> Router {
     // Outer->inner: map shed errors to 429, shed when full, then bound the
     // number of concurrently-running handlers.
     let bounded = tower::ServiceBuilder::new()
@@ -194,13 +246,17 @@ pub fn router(state: AppState) -> Router {
             DEFAULT_MAX_CONCURRENCY,
         ));
 
-    Router::new()
+    let app = Router::new()
         .route("/health", get(health))
         .route("/search", post(search))
         .route("/search_deep", post(search_deep))
         .route("/read", get(read_doc))
         .layer(bounded)
-        .with_state(state)
+        .with_state(state);
+    match cors {
+        Some(layer) => app.layer(layer),
+        None => app,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -387,7 +443,7 @@ pub async fn serve_with(
         tracing::info!(lanes = extra_lanes.len(), "serving with injected retrieval lanes");
         state.with_extra_lanes(extra_lanes)
     };
-    let app = router(state);
+    let app = router_with_cors(state, cors_layer_from_env());
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .map_err(|e| AppError::Config(format!("failed to bind {}: {e}", cfg.bind)))?;

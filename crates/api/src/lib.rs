@@ -22,7 +22,10 @@ pub use engine::{
     EngineSearchRequest, EngineSearchResponse, SearcherLane,
 };
 pub use query::{analyze, build_signals, execute, IndexHit, Searcher, DEFAULT_LIMIT, MAX_LIMIT};
-pub use server::{router, serve, serve_with, AppState, ApiError, DEFAULT_MAX_CONCURRENCY};
+pub use server::{
+    cors_layer_from_origins, router, router_with_cors, serve, serve_with, AppState, ApiError,
+    DEFAULT_MAX_CONCURRENCY,
+};
 
 #[cfg(feature = "real-indexer")]
 pub use indexer_adapter::IndexerSearcher;

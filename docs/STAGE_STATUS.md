@@ -34,8 +34,9 @@ multi-week architecture work, gated by the plan on proven quality.
      co-occurrence edges and works (9 294 / 2 109 / 73 413 / 210 on the last run), but §9.4 runs
      no personalised-PageRank activation at query time, and entity→document mapping needs a table
      the schema does not have (documents are not linked to the entities they mention).
-  4. **UI provenance verified live — code/verification.** The panel exists and vitest covers it,
-     but no live end-to-end check (real API response → rendered provenance) is recorded.
+  4. ~~UI provenance verified live.~~ **Done** — verified in a browser (see the exit gate above),
+     with the CORS gap that blocked it closed (`SEARCH_CORS_ORIGIN`, tested in
+     `crates/api/tests/cors.rs`).
 
 ## Stage 2 — Search quality & benchmarks
 - **Done:** `eval`, `embed`, `rerank`, `ann` present; RRF fusion; feature ranker; MMR

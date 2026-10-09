@@ -48,12 +48,54 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_USER_AGENT` | `AgentNativeSearchBot/0.1 (+https://github.com/agent-native-search)` | crawl UA |
 | `RUST_LOG` | `info` | tracing filter (see *Logs*) |
 | `SEARCH_MODEL_CACHE` | `<workspace>/models/fastembed` | where the real embedding weights live (see *Real embedding model*) |
+| `SEARCH_READ_ONLY` | `auto` | `auto` takes the index writer and falls back to a **read-only** open when it is locked (a crawl is running); `1` always read-only, `0` always the writer |
+| `SEARCH_CORS_ORIGIN` | unset | comma-separated origins allowed to call the API from a browser (see *Browser clients and CORS*) |
+
+## Browser clients and CORS
+
+The API binds loopback and carries no authentication, so **it sends no CORS headers by
+default**: a page served from another origin cannot call it, and a preflight is refused. This is
+deliberate — an allow-any-origin localhost API lets any site the user visits drive their index.
+
+To develop the UI against a running API, name the origin explicitly:
+
+```sh
+SEARCH_BIND=127.0.0.1:8090 SEARCH_DATA_DIR=/var/lib/search \
+SEARCH_ANSWER_ENABLED=1 SEARCH_CORS_ORIGIN=http://127.0.0.1:5173 \
+  agent0 serve
+(cd ui && VITE_API_BASE=http://127.0.0.1:8090 npm run dev)   # Vite on :5173
+```
+
+Only the listed origins receive `access-control-allow-origin`; any other origin gets none, which
+is what makes the browser refuse the request. Production needs no CORS at all: serve the built UI
+from the same host (`deploy/nginx.conf`), which the `deploy` npm script prepares.
+
+## Read-only serving (crawl and serve at once)
+
+Tantivy's writer lock is exclusive per index directory, so a process that opens a writer cannot
+share the data root with another one. `agent0 serve` therefore defaults to `SEARCH_READ_ONLY=auto`:
+it tries the writer (full function, query-time refresh on) and, when a crawl holds it, comes up
+**read-only** with a warning — queries work, query-time refresh does not. The same property is
+what lets the embedding backfill run beside a crawl:
+
+```sh
+agent0 embed build --out /var/lib/search/vectors.bin     # read-only; safe during a crawl
+```
 
 ## Real embedding model (BGE-small)
 
-The dense lane can run a real semantic model instead of the built-in lexical
-`HashEmbedder`. It is **off by default** — the default build links no ONNX Runtime and
-downloads nothing — and enabled per build with the `bge` feature:
+The dense lane runs a real semantic model (BGE-small-en-v1.5) by default; the deterministic
+lexical `HashEmbedder` is the fallback. A hermetic build with no ONNX Runtime and no model
+download is available with `--no-default-features`:
+
+```sh
+cargo build --release --no-default-features -p search-agent0   # hash embedder only
+```
+
+With the default build, `agent0 serve` loads the vector sidecar when one exists
+(`<data_dir>/vectors.bin`, built by `agent0 embed build`) and logs `dense lane enabled docs=N`.
+Without a sidecar the lane is simply absent — and every result's `lane_ranks` shows which lanes
+produced it (`bm25`, `dense`, `source_first`).
 
 ```sh
 cargo build --release --features bge -p search-bench

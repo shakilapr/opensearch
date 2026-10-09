@@ -61,6 +61,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tantivy = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "brotli", "rustls-tls", "stream"] }
 axum = "0.7"
+# Opt-in CORS for a browser-hosted UI (see SEARCH_CORS_ORIGIN).
+tower-http = { version = "0.6", features = ["cors"] }
 scraper = "0.20"
 html-escape = "0.2"
 quick-xml = "0.36"
