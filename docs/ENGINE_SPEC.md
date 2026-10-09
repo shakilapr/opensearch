@@ -122,7 +122,8 @@ impl Budget {
     pub fn charge_round(&mut self) -> bool;      // false when no rounds remain
     pub fn remaining_ms(&self, now_ms: u64) -> u64;
 }
-pub enum StopReason { Deadline, BudgetExhausted, SufficientCoverage, NoAdmissibleAction, Cancelled, Plateau }
+pub enum StopReason { Deadline, BudgetExhausted, SufficientCoverage, LimitReached, NoAdmissibleAction, Cancelled, Plateau }
+// Read-back priority when several hold at once: Deadline > LimitReached > SufficientCoverage > BudgetExhausted.
 ```
 
 ### `fuse` (§10) — candidate fusion and ranking cascade
@@ -153,6 +154,17 @@ pub fn evidence_coverage(units: &[QueryUnit], records: &[EvidenceRecord]) -> Cov
 
 /// Independent origins, not syndicated copies, count as corroboration (§16).
 pub fn independent_origins(records: &[EvidenceRecord], origin_of: &dyn Fn(&str) -> String) -> usize;
+
+/// §16 content verification, injected by the layer above (which can see document text).
+/// Injected through `Deps.verifier`; consulted first, with the title matcher as fallback.
+pub trait EvidenceVerifier: Send + Sync {
+    fn supports(&self, unit_text: &str, doc_id: &str) -> bool;
+}
+
+/// Deterministic title fallback: lowercase both sides, map every non-alphanumeric char to a
+/// space, split on whitespace; the title supports the unit when all of its tokens appear (units
+/// of <= 4 tokens) or at least ceil(0.8 * token_count) do (longer units; capped at 15 tokens).
+pub fn title_supports_unit(unit_text: &str, title: &str) -> bool;
 ```
 
 ### `diversify` (§16) — greedy maximal marginal relevance

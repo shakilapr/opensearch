@@ -13,6 +13,76 @@ pub enum Support {
     Unknown,
 }
 
+/// Verifies whether a retrieved document supports a query unit. Implemented by the
+/// layer above (which can see document text); the engine only calls it.
+///
+/// The engine's `Deps` carries only document *titles* (what the retrieval lanes return), so
+/// content-level verification (§16) cannot be derived here. The caller injects this trait and
+/// the coordinator consults it first, falling back to title matching when it is absent or
+/// unhelpful. Implementations must be deterministic and side-effect free.
+pub trait EvidenceVerifier: Send + Sync {
+    /// Return true when `doc_id`'s content supports `unit_text`.
+    fn supports(&self, unit_text: &str, doc_id: &str) -> bool;
+}
+
+/// Maximum number of normalised unit tokens considered by [`title_supports_unit`]; longer
+/// units are truncated to their first `MAX_UNIT_TOKENS` tokens so matching stays bounded.
+pub const MAX_UNIT_TOKENS: usize = 15;
+
+/// Units with at most this many normalised tokens must match *every* token in the title;
+/// longer units are allowed to fall short (see [`title_supports_unit`]).
+pub const ALL_TOKENS_AT_OR_BELOW: usize = 4;
+
+/// Lowercase `s`, map every non-alphanumeric character to a space, and split on whitespace,
+/// yielding the normalised token list. Unicode-aware lowercasing; deterministic and bounded
+/// by the input length.
+pub fn normalize_tokens(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Token-based, punctuation-normalised title match — the deterministic §16 fallback used when
+/// no [`EvidenceVerifier`] is injected (or it reports support for no candidate).
+///
+/// Exact rule (documented as implemented):
+/// * Both `unit_text` and `title` are normalised with [`normalize_tokens`]: lowercased, every
+///   non-alphanumeric character becomes a space, then split on whitespace. So
+///   `"retrieval augmented generation"` and `"Retrieval-Augmented Generation: A Survey"` both
+///   normalise to `["retrieval", "augmented", "generation", ...]` and the token `generation`
+///   in either matches the other — punctuation (the hyphen) is not significant.
+/// * The unit's token list is capped at [`MAX_UNIT_TOKENS`] tokens (keeping the first ones);
+///   a unit that normalises to no tokens (empty or punctuation/whitespace-only) supports
+///   nothing.
+/// * The title supports the unit when at least `required` of the unit's tokens are also tokens
+///   of the normalised title, where `required` is **all** of the unit's tokens when it has
+///   `<= ALL_TOKENS_AT_OR_BELOW` tokens, and otherwise `ceil(0.8 * token_count)` (i.e. at
+///   least 80% of the tokens) so a long unit does not require a title to contain every word.
+/// * Complexity is `O(unit_tokens * title_tokens)` — no regex, no recursion; the caller bounds
+///   the number of titles.
+pub fn title_supports_unit(unit_text: &str, title: &str) -> bool {
+    let mut need = normalize_tokens(unit_text);
+    if need.is_empty() {
+        return false;
+    }
+    if need.len() > MAX_UNIT_TOKENS {
+        need.truncate(MAX_UNIT_TOKENS);
+    }
+    let have = normalize_tokens(title);
+    let matched = need.iter().filter(|t| have.iter().any(|h| h == *t)).count();
+    let required = if need.len() <= ALL_TOKENS_AT_OR_BELOW {
+        need.len()
+    } else {
+        // ceil(0.8 * n) == (4*n + 4) / 5 for integer n.
+        (need.len() * 4 + 4) / 5
+    };
+    matched >= required
+}
+
 /// Evidence for one unit from one document version, with the exact span when known.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceRecord {

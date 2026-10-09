@@ -24,7 +24,10 @@ pub use coord::{
     run_search, Action, Answerer, Deps, ResultRow, SearchRequest, SearchResponse, Selector,
 };
 pub use diversify::{diversify, DiversityConfig, Scored};
-pub use evidence::{evidence_coverage, independent_origins, Coverage, EvidenceRecord, Support};
+pub use evidence::{
+    evidence_coverage, independent_origins, normalize_tokens, title_supports_unit, Coverage,
+    EvidenceRecord, EvidenceVerifier, Support,
+};
 pub use fuse::{fuse, run_cascade, CascadeInput, CascadeOutput, Fused, FusionPolicy, LaneHits};
 pub use plan::{
     build_plan, variant_preserves_constraints, IndexStats, Mode, Plan, QueryVariant, StageDeadlines,

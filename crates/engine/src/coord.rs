@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::analyze::{analyze_query, AliasPriors};
 use crate::budget::{Budget, StopReason};
 use crate::diversify::{diversify, DiversityConfig, Scored};
-use crate::evidence::{evidence_coverage, EvidenceRecord, Support};
+use crate::evidence::{evidence_coverage, EvidenceRecord, EvidenceVerifier, Support};
 use crate::fuse::{fuse, run_cascade, CascadeInput, FusionPolicy, LaneHits};
 use crate::plan::{build_plan, IndexStats, Mode, Plan};
 use crate::units::QueryUnit;
@@ -65,6 +65,14 @@ pub struct Deps<'a> {
     pub stats: IndexStats,
     /// Query start, unix seconds. The crate never reads a clock.
     pub now: i64,
+    /// §16 — optional content-level evidence verifier, injected by the layer above (which can
+    /// see document text). When `Some`, a unit is marked supported for a document when the
+    /// verifier reports that document's *content* supports it; when it is `None`, or reports
+    /// support for no candidate, the coordinator falls back to deterministic title-based
+    /// matching ([`crate::evidence::title_supports_unit`]). Additive: existing callers pass
+    /// `None` and keep the previous title-only behaviour. The verifier never sees a clock or
+    /// the network from inside this crate — it is purely injected.
+    pub verifier: Option<&'a dyn EvidenceVerifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,7 +221,9 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             }
         }
         state.candidates = launched;
-        refresh_evidence(&analysis.units, &titles, &mut records, &mut coverage, &mut state);
+        refresh_evidence(
+            &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
+        );
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     } else {
         state.stop_reason = Some(StopReason::BudgetExhausted);
@@ -340,15 +350,15 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         }
 
         state.candidates = raw_hits.iter().map(|h| h.ranked.len()).sum();
-        refresh_evidence(&analysis.units, &titles, &mut records, &mut coverage, &mut state);
+        refresh_evidence(
+            &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
+        );
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     }
 
-    if state.stop_reason.is_none() {
-        state.stop_reason = Some(StopReason::BudgetExhausted);
-    }
-    let stop_reason = state.stop_reason.unwrap_or(StopReason::BudgetExhausted);
-    trace.push(format!("stop reason: {stop_reason:?}"));
+    // Provisional verdict from the loop; refined below once the final result set is known
+    // (§17 priority: deadline > limit-reached > sufficient-coverage > budget).
+    let mut stop_reason = state.stop_reason.unwrap_or(StopReason::BudgetExhausted);
 
     // ---- Finalize: fuse, cascade, diversify, emit rows (§18 tail). ----
     let collapsed = collapse_lane_hits(&raw_hits);
@@ -396,6 +406,23 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         .collect();
 
     trace.push(format!("results: {} of limit {}", results.len(), req.limit));
+
+    // §17 stop-reason refinement, applied once the final result set is known. Priority when
+    // several conditions hold at once: deadline > limit-reached > sufficient-coverage > budget.
+    // `Deadline` is the single condition that outranks everything (checked first in the loop, so
+    // it is never masked here). Otherwise, a request whose result set has reached the requested
+    // `limit` is reported as `LimitReached` — the request was satisfied, so that, not the round
+    // budget or the coverage plateau that happened to fire, is why we stopped. When the limit is
+    // *not* reached the loop's own verdict stands, which already orders sufficient-coverage
+    // ahead of budget exhaustion.
+    let reached_limit = req.limit > 0 && results.len() >= req.limit;
+    if stop_reason != StopReason::Deadline && reached_limit {
+        trace.push(
+            "stop: refined to LimitReached (result set reached the requested limit)".to_string(),
+        );
+        stop_reason = StopReason::LimitReached;
+    }
+    trace.push(format!("stop reason: {stop_reason:?}"));
 
     // ---- Answer generation (§16/§22.1): strictly after selection; must not alter eligibility. ----
     let mut answer: Option<String> = None;
@@ -578,34 +605,63 @@ fn call_searcher(
 /// Recompute evidence records and coverage from the retained document metadata, then refresh the
 /// state's uncovered-mandatory list.
 ///
-/// No `EvidenceVerifier` is injected through [`Deps`], so the coordinator derives deterministic
-/// evidence from document *titles*: a unit is `Supported` when its normalized text is a
-/// case-insensitive substring of a retrieved document's title. This is a conservative stand-in
-/// for the §16 verifier and never marks a unit supported on speculation.
+/// Support is derived in two steps (§16):
+/// 1. **Injected content verification.** When a [`EvidenceVerifier`] is supplied through
+///    [`Deps`], a unit is `Supported` for the first candidate document whose *content* the
+///    verifier reports as supporting the unit (`verifier.supports(u.text, doc_id)`). The
+///    verifier is the layer above's window onto document text.
+/// 2. **Deterministic title fallback.** When no verifier is injected — or the verifier reports
+///    support for no candidate — the unit is matched against document *titles* with
+///    [`crate::evidence::title_supports_unit`]: both sides are lowercased, every non-alphanumeric
+///    character becomes a space, and the unit is supported when all of its tokens (or, for units
+///    longer than four tokens, at least 80% of them) appear as title tokens. This fixes the old
+///    substring test, which failed whenever a title punctuated a multi-word unit (e.g. the
+///    hyphen in `Retrieval-Augmented Generation`).
+///
+/// In both steps the search stops at the first supporting document, so at most one record is
+/// emitted per unit and the record count stays bounded by the number of units. A unit is
+/// `Supported` only on a positive verifier verdict or a positive title match — never on
+/// speculation — and `span` is left `None` (neither source reports offsets).
 fn refresh_evidence(
     units: &[QueryUnit],
     titles: &BTreeMap<String, String>,
+    verifier: Option<&dyn EvidenceVerifier>,
     records: &mut Vec<EvidenceRecord>,
     coverage: &mut crate::evidence::Coverage,
     state: &mut EngineState,
 ) {
     records.clear();
     for u in units {
-        let needle = u.text.trim().to_lowercase();
-        if needle.is_empty() {
-            continue;
-        }
-        for (doc_id, title) in titles {
-            if title.to_lowercase().contains(&needle) {
+        // 1. Injected content verification, when available.
+        if let Some(v) = verifier {
+            if let Some(doc_id) = titles.keys().find(|doc_id| v.supports(&u.text, doc_id)).cloned()
+            {
                 records.push(EvidenceRecord {
                     unit_id: u.id.clone(),
-                    doc_id: doc_id.clone(),
+                    doc_id,
                     status: Support::Supported,
                     span: None,
                     doc_version: "v1".to_string(),
                 });
-                break;
+                continue;
             }
+        }
+        // 2. Deterministic title fallback.
+        if u.text.trim().is_empty() {
+            continue;
+        }
+        if let Some(doc_id) = titles
+            .iter()
+            .find(|(_, title)| crate::evidence::title_supports_unit(&u.text, title))
+            .map(|(doc_id, _)| doc_id.clone())
+        {
+            records.push(EvidenceRecord {
+                unit_id: u.id.clone(),
+                doc_id,
+                status: Support::Supported,
+                span: None,
+                doc_version: "v1".to_string(),
+            });
         }
     }
     *coverage = evidence_coverage(units, records);

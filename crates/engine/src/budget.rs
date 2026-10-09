@@ -16,6 +16,11 @@ pub enum StopReason {
     Deadline,
     BudgetExhausted,
     SufficientCoverage,
+    /// The result set reached the requested `limit` (§17): the request was satisfied, so the
+    /// loop stopped even though more candidates or rounds may have remained. Reported ahead of
+    /// [`StopReason::SufficientCoverage`] and [`StopReason::BudgetExhausted`], behind
+    /// [`StopReason::Deadline`].
+    LimitReached,
     NoAdmissibleAction,
     Cancelled,
     Plateau,

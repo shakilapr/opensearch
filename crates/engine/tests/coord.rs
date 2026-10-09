@@ -10,7 +10,7 @@ use search_engine::analyze::AliasPriors;
 use search_engine::coord::{
     run_search, Action, Answerer, Deps, EngineState, RuleSelector, SearchRequest, Selector,
 };
-use search_engine::evidence::EvidenceRecord;
+use search_engine::evidence::{EvidenceRecord, EvidenceVerifier};
 use search_engine::plan::{IndexStats, Mode};
 use search_engine::{LaneId, StopReason};
 use search_retrieval::{
@@ -52,7 +52,25 @@ fn deps<'a>(
     answerer: Option<&'a dyn Answerer>,
     aliases: &'a AliasPriors,
 ) -> Deps<'a> {
-    Deps { lanes, selector, answerer, aliases, stats: stats(), now: 0 }
+    Deps { lanes, selector, answerer, aliases, stats: stats(), now: 0, verifier: None }
+}
+
+/// The same as [`deps`] but with an injected §16 content verifier.
+fn deps_with_verifier<'a>(
+    lanes: &'a [&'a dyn LaneSearcher],
+    selector: &'a dyn Selector,
+    aliases: &'a AliasPriors,
+    verifier: &'a dyn EvidenceVerifier,
+) -> Deps<'a> {
+    Deps {
+        lanes,
+        selector,
+        answerer: None,
+        aliases,
+        stats: stats(),
+        now: 0,
+        verifier: Some(verifier),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -428,4 +446,206 @@ fn zero_candidates_still_considers_widening_or_expanding() {
 
     assert!(!resp.results.is_empty(), "later retrieval must surface results");
     assert!(grower.calls() >= 2, "the coordinator must take a follow-up action");
+}
+
+// ---------------------------------------------------------------------------------------------
+// §16 evidence verification: token-based title matching and the injected `EvidenceVerifier`.
+// ---------------------------------------------------------------------------------------------
+
+/// A §16 verifier that reports content support only for one named document.
+struct SupportsDoc {
+    doc_id: String,
+}
+
+impl EvidenceVerifier for SupportsDoc {
+    fn supports(&self, unit_text: &str, doc_id: &str) -> bool {
+        !unit_text.trim().is_empty() && doc_id == self.doc_id
+    }
+}
+
+/// A §16 verifier that reports no support at all (forces the title fallback).
+struct NeverSupports;
+
+impl EvidenceVerifier for NeverSupports {
+    fn supports(&self, _unit_text: &str, _doc_id: &str) -> bool {
+        false
+    }
+}
+
+#[test]
+fn hyphenated_title_supports_multi_word_unit() {
+    // The unit is the whole phrase "retrieval augmented generation"; the document renders it
+    // "Retrieval-Augmented Generation ...". The old substring test failed on the hyphen; the
+    // normalised token matcher must succeed, so coverage reaches 1.0 with no verifier injected.
+    let mem = MemoryLaneSearcher::with_docs(vec![
+        MemoryDoc::new("d1", "Retrieval-Augmented Generation: A Survey")
+            .with_body("retrieval augmented generation explained"),
+        MemoryDoc::new("d2", "Unrelated topic").with_body("nothing here"),
+    ]);
+    let searcher = Recorder::new(mem);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let d = deps(&lanes, &selector, None, &aliases);
+
+    let resp = run_search(request("retrieval augmented generation", 5, Mode::Fast), &d);
+
+    assert!(
+        resp.coverage.mandatory_ok,
+        "the hyphenated title must support U1: {:?}",
+        resp.coverage
+    );
+    assert!(
+        resp.coverage.coverage >= 0.99,
+        "coverage {} should be ~1.0",
+        resp.coverage.coverage
+    );
+    assert!(
+        resp.coverage.unsupported.is_empty(),
+        "unsupported: {:?}",
+        resp.coverage.unsupported
+    );
+}
+
+#[test]
+fn injected_verifier_supports_when_titles_alone_would_not() {
+    // The title shares no token with the unit, so title matching alone cannot support U1.
+    let corpus = || {
+        MemoryLaneSearcher::with_docs(vec![MemoryDoc::new("d1", "Cooking pasta tonight")
+            .with_body("retrieval augmented generation explained")])
+    };
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+
+    // No verifier -> title fallback fails -> U1 unsupported.
+    let s1 = Recorder::new(corpus());
+    let lanes1: Vec<&dyn LaneSearcher> = vec![&s1];
+    let d1 = deps(&lanes1, &selector, None, &aliases);
+    let without = run_search(request("retrieval augmented generation", 5, Mode::Fast), &d1);
+    assert!(!without.coverage.mandatory_ok, "title alone must not support U1");
+    assert!(
+        without.coverage.unsupported.contains(&"U1".to_string()),
+        "unsupported: {:?}",
+        without.coverage.unsupported
+    );
+
+    // With a verifier that reports content support for d1 -> U1 supported despite the title.
+    let s2 = Recorder::new(corpus());
+    let lanes2: Vec<&dyn LaneSearcher> = vec![&s2];
+    let verifier = SupportsDoc { doc_id: "d1".to_string() };
+    let d2 = deps_with_verifier(&lanes2, &selector, &aliases, &verifier);
+    let with = run_search(request("retrieval augmented generation", 5, Mode::Fast), &d2);
+    assert!(
+        with.coverage.mandatory_ok,
+        "the verifier must support U1: {:?}",
+        with.coverage
+    );
+    assert!(with.coverage.coverage >= 0.99);
+}
+
+#[test]
+fn unit_with_no_matching_title_stays_unsupported() {
+    // d1 is retrieved (its body contains the query terms) but its TITLE contains none of the
+    // unit's tokens and no verifier is injected, so U1 must stay unsupported/Unknown.
+    let mem = MemoryLaneSearcher::with_docs(vec![MemoryDoc::new("d1", "Cooking pasta tonight")
+        .with_body("quantum entanglement explained")]);
+    let searcher = Recorder::new(mem);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let d = deps(&lanes, &selector, None, &aliases);
+
+    let resp = run_search(request("quantum entanglement", 5, Mode::Auto), &d);
+
+    assert_eq!(resp.coverage.coverage, 0.0);
+    assert!(!resp.coverage.mandatory_ok);
+    assert_eq!(resp.coverage.unsupported, vec!["U1".to_string()]);
+    assert!(resp.coverage.contradicted_units.is_empty());
+    assert!(!resp.results.is_empty(), "the document is still retrieved");
+    assert!(
+        resp.results.iter().all(|r| r.unit_support.is_empty()),
+        "no result may claim support for an unverified unit"
+    );
+}
+
+#[test]
+fn unit_is_never_marked_supported_on_speculation() {
+    // Even with a verifier present, one that reports no support must not cause a speculative
+    // Supported record; the title (also non-matching) leaves U1 unsupported.
+    let mem = MemoryLaneSearcher::with_docs(vec![MemoryDoc::new("d1", "Cooking pasta tonight")
+        .with_body("quantum entanglement explained")]);
+    let searcher = Recorder::new(mem);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let verifier = NeverSupports;
+    let d = deps_with_verifier(&lanes, &selector, &aliases, &verifier);
+
+    let resp = run_search(request("quantum entanglement", 5, Mode::Fast), &d);
+
+    assert_eq!(resp.coverage.coverage, 0.0);
+    assert!(!resp.coverage.mandatory_ok);
+    assert_eq!(resp.coverage.unsupported, vec!["U1".to_string()]);
+    assert!(resp.results.iter().all(|r| r.unit_support.is_empty()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// §17 stop-reason reporting: deadline > limit-reached > sufficient-coverage > budget.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn stop_reason_is_limit_reached_for_every_mode_when_limit_is_met() {
+    // Two documents match "rust async"; a limit of 2 is satisfied by every mode, so the reported
+    // reason must be LimitReached rather than the round-budget/plateau verdict the loop hit.
+    for mode in [Mode::Fast, Mode::Auto, Mode::Deep] {
+        let searcher = Recorder::new(corpus());
+        let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+        let selector = RuleSelector::new();
+        let aliases = AliasPriors::empty();
+        let d = deps(&lanes, &selector, None, &aliases);
+
+        let resp = run_search(request("rust async", 2, mode), &d);
+
+        assert_eq!(resp.results.len(), 2, "fixture must fill the limit ({mode:?})");
+        assert_eq!(
+            resp.stop_reason,
+            StopReason::LimitReached,
+            "mode {mode:?} must report LimitReached, trace: {:?}",
+            resp.trace
+        );
+        assert!(
+            resp.trace.iter().any(|l| l.contains("LimitReached")),
+            "the reason must appear in the trace ({mode:?})"
+        );
+    }
+}
+
+#[test]
+fn stop_reason_is_deadline_when_deadline_already_elapsed_for_every_mode() {
+    // The deadline is already past at entry. Even though the fixture fills the limit, the
+    // deadline outranks the limit in the §17 priority, so Deadline must be reported.
+    for mode in [Mode::Fast, Mode::Auto, Mode::Deep] {
+        let searcher = Recorder::new(corpus());
+        let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+        let selector = RuleSelector::new();
+        let aliases = AliasPriors::empty();
+        let d = deps(&lanes, &selector, None, &aliases);
+
+        let req = SearchRequest {
+            query: "rust async".to_string(),
+            limit: 2,
+            mode,
+            deadline_ms: 0,
+            tz_offset_min: 0,
+        };
+        let resp = run_search(req, &d);
+
+        assert_eq!(resp.results.len(), 2, "fixture must fill the limit ({mode:?})");
+        assert_eq!(
+            resp.stop_reason,
+            StopReason::Deadline,
+            "mode {mode:?} must report Deadline, trace: {:?}",
+            resp.trace
+        );
+    }
 }

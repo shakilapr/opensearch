@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
 
-use search_agent0::crawl::{crawl, CrawlOptions};
+use search_agent0::crawl::{crawl, CrawlOptions, MAX_LINKS_PER_PAGE};
 use search_core::config::Config;
 
 // Fixture bodies. Their SHA-256 values are asserted verbatim in the log.
@@ -64,6 +64,15 @@ impl Fx {
     fn count(&self, path: &str) -> usize {
         self.times(path).len()
     }
+    /// Every recorded request path, in arrival order (duplicates preserved).
+    fn paths(&self) -> Vec<String> {
+        self.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
 }
 
 /// Spawn a fixture serving `/robots.txt` + the given `(path, content_type, body)`
@@ -101,6 +110,73 @@ async fn spawn_fixture(
     }
 
     let router = router.fallback(|| async { StatusCode::NOT_FOUND });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{addr}"), fx)
+}
+
+/// Like [`spawn_fixture`], but the routes are owned `String`s built at runtime
+/// (so a page body can embed a second fixture's address) and **every** request —
+/// including one that falls through to the 404 handler — is recorded. That lets
+/// a test assert which paths were fetched *and* which were never tried.
+async fn spawn_recording_fixture(
+    routes: Vec<(String, String, String)>,
+    robots: &'static str,
+) -> (String, Fx) {
+    let fx = Fx::default();
+
+    let robots_fx = fx.clone();
+    let mut router = Router::new().route(
+        "/robots.txt",
+        get(move || {
+            let fx = robots_fx.clone();
+            async move {
+                fx.record("/robots.txt");
+                ([(header::CONTENT_TYPE, "text/plain")], robots).into_response()
+            }
+        }),
+    );
+
+    for (path, ct, body) in routes {
+        let fxc = fx.clone();
+        let path_rec = path.clone();
+        router = router.route(
+            &path,
+            get(move || {
+                let fx = fxc.clone();
+                let p = path_rec.clone();
+                let ct = ct.clone();
+                let body = body.clone();
+                async move {
+                    fx.record(&p);
+                    let mut hm = HeaderMap::new();
+                    if let Ok(v) = HeaderValue::from_str(&ct) {
+                        hm.insert(header::CONTENT_TYPE, v);
+                    }
+                    (StatusCode::OK, hm, body).into_response()
+                }
+            }),
+        );
+    }
+
+    // The fallback records the path too: a request for a route we did not
+    // register (e.g. a low-value or off-origin link that should never be
+    // followed) still shows up as a hit.
+    let fallback_fx = fx.clone();
+    let router = router.fallback(move |req: axum::extract::Request| {
+        let fx = fallback_fx.clone();
+        let path = req.uri().path().to_string();
+        async move {
+            fx.record(&path);
+            StatusCode::NOT_FOUND
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -501,4 +577,184 @@ fn content_urls_rank_ahead_of_generic_pages() {
         url_rank("https://example.com/docs/a-b-c"),
         url_rank("https://example.com/docs/a-b-c")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Link following
+// ---------------------------------------------------------------------------
+
+/// `article_links` resolves relative hrefs, keeps document-shaped links, drops
+/// profile/asset/mailto links, strips fragments, dedupes first-seen, honours the
+/// cap, ignores `href` inside comments/scripts, and never panics on malformed
+/// HTML or a page with no anchors.
+#[test]
+fn article_links_resolves_filters_dedupes_and_caps() {
+    use search_agent0::crawl::article_links;
+
+    let html = r##"<html><body>
+        <a href="/docs/getting-started">a</a>
+        <a href='/docs/getting-started'>dup</a>
+        <a href="/docs/api-reference">b</a>
+        <a href="/author/someone">author</a>
+        <a href="/assets/app.js">js</a>
+        <a href="https://other.example.com/docs/remote-guide">off</a>
+        <a href="#top">frag</a>
+        <a href="mailto:x@example.com">mail</a>
+        <a href="   ">empty</a>
+        <!-- <a href="/docs/hidden-in-comment">c</a> -->
+        <script>var s = '<a href="/docs/hidden-in-script">s</a>';</script>
+    </body></html>"##;
+
+    let links = article_links("http://example.com/", html, 200);
+    assert_eq!(
+        links,
+        vec![
+            "http://example.com/docs/getting-started".to_string(),
+            "http://example.com/docs/api-reference".to_string(),
+            // Origin-agnostic at this layer: the same-origin gate is the caller's.
+            "https://other.example.com/docs/remote-guide".to_string(),
+        ],
+        "resolved, deduped (first-seen order), filtered, comment/script ignored"
+    );
+
+    // The cap is a hard ceiling on the number of returned links.
+    assert_eq!(article_links("http://example.com/", html, 1).len(), 1);
+    assert!(article_links("http://example.com/", html, 0).is_empty());
+
+    // A page with no anchors yields nothing.
+    assert!(
+        article_links("http://example.com/", "<html><body>plain text</body></html>", 200)
+            .is_empty()
+    );
+
+    // An unterminated comment swallows the rest: nothing inside is extracted.
+    assert!(
+        article_links("http://example.com/", "<!-- <a href=\"/docs/hidden\"> --> behind", 200)
+            .is_empty()
+    );
+
+    // Malformed / truncated HTML must not panic and cannot invent many links.
+    let junk = "<a href=\"/docs/a-b-c <a href='/docs/d-e-f <!-- <a href=\"/docs/g-h-i\">";
+    assert!(article_links("http://example.com/", junk, 200).len() <= 1);
+    assert!(article_links("http://example.com/", "<a href=", 200).is_empty());
+}
+
+/// Links published on a seed page are followed to the same origin only: a
+/// document link is fetched, profile/asset links and an off-origin document link
+/// are not.
+#[tokio::test]
+async fn seed_page_links_are_followed_same_origin_only() {
+    // A second loopback origin (different port ⇒ a different site key).
+    let (other, off_fx) = spawn_recording_fixture(
+        vec![("/docs/off-site".to_string(), "text/html".to_string(), P2.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+
+    let body = format!(
+        "<!doctype html><html><head><title>root</title></head><body>\
+         <a href=\"/docs/getting-started\">d</a>\
+         <a href=\"/author/someone\">a</a>\
+         <a href=\"/assets/app.js\">j</a>\
+         <a href=\"{other}/docs/off-site\">o</a>\
+         </body></html>"
+    );
+    let (base, fx) = spawn_recording_fixture(
+        vec![
+            ("/".to_string(), "text/html".to_string(), body),
+            ("/docs/getting-started".to_string(), "text/html".to_string(), P1.to_string()),
+        ],
+        ROBOTS_OPEN,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "links.txt", &[format!("{base}/")]);
+
+    let summary = crawl(options(seeds, out.clone()), &cfg).await.unwrap();
+
+    assert!(
+        fx.count("/docs/getting-started") >= 1,
+        "the same-origin document link was followed"
+    );
+    assert_eq!(fx.count("/author/someone"), 0, "profile link must not be followed");
+    assert_eq!(fx.count("/assets/app.js"), 0, "asset link must not be followed");
+    assert_eq!(
+        off_fx.count("/docs/off-site"),
+        0,
+        "off-origin link must not be followed"
+    );
+    assert_eq!(
+        summary.urls_attempted, 2,
+        "only the seed and its one document link are attempted, got {summary:?}"
+    );
+}
+
+/// Link following is opt-out: with `follow_links = false` only the seed is
+/// fetched and nothing else is enqueued.
+#[tokio::test]
+async fn follow_links_can_be_disabled() {
+    let body = "<!doctype html><html><body><a href=\"/docs/getting-started\">d</a></body></html>";
+    let (base, fx) = spawn_recording_fixture(
+        vec![
+            ("/".to_string(), "text/html".to_string(), body.to_string()),
+            ("/docs/getting-started".to_string(), "text/html".to_string(), P1.to_string()),
+        ],
+        ROBOTS_OPEN,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "nofollow.txt", &[format!("{base}/")]);
+
+    let mut o = options(seeds, out.clone());
+    o.follow_links = false;
+    let summary = crawl(o, &cfg).await.unwrap();
+
+    assert_eq!(fx.count("/docs/getting-started"), 0, "link following is off");
+    assert_eq!(
+        summary.urls_attempted, 1,
+        "only the seed is attempted, got {summary:?}"
+    );
+    assert_eq!(summary.ingested, 1);
+}
+
+/// Regression: a seed page with 5 000 anchors must not fetch 5 000 URLs — the
+/// number of distinct non-seed paths fetched is bounded by `MAX_LINKS_PER_PAGE`.
+#[tokio::test]
+async fn huge_anchor_page_is_capped() {
+    let mut body = String::from("<!doctype html><html><body>");
+    for i in 0..5000 {
+        body.push_str(&format!("<a href=\"/docs/page-{i:04}\">x</a>"));
+    }
+    body.push_str("</body></html>");
+
+    let (base, fx) = spawn_recording_fixture(
+        vec![("/".to_string(), "text/html".to_string(), body)],
+        ROBOTS_OPEN,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "big.txt", &[format!("{base}/")]);
+
+    let _summary = crawl(options(seeds, out), &cfg).await.unwrap();
+
+    let distinct: std::collections::BTreeSet<String> = fx
+        .paths()
+        .into_iter()
+        .filter(|p| p != "/" && p != "/robots.txt")
+        .collect();
+    assert!(
+        distinct.len() <= MAX_LINKS_PER_PAGE,
+        "fetched {} distinct non-seed paths, cap is {MAX_LINKS_PER_PAGE}",
+        distinct.len()
+    );
+    assert!(!distinct.is_empty(), "some links were still followed");
 }
