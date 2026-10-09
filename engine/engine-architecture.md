@@ -4,6 +4,8 @@ Version: 2.0 · Research reviewed: 7 October 2026
 
 Status: implementation design, not a measured performance report. This document expands the supplied Search Engine Core Algorithm into an end-to-end engine specification. Algorithm descriptions have primary-source references; the combined architecture, policies, budgets, and rollout gates are proposed engineering choices. Numerical defaults must be tuned on the actual corpus, hardware, and traffic.
 
+Implementation status as of 2026-10-09: see §26 — sections 6–18 are implemented in `crates/engine` and served over HTTP; §26 records what is real versus proxied and the live measurements behind that claim.
+
 ## 1. Purpose and design decisions
 
 Build an independent search engine that accepts natural-language queries, conversation context, explicit constraints, freshness requirements, and a search mode. Return ranked documents and URLs with attributable evidence, timestamps, coverage, and an honest description of incomplete retrieval.
@@ -739,3 +741,38 @@ The linked papers and official documentation establish individual techniques. Th
 - **[R14] vLLM structured outputs.** [Official documentation source](https://github.com/vllm-project/vllm/blob/main/docs/features/structured_outputs.md). Choice and schema constraints; validate APIs against a pinned runtime version.
 - **[R15] vLLM automatic prefix caching.** [Official documentation source](https://github.com/vllm-project/vllm/blob/main/docs/features/automatic_prefix_caching.md). Shared-prefix prefill reuse; not elimination of queueing or decoding cost.
 - **[R16] BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models (2021).** [Paper](https://arxiv.org/abs/2104.08663), [official benchmark repository](https://github.com/beir-cellar/beir). Cross-domain retrieval evaluation; supplement with temporal and application-specific tests.
+
+## 26. Implementation status (as built)
+
+This section is written after the fact and describes the code as it exists, so a reader can tell which parts of §6–§18 are real algorithms and which are stand-ins with the same interface. It is a status record, not a redesign; the design above is unchanged.
+
+**Where it lives.** `crates/engine` (`search-engine`) implements §6–§18 and depends on `search-core`, `search-retrieval`, `search-rerank`, `search-indexer` — never on `search-agent0` or `search-api`. `crates/api/src/engine.rs` adapts it to HTTP: `POST /search` with `{"engine": true, ...}` runs `run_search`; an absent or unknown `engine` field keeps the legacy path. The engine is deterministic and hermetic: no network, no clock (time is the injected `now: i64`), every LLM decision behind a trait with a deterministic stub, no `unwrap`/`panic!` in request paths, and every loop statically bounded.
+
+| § | Subject | Status |
+|---|---------|--------|
+| 6 | Query analysis and belief state | Implemented (`analyze.rs`), rule-based with an injectable LLM selector |
+| 7 | Constraint decomposition, unit extraction | Implemented (`units.rs`) |
+| 8 | Planning and lane allocation | Implemented (`plan.rs`) |
+| 9.1 | Lexical lane | Real: Tantivy BM25 via `search-indexer`, with stop-word pruning on the query side |
+| 9.2 | Sparse lane | Proxy: co-occurrence fixture scoring, no trained SPLADE weights |
+| 9.3 | Dense lane | Proxy by default (hash embedding); real BGE-small-en-v1.5 behind `--features bge`, fetched to the model cache at runtime |
+| 9.4 | Graph lane | Interface only (`crates/graph`); no personalised-PageRank activation math |
+| 9.5 | Source-first lane | Real |
+| 10 | Fusion and ranking cascade | Implemented (`fuse.rs`); rank fusion plus the staged cascade |
+| 11 | Multi-vector options | Interface and tests; no trained multi-vector index |
+| 12 | Fast LLM selection | Implemented behind the `Selector` trait; deterministic rule selector by default |
+| 13 | Activation and refresh scheduling | Real |
+| 14 | Freshness semantics | Implemented; `published_at` is populated from crawl metadata where the page exposes it |
+| 15 | Looking strategies, action frontier | Implemented |
+| 16 | Evidence scoring and diversity | Evidence verification real (see below); diversity is MMR |
+| 17 | Budgets, deadlines, stopping | Implemented (`budget.rs`); `limit_reached` and `deadline` are the wire stop reasons |
+| 18 | Coordinator | Implemented (`coord.rs`) |
+
+**What is measured live.** Against a local index built by the real crawler, `POST /search` with `engine: true` returns grounded answers with `[n]` citations, `coverage` computed over decomposed units, and `stop_reason: limit_reached`. Queries with no support in the corpus return `coverage 0` with the unsupported unit named and an answer that says the evidence is insufficient — the answerer is not permitted to fill the gap from its own knowledge.
+
+**Two defects this status record had to fix first**, because the engine alone knows a result only by `doc_id`:
+
+1. An LLM handed document identifiers cannot ground anything — it reported, correctly, that the evidence contained "only passage identifiers". `SnippetAnswerer` now resolves each id to real text through `Searcher::doc_text`, preferring the query-relevant fragment the index retained and adding the page's own text excerpted around the first query term (1500 characters total). The head of a scraped page is navigation; live answers used to say "table of contents".
+2. Coverage scored 0 for queries the corpus demonstrably answered. Two causes: the serving wrapper (`SourceFirstSearcher`) did not forward `doc_text`, so every stored-body read returned the trait default `Ok(None)`; and `TextVerifier` required every query token including function words a page never contains. The wrapper delegates now, and verification uses content tokens only, requiring a unit's terms to occur inside one 80-token window — presence anywhere in a 90 KB page is not support.
+
+**Honest gaps, unchanged by the above.** No trained SPLADE weights and no trained cross-encoder; the dense lane is opt-in; the graph lane has an interface with no activation math; diversity is MMR only; `doc_type` and `language` are indexed but not stored; the crawler is single-writer and single-box. Vocabulary and corpus scale are the dominant quality limit today, not the controller: "what is a transformer" returns an insufficient-evidence answer because the corpus has no page that defines it, which is a crawl problem, not an engine one.
