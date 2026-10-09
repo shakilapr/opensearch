@@ -124,6 +124,25 @@ pub trait LaneSearcher: Send + Sync {
         limit: usize,
         source_id: Option<&str>,
     ) -> Result<Vec<Candidate>, RetrievalError>;
+
+    /// This lane's provenance-reporting view, when it has one.
+    ///
+    /// Fusion keeps **one** lane per document ([`merge_dedup`] preserves the first-seen lane), so a
+    /// document reached by two lanes is reported under a single one. A caller that needs to know a
+    /// document was *also* reached by a particular lane — the API does, to report honest
+    /// graph-expansion provenance — asks through here instead of guessing from the fused lane.
+    ///
+    /// Defaults to `None`, so a lane that cannot report contributes nothing rather than claiming
+    /// credit it has not earned.
+    fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
+        None
+    }
+}
+
+/// A lane that can name the documents it reached, independently of how fusion labelled them.
+pub trait ExpandingLane: Send + Sync {
+    /// Documents this lane reaches for `query`, best first.
+    fn expanded_docs(&self, query: &str, limit: usize) -> Vec<String>;
 }
 
 /// Blanket forwarding so a `Box<dyn LaneSearcher>` / `Arc<dyn LaneSearcher>` /
@@ -138,6 +157,13 @@ impl<T: LaneSearcher + ?Sized> LaneSearcher for Box<T> {
     ) -> Result<Vec<Candidate>, RetrievalError> {
         (**self).search(query, limit, source_id)
     }
+
+    // Forwarded explicitly: a defaulted method that a blanket impl forgets silently becomes the
+    // default, which here means "this lane cannot report provenance" — the graph lane was wrapped
+    // in an `Arc` and its expansion view was invisible for exactly this reason.
+    fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
+        (**self).as_expanding()
+    }
 }
 
 impl<T: LaneSearcher + ?Sized> LaneSearcher for Arc<T> {
@@ -148,6 +174,12 @@ impl<T: LaneSearcher + ?Sized> LaneSearcher for Arc<T> {
         source_id: Option<&str>,
     ) -> Result<Vec<Candidate>, RetrievalError> {
         (**self).search(query, limit, source_id)
+    }
+
+    /// Forwarded for the same reason as the `Box` impl: without this the `Arc` wrapper answers
+    /// `None` and every caller holding `Arc<dyn LaneSearcher>` loses the lane's expansion view.
+    fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
+        (**self).as_expanding()
     }
 }
 
@@ -507,4 +539,38 @@ mod tests {
         let s1a = out.iter().find(|c| c.doc_id == "s1-a").unwrap();
         assert_eq!(s1a.lane, Lane::SourceFirst);
     }
+    #[test]
+    fn a_wrapper_does_not_swallow_a_lanes_expansion_view() {
+        // The bug this guards: `Arc<dyn LaneSearcher>` resolves `as_expanding` through the blanket
+        // impl, which must forward it. When it did not, the wrapped lane answered `None`, the API's
+        // provenance probe found no lane, and `graph_expansion` read 0.0 for every query — with no
+        // error anywhere.
+        struct Reporting;
+        impl LaneSearcher for Reporting {
+            fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _source_id: Option<&str>,
+            ) -> Result<Vec<Candidate>, RetrievalError> {
+                Ok(vec![Candidate::new("doc-1", 1.0)])
+            }
+            fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
+                Some(self)
+            }
+        }
+        impl ExpandingLane for Reporting {
+            fn expanded_docs(&self, _query: &str, _limit: usize) -> Vec<String> {
+                vec!["doc-1".to_string()]
+            }
+        }
+
+        let boxed: Box<dyn LaneSearcher> = Box::new(Reporting);
+        let arced: std::sync::Arc<dyn LaneSearcher> = std::sync::Arc::new(Reporting);
+        for (label, lane) in [("box", &boxed as &dyn LaneSearcher), ("arc", &arced as &dyn LaneSearcher)] {
+            let view = lane.as_expanding().unwrap_or_else(|| panic!("{label} swallowed the view"));
+            assert_eq!(view.expanded_docs("q", 10), vec!["doc-1".to_string()], "{label}");
+        }
+    }
+
 }

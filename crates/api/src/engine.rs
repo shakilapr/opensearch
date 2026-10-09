@@ -553,6 +553,11 @@ impl EvidenceVerifier for TextVerifier<'_> {
 /// name in `lane_ranks`.
 pub type ExtraLanes = [Arc<dyn search_retrieval::LaneSearcher + Send + Sync>];
 
+/// Documents to ask an expanding lane for when building provenance. Generous on purpose: a document
+/// only needs to be *in* this set to be reported as graph-reached, and the lane is cheap (a bounded
+/// walk), so the cost of a large probe is a few milliseconds against a mislabelled signal.
+const GRAPH_EXPANSION_PROBE: usize = 200;
+
 pub fn run_engine_search(
     searcher: &dyn Searcher,
     req: EngineSearchRequest,
@@ -566,6 +571,15 @@ pub fn run_engine_search(
     if query.is_empty() {
         return Err(AppError::Invalid("query must not be empty".into()));
     }
+
+    // Which documents did graph expansion reach for this query? Fusion keeps one lane per document,
+    // so a graph-reached page that also matched lexically is labelled lexical-only; asking the lane
+    // directly is what keeps `graph_expansion` an observation rather than a constant.
+    let graph_docs: std::collections::HashSet<String> = extra_lanes
+        .iter()
+        .filter_map(|lane| lane.as_expanding())
+        .flat_map(|lane| lane.expanded_docs(&query, GRAPH_EXPANSION_PROBE))
+        .collect();
     let limit = normalize_limit(req.base.limit)?;
 
     let manifest = searcher.manifest()?;
@@ -660,7 +674,7 @@ pub fn run_engine_search(
         .iter()
         .filter_map(|row| {
             let hit = docmap.get(&row.doc_id)?;
-            let signals = build_signals(hit, &entities);
+            let signals = build_signals(hit, &entities, &graph_docs);
             let mut base = SearchResult::from(hit.clone());
             base.signals = signals;
             base.score = row.score as f32;
@@ -713,7 +727,16 @@ pub fn run_engine_search(
         engine: true,
         coverage,
         stop_reason: stop_reason_name(engine_resp.stop_reason).to_string(),
-        trace: engine_resp.trace,
+        trace: {
+            // Auditable: how many documents graph expansion reached for this query, so a reader of a
+            // trace can tell "the graph had nothing" from "the graph lane is not wired".
+            let mut trace = engine_resp.trace;
+            trace.push(format!(
+                "provenance: graph expansion reached {} document(s)",
+                graph_docs.len()
+            ));
+            trace
+        },
         answer: engine_resp.answer,
     })
 }

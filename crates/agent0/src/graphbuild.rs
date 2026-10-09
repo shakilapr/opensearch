@@ -148,7 +148,10 @@ pub async fn run(args: &[String]) -> ExitCode {
     let opts = Options::from_args(args);
     let cfg = Config::from_env();
 
-    let pipeline = match Pipeline::open(&cfg) {
+    // Read-only: a graph build reads stored documents and writes only to the metadata database, so
+    // it must not take Tantivy's exclusive writer lock — that lock is what made a graph build
+    // impossible while the server (or a crawl) was running.
+    let pipeline = match Pipeline::open_read_only(&cfg, false) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to open pipeline: {e}");

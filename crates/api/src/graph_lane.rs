@@ -26,11 +26,19 @@ use search_graph::activate::{activate, ActivationOptions};
 use search_graph::extract::extract_mentions;
 use search_graph::sidecar::GraphSidecar;
 use search_graph::Graph;
-use search_retrieval::{Candidate, Lane, LaneSearcher, RetrievalError};
+use search_retrieval::{Candidate, ExpandingLane, Lane, LaneSearcher, RetrievalError};
 
 /// Cap on the mention candidates taken from one query. A query is short; this only bounds the work
 /// when someone searches with a paragraph.
 const QUERY_MENTIONS: usize = 16;
+/// Longest token run considered when scanning the query itself for entity names. Four covers real
+/// names ("retrieval augmented generation" is tried as 1-, 2-, 3- and 4-grams).
+const QUERY_NGRAM_TOKENS: usize = 4;
+/// A query this short is a term lookup ("transformer", "paged attention"), so any match counts; a
+/// longer one has to name something, per [`is_named_entity`].
+const QUERY_LOOKUP_TOKENS: usize = 3;
+/// Tokens of the query scanned for n-grams (the query is short, but a pasted paragraph is not).
+const QUERY_SCAN_TOKENS: usize = 12;
 
 pub struct GraphLaneSearcher {
     graph: Graph,
@@ -65,6 +73,12 @@ impl GraphLaneSearcher {
         self.entity_count
     }
 
+    /// How many entities this query seeds. Exposed because "the graph matched nothing" and "the
+    /// query named nothing known" look identical in a response, and they call for different fixes.
+    pub fn seed_count(&self, query: &str) -> usize {
+        self.seeds(query).len()
+    }
+
     /// Entity ids the query names (by canonical name or alias), deduplicated and order-stable.
     fn seeds(&self, query: &str) -> Vec<String> {
         let mut seeds: Vec<String> = Vec::new();
@@ -76,11 +90,32 @@ impl GraphLaneSearcher {
             candidates.push(trimmed.to_string());
         }
         for mention in extract_mentions(query, 1, QUERY_MENTIONS) {
+            // Multi-word phrases are tried whole *and* token by token: "transformer architecture" is
+            // not a graph node, but `transformer` is, and refusing to look would leave a natural
+            // query with no seeds at all (observed: a probe that reached 0 documents). Tokenised
+            // first because pushing the key consumes it.
+            for token in mention.key.split_whitespace() {
+                candidates.push(token.to_string());
+            }
             candidates.push(mention.name);
             candidates.push(mention.key);
         }
+        // The extractor is tuned for documents, where an entity is capitalised; a typed query is
+        // often all lowercase and produces no mentions at all — "transformer architecture" yielded
+        // zero mentions and therefore zero seeds, though `transformer` is a graph node. So every
+        // contiguous token run of the query is tried too, and `resolve_name` folds case.
+        let tokens: Vec<&str> = trimmed.split_whitespace().take(QUERY_SCAN_TOKENS).collect();
+        for n in 1..=tokens.len().min(QUERY_NGRAM_TOKENS) {
+            for window in tokens.windows(n) {
+                candidates.push(window.join(" "));
+            }
+        }
+
         for candidate in candidates {
             for entity in self.graph.resolve_name(&candidate) {
+                if !is_named_entity(&entity.name, trimmed, &candidate) {
+                    continue;
+                }
                 if !seeds.iter().any(|s| s == &entity.entity_id) {
                     seeds.push(entity.entity_id.clone());
                 }
@@ -90,7 +125,53 @@ impl GraphLaneSearcher {
     }
 }
 
+/// Does this match look like a *name* rather than a lone topic word?
+///
+/// The graph contains single capitalised common nouns the extractor kept — a live probe resolved
+/// "phrase" to the entity `Phrase`, which made the lane fire on an unrelated query and inject
+/// loosely related documents into every result. A lone lowercase topic word ("transformer",
+/// "database") is what lexical retrieval is for; the graph lane earns its keep on *names*.
+///
+/// A match counts as a name when it is a multi-word phrase, carries a digit, is acronym-ish or
+/// mixed-case (`vLLM`, `BERT`, `NumPy` — an uppercase letter beyond the first), or when the user
+/// capitalised it in the query, which is the strongest available statement of intent.
+fn is_named_entity(entity_name: &str, query: &str, candidate: &str) -> bool {
+    // A short query is a term lookup: the user typed the term, so a single lowercase word counts.
+    if query.split_whitespace().count() <= QUERY_LOOKUP_TOKENS {
+        return true;
+    }
+    if candidate.contains(' ') {
+        return true;
+    }
+    if entity_name.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let mut chars = entity_name.chars();
+    let first = chars.next();
+    if let Some(first) = first {
+        if entity_name.chars().any(|c| c.is_uppercase() && c != first) {
+            return true;
+        }
+    }
+    query.split_whitespace().any(|token| token == entity_name)
+}
+
+/// Provenance for the fused response: fusion keeps one lane per document, so a document the graph
+/// lane reached but that also matched lexically would otherwise be reported as lexical-only and the
+/// API's `graph_expansion` would read 0 for every query.
+impl ExpandingLane for GraphLaneSearcher {
+    fn expanded_docs(&self, query: &str, limit: usize) -> Vec<String> {
+        self.search(query, limit, None)
+            .map(|hits| hits.into_iter().map(|h| h.doc_id).collect())
+            .unwrap_or_default()
+    }
+}
+
 impl LaneSearcher for GraphLaneSearcher {
+    fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
+        Some(self)
+    }
+
     fn search(
         &self,
         query: &str,
@@ -197,6 +278,42 @@ mod tests {
             "scores are relative and bounded: {:?}",
             hits.iter().map(|h| h.score).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_lone_lowercase_topic_word_does_not_seed() {
+        // Live: this query resolved "phrase" to a capitalised common-noun entity and reached ten
+        // documents. Seeding on that is noise, not expansion.
+        let lane = lane();
+        assert_eq!(
+            lane.seed_count("an entirely unrelated phrase about gardening"),
+            0,
+            "a lone lowercase topic word must not seed the walk"
+        );
+    }
+
+    #[test]
+    fn a_short_lowercase_query_seeds_because_it_is_a_term_lookup() {
+        // "transformer" alone is a lookup, not a sentence; refusing it would make the lane useless
+        // for the most common way people search.
+        let lane = lane();
+        assert_eq!(lane.seed_count("vllm"), 1, "a one-word query is a term lookup");
+    }
+
+    #[test]
+    fn a_capitalised_entity_word_seeds_even_when_single_token() {
+        // The other half of the rule: capitalisation is the user saying "this is a name".
+        let lane = lane();
+        assert_eq!(lane.seed_count("vLLM"), 1, "a mixed-case acronym always seeds");
+    }
+
+    #[test]
+    fn a_phrase_that_is_not_a_node_still_seeds_through_its_tokens() {
+        // "paged attention model" is not a node; `paged attention` is, and `vLLM` in a longer phrase
+        // must still seed. Without the token fallback a natural query reached zero documents.
+        let lane = lane();
+        let hits = lane.search("VLLM inference engine internals", 10, None).expect("search");
+        assert!(!hits.is_empty(), "a phrase containing a known entity must still seed: {hits:?}");
     }
 
     #[test]

@@ -119,7 +119,43 @@ impl From<IndexHit> for SearchResult {
 /// immutable base is carried by the frozen `lane` (`lexical_overlay`) /
 /// `provenance` (`overlay`) fields — see `SearchResult`, which is frozen and
 /// needs no `live_overlay` field added.
-pub fn build_signals(hit: &IndexHit, entities: &[String]) -> Vec<Signal> {
+/// `1.0` when graph expansion reached this document, else `0.0`.
+///
+/// Two ways a document can qualify, and both are needed:
+///
+/// * its fused `lane` names the graph lane, or
+/// * the graph lane reported the document in `graph_docs` for this query.
+///
+/// The second exists because fusion keeps one lane per document: a page that both matches
+/// lexically and is reached by activation is reported under the lexical lane, so reading the lane
+/// alone would report `graph_expansion: 0.0` for every query that the graph had actually expanded —
+/// a signal that always reads zero is not a measurement.
+pub fn graph_expansion_value(
+    hit: &IndexHit,
+    graph_docs: &std::collections::HashSet<String>,
+) -> f32 {
+    if hit.lane.contains("graph") || graph_docs.contains(&hit.doc_id) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn graph_expansion_note(hit: &IndexHit, graph_docs: &std::collections::HashSet<String>) -> String {
+    if hit.lane.contains("graph") {
+        "reached via graph expansion".to_string()
+    } else if graph_docs.contains(&hit.doc_id) {
+        "also reached via graph expansion".to_string()
+    } else {
+        "direct match (no graph expansion)".to_string()
+    }
+}
+
+pub fn build_signals(
+    hit: &IndexHit,
+    entities: &[String],
+    graph_docs: &std::collections::HashSet<String>,
+) -> Vec<Signal> {
     let bm25 = hit
         .signals
         .iter()
@@ -158,12 +194,8 @@ pub fn build_signals(hit: &IndexHit, entities: &[String]) -> Vec<Signal> {
         },
         Signal {
             name: "graph_expansion".to_string(),
-            value: if hit.lane.contains("graph") { 1.0 } else { 0.0 },
-            note: if hit.lane.contains("graph") {
-                "reached via graph expansion".to_string()
-            } else {
-                "direct match (no graph expansion)".to_string()
-            },
+            value: graph_expansion_value(hit, graph_docs),
+            note: graph_expansion_note(hit, graph_docs),
         },
     ];
 
@@ -338,7 +370,7 @@ pub fn execute(searcher: &dyn Searcher, req: &SearchRequest) -> AppResult<Search
         .map(|h| {
             // Compute the full per-signal provenance from the hit + the query's
             // extracted entities before the hit is consumed into a SearchResult.
-            let signals = build_signals(&h, &analysis.entities);
+            let signals = build_signals(&h, &analysis.entities, &std::collections::HashSet::new());
             let mut r = SearchResult::from(h);
             r.signals = signals;
             r
@@ -1045,6 +1077,32 @@ mod tests {
     }
 
     #[test]
+    fn a_document_the_graph_lane_reached_reports_expansion_even_when_fusion_labelled_it_lexical() {
+        // The case that made the signal useless: a page that both matches lexically and is reached
+        // by activation is reported under one lane by fusion. Reading the lane alone reported
+        // graph_expansion 0.0 for every query the graph had actually expanded.
+        let mut h = hit("res-graph-reached", 1.0, "s", 100);
+        h.lane = "lexical_overlay".into();
+        let mut graph_docs = std::collections::HashSet::new();
+        graph_docs.insert("res-graph-reached".to_string());
+
+        let sigs = build_signals(&h, &[], &graph_docs);
+        let gx = sigs.iter().find(|s| s.name == "graph_expansion").unwrap();
+        assert_eq!(gx.value, 1.0, "the document WAS reached by graph expansion");
+        assert!(gx.note.contains("also"), "the note must say it was also reached: {}", gx.note);
+    }
+
+    #[test]
+    fn a_document_neither_labelled_nor_reached_reports_no_expansion() {
+        let mut h = hit("res-plain", 1.0, "s", 100);
+        h.lane = "lexical_overlay".into();
+        let sigs = build_signals(&h, &[], &std::collections::HashSet::new());
+        let gx = sigs.iter().find(|s| s.name == "graph_expansion").unwrap();
+        assert_eq!(gx.value, 0.0, "an honest \"not expanded\" rather than a fabricated boost");
+        assert!(gx.note.contains("no graph expansion"), "{}", gx.note);
+    }
+
+    #[test]
     fn build_signals_prefers_searcher_bm25_and_keeps_extras() {
         let mut h = hit("a", 1.0, "s", 100);
         h.lane = "graph_expand".into();
@@ -1060,7 +1118,7 @@ mod tests {
                 note: "extra".into(),
             },
         ];
-        let sigs = build_signals(&h, &[]);
+        let sigs = build_signals(&h, &[], &std::collections::HashSet::new());
         assert_eq!(sigs.iter().find(|s| s.name == "bm25").unwrap().value, 7.5);
         assert_eq!(
             sigs.iter().find(|s| s.name == "graph_expansion").unwrap().value,
