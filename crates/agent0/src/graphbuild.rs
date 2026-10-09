@@ -286,8 +286,13 @@ mod tests {
         )
     }
 
+    /// Test options, derived from the *production* defaults so adding a field to `Options`
+    /// cannot leave this helper uncompilable (which is exactly what happened once) or silently
+    /// divergent from the CLI.
     fn opts(min_docs: usize) -> Options {
-        Options { limit: usize::MAX, min_count: 2, min_docs, max_mentions: 40, window: 50, batch: 10 }
+        let mut o = Options::from_args(&[] as &[String]);
+        o.min_docs = min_docs;
+        o
     }
 
     #[test]
