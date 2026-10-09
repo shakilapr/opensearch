@@ -34,6 +34,7 @@ members = [
     "crates/api",
     "crates/agent0",
     "crates/organize",
+    "crates/engine",
 ]
 
 [workspace.package]
