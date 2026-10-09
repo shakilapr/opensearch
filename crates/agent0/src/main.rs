@@ -21,6 +21,37 @@ use std::process::ExitCode;
 use search_agent0::Pipeline;
 use search_core::config::Config;
 
+/// Open the pipeline for serving, honouring `SEARCH_READ_ONLY`.
+///
+/// The crawler holds the index writer lock for the whole of a run, so a server that insists on
+/// its own writer cannot come up beside one — which is why serving and crawling used to be
+/// mutually exclusive. `auto` (the default) tries the writer, and on a locked index falls back
+/// to a read-only open: queries work, query-time refresh does not, and the log says so.
+///
+/// * `SEARCH_READ_ONLY=1` — always read-only (a crawl may be running; never fails on the lock).
+/// * `SEARCH_READ_ONLY=0` — always take the writer; fail if the index is locked.
+/// * unset / `auto` — writer if possible, read-only otherwise.
+fn open_for_serve(cfg: &search_core::config::Config) -> search_core::error::AppResult<Pipeline> {
+    let mode = std::env::var("SEARCH_READ_ONLY").unwrap_or_default().trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "1" | "true" | "yes" => {
+            tracing::info!("SEARCH_READ_ONLY=1: serving read-only (no index lock, refresh off)");
+            Pipeline::open_read_only(cfg, false)
+        }
+        "0" | "false" | "no" => Pipeline::open(cfg),
+        _ => match Pipeline::open(cfg) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "index is locked (a crawl is running?): serving READ-ONLY — queries work, query-time refresh is off"
+                );
+                Pipeline::open_read_only(cfg, false)
+            }
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Honour RUST_LOG (default `info`); without this the deploy unit's RUST_LOG
@@ -180,7 +211,7 @@ async fn run_refresh() -> ExitCode {
 
 async fn run_serve() -> ExitCode {
     let cfg = config();
-    let pipeline = match Pipeline::open(&cfg) {
+    let pipeline = match open_for_serve(&cfg) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to open pipeline: {e}");

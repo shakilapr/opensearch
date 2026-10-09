@@ -301,6 +301,30 @@ impl Pipeline {
         scheduler_cfg: SchedulerConfig,
         budget_capacity: u64,
     ) -> AppResult<Self> {
+        Self::open_inner(cfg, allow_loopback, scheduler_cfg, budget_capacity, false)
+    }
+
+    /// Open **read-only**: no Tantivy writer, so no lock on the index directory.
+    ///
+    /// This is what lets the server run beside a crawler (or any other writer) against one data
+    /// root. Queries are unaffected; refresh and ingest cannot run, and say so.
+    pub fn open_read_only(cfg: &Config, allow_loopback: bool) -> AppResult<Self> {
+        Self::open_inner(
+            cfg,
+            allow_loopback,
+            SchedulerConfig::default(),
+            DEFAULT_REFRESH_BUDGET,
+            true,
+        )
+    }
+
+    fn open_inner(
+        cfg: &Config,
+        allow_loopback: bool,
+        scheduler_cfg: SchedulerConfig,
+        budget_capacity: u64,
+        read_only: bool,
+    ) -> AppResult<Self> {
         cfg.assert_not_synced().map_err(AppError::Config)?;
         cfg.ensure_dirs()?;
         cfg.limits.validate().map_err(AppError::Config)?;
@@ -309,7 +333,12 @@ impl Pipeline {
         let writer = MetadataWriter::from_path(&cfg.meta_db())?;
         let frontier = Frontier::new(cfg.meta_db());
         let fetcher = Fetcher::new(cfg.limits.clone(), cfg.user_agent.clone());
-        let indexer = Arc::new(Indexer::open(IndexerConfig::new(cfg.data_dir.join("tantivy")))?);
+        let index_cfg = if read_only {
+            IndexerConfig::read_only(cfg.data_dir.join("tantivy"))
+        } else {
+            IndexerConfig::new(cfg.data_dir.join("tantivy"))
+        };
+        let indexer = Arc::new(Indexer::open(index_cfg)?);
         let http = reqwest::Client::builder()
             .user_agent(cfg.user_agent.clone())
             // Redirects are not auto-followed; the loopback path is direct.
@@ -359,6 +388,11 @@ impl Pipeline {
             .map_err(|e| AppError::Internal(format!("failed to open trace sink: {e}")))?;
         self.trace = Some(Arc::new(PolicyTrace::new(Box::new(sink))));
         Ok(())
+    }
+
+    /// Whether this pipeline was opened without an index writer (no lock, no refresh).
+    pub fn is_read_only(&self) -> bool {
+        self.indexer.is_read_only()
     }
 
     /// The searcher the HTTP API should be wired to (real Tantivy indexer behind
@@ -514,6 +548,9 @@ impl Pipeline {
         sources: &[SourceDue],
         now: i64,
     ) -> AppResult<RefreshReport> {
+        if self.is_read_only() {
+            return Ok(RefreshReport::default());
+        }
         let activations = self.scheduler.due(sources, now);
         let mut report = RefreshReport {
             admitted: activations.len(),
@@ -531,6 +568,11 @@ impl Pipeline {
     /// time-sensitive performs no refresh work and issues zero fetches.
     pub async fn query_refresh(&self, q: &str, now: i64) -> AppResult<RefreshReport> {
         let mut report = RefreshReport::default();
+        // A read-only pipeline cannot write the index; report that as a no-op rather than
+        // failing the search that asked for freshness.
+        if self.is_read_only() {
+            return Ok(report);
+        }
         if !is_time_sensitive(q, now) {
             return Ok(report);
         }

@@ -38,6 +38,12 @@ const SCHEMA_HASH_FILE: &str = "_schema_hash";
 pub struct IndexerConfig {
     pub base_dir: PathBuf,
     pub overlay_dir: PathBuf,
+    /// Open without an `IndexWriter`, so the process takes **no lock** on the directory.
+    ///
+    /// Tantivy's writer lock is exclusive per index directory, which is why a crawl and a
+    /// `serve` could not run against the same data root at all. A read-only index serves
+    /// queries normally and refuses every write with a clear error.
+    pub read_only: bool,
 }
 
 impl IndexerConfig {
@@ -47,7 +53,13 @@ impl IndexerConfig {
         Self {
             base_dir: root.join("base"),
             overlay_dir: root.join("overlay"),
+            read_only: false,
         }
+    }
+
+    /// The same layout, opened read-only (no writer, no lock).
+    pub fn read_only(root: impl AsRef<Path>) -> Self {
+        Self { read_only: true, ..Self::new(root) }
     }
 }
 
@@ -245,8 +257,10 @@ pub struct Indexer {
     overlay_dir: PathBuf,
     base: Index,
     overlay: Index,
-    base_writer: Mutex<IndexWriter>,
-    overlay_writer: Mutex<IndexWriter>,
+    /// `None` when the index was opened read-only (see `IndexerConfig::read_only`): no writer
+    /// means no lock on the directory, which is what lets a reader run beside a crawl.
+    base_writer: Option<Mutex<IndexWriter>>,
+    overlay_writer: Option<Mutex<IndexWriter>>,
     base_reader: IndexReader,
     overlay_reader: IndexReader,
     state: Mutex<State>,
@@ -258,8 +272,15 @@ impl Indexer {
         let schema = build_schema();
         let base = open_or_create(&cfg.base_dir, &schema)?;
         let overlay = open_or_create(&cfg.overlay_dir, &schema)?;
-        let base_writer = base.writer(WRITER_BUDGET).ix()?;
-        let overlay_writer = overlay.writer(WRITER_BUDGET).ix()?;
+        // The writer is what takes the exclusive lock, so a read-only open must not create one.
+        let (base_writer, overlay_writer) = if cfg.read_only {
+            (None, None)
+        } else {
+            (
+                Some(Mutex::new(base.writer(WRITER_BUDGET).ix()?)),
+                Some(Mutex::new(overlay.writer(WRITER_BUDGET).ix()?)),
+            )
+        };
         let base_reader = base.reader().ix()?;
         let overlay_reader = overlay.reader().ix()?;
         let fields = Fields::from_schema(&schema);
@@ -271,8 +292,8 @@ impl Indexer {
             overlay_dir: cfg.overlay_dir,
             base,
             overlay,
-            base_writer: Mutex::new(base_writer),
-            overlay_writer: Mutex::new(overlay_writer),
+            base_writer,
+            overlay_writer,
             base_reader,
             overlay_reader,
             state: Mutex::new(State { manifest }),
@@ -289,11 +310,41 @@ impl Indexer {
         &self.overlay_dir
     }
 
+    /// Whether this handle can write (false = opened read-only, no writer, no lock).
+    pub fn is_read_only(&self) -> bool {
+        self.base_writer.is_none()
+    }
+
+    /// The base writer, or a clear error when the index is open read-only.
+    ///
+    /// A read-only index exists so a reader can run beside a crawler; every write path must
+    /// therefore fail with a sentence a caller can log, not a panic or a silent no-op.
+    fn base_writer(&self) -> AppResult<std::sync::MutexGuard<'_, IndexWriter>> {
+        match self.base_writer.as_ref() {
+            Some(w) => Ok(w.lock().unwrap_or_else(|e| e.into_inner())),
+            None => Err(AppError::Index(
+                "index is open read-only: writes are refused (start without read-only to write)"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The overlay writer, or a clear error when the index is open read-only.
+    fn overlay_writer(&self) -> AppResult<std::sync::MutexGuard<'_, IndexWriter>> {
+        match self.overlay_writer.as_ref() {
+            Some(w) => Ok(w.lock().unwrap_or_else(|e| e.into_inner())),
+            None => Err(AppError::Index(
+                "index is open read-only: writes are refused (start without read-only to write)"
+                    .to_string(),
+            )),
+        }
+    }
+
     // -- writes ------------------------------------------------------------
 
     /// Single-doc writer on the overlay, for freshness. Commits immediately.
     pub fn index_overlay(&self, doc: IndexDoc) -> AppResult<()> {
-        let mut w = self.overlay_writer.lock().unwrap();
+        let mut w = self.overlay_writer()?;
         // Replace any prior overlay version of this doc (doc_id is the delete term).
         w.delete_term(Term::from_field_text(self.fields.doc_id, &doc.doc_id));
         w.add_document(doc.to_tantivy(&self.schema)).ix()?;
@@ -303,7 +354,7 @@ impl Indexer {
 
     /// Batched writer on the base index. One commit for the whole batch.
     pub fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
-        let mut w = self.base_writer.lock().unwrap();
+        let mut w = self.base_writer()?;
         for doc in docs {
             w.delete_term(Term::from_field_text(self.fields.doc_id, &doc.doc_id));
             w.add_document(doc.to_tantivy(&self.schema)).ix()?;
@@ -317,7 +368,7 @@ impl Indexer {
     pub fn delete(&self, doc_id: &str) -> AppResult<()> {
         let version = self.current_version(doc_id)?.saturating_add(1);
         {
-            let mut w = self.base_writer.lock().unwrap();
+            let mut w = self.base_writer()?;
             w.delete_term(Term::from_field_text(self.fields.doc_id, doc_id));
             w.commit().ix()?;
         }
@@ -326,7 +377,7 @@ impl Indexer {
 
     /// Delete the `doc_id` term from base only.
     pub fn delete_from_base(&self, doc_id: &str) -> AppResult<()> {
-        let mut w = self.base_writer.lock().unwrap();
+        let mut w = self.base_writer()?;
         w.delete_term(Term::from_field_text(self.fields.doc_id, doc_id));
         w.commit().ix()?;
         Ok(())
@@ -503,7 +554,7 @@ impl Indexer {
         let overlay_docs = self.read_all(&self.overlay_reader, Provenance::Overlay)?;
 
         {
-            let mut w = self.base_writer.lock().unwrap();
+            let mut w = self.base_writer()?;
             for cand in &overlay_docs {
                 w.delete_term(Term::from_field_text(self.fields.doc_id, &cand.doc_id));
                 if cand.tombstone == 0 {
@@ -518,7 +569,7 @@ impl Indexer {
 
         // Clear the overlay in one commit.
         {
-            let mut w = self.overlay_writer.lock().unwrap();
+            let mut w = self.overlay_writer()?;
             w.delete_all_documents().ix()?;
             w.commit().ix()?;
         }
@@ -1095,10 +1146,13 @@ mod tests {
         b.add_text_field("totally_different", tantivy::schema::STRING);
         tantivy::Index::create_in_dir(&base, b.build()).unwrap();
 
-        let err = match Indexer::open(IndexerConfig {
+        // Built from the constructor rather than a literal, so a new config field cannot leave
+        // this test uncompilable (which has happened twice in this codebase already).
+        let cfg = IndexerConfig {
             base_dir: base,
-            overlay_dir: dir.path().join("overlay"),
-        }) {
+            ..IndexerConfig::new(dir.path().join("tantivy"))
+        };
+        let err = match Indexer::open(cfg) {
             Ok(_) => panic!("expected a schema-mismatch error"),
             Err(e) => e,
         };
