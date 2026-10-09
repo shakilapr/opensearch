@@ -19,6 +19,9 @@ MAX_DOCS="${MAX_DOCS:-10000}"
 MAX_URLS="${MAX_URLS:-200000}"
 CONCURRENCY="${CONCURRENCY:-16}"
 ORIGIN_INTERVAL_MS="${ORIGIN_INTERVAL_MS:-750}"
+# Per-origin attempt cap: a small value spreads the document budget across many
+# sources (the Stage-1 goal), the derived default is depth-first.
+ORIGIN_CAP="${ORIGIN_CAP:-}"
 
 echo "== building release agent0 (bge off: lexical corpus build) =="
 cargo build --release -p search-agent0
@@ -26,13 +29,14 @@ cargo build --release -p search-agent0
 BIN=target/release/agent0
 mkdir -p "$OUT/blobs"
 
-echo "== crawling seeds=$SEEDS -> out=$OUT (max-docs=$MAX_DOCS max-urls=$MAX_URLS)"
+echo "== crawling seeds=$SEEDS -> out=$OUT (max-docs=$MAX_DOCS max-urls=$MAX_URLS origin-cap=${ORIGIN_CAP:-derived})"
 SEARCH_DATA_DIR="$DATA_DIR" \
 SEARCH_CRAWL_ORIGIN_INTERVAL_MS="$ORIGIN_INTERVAL_MS" \
   "$BIN" crawl "$SEEDS" \
     --max-docs "$MAX_DOCS" \
     --max-urls "$MAX_URLS" \
     --concurrency "$CONCURRENCY" \
+    ${ORIGIN_CAP:+--origin-cap "$ORIGIN_CAP"} \
     --out "$OUT"
 
 echo "== raw-dataset =="
