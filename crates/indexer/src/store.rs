@@ -457,7 +457,7 @@ impl Indexer {
         // Read every overlay doc (including tombstones) while holding the
         // overlay writer lock is avoided; readers are independent.
         self.overlay_reader.reload().ix()?;
-        let overlay_docs = self.read_all(&self.overlay_reader)?;
+        let overlay_docs = self.read_all(&self.overlay_reader, Provenance::Overlay)?;
 
         {
             let mut w = self.base_writer.lock().unwrap();
@@ -486,14 +486,51 @@ impl Indexer {
     }
 
     /// Every live (non-deleted) doc currently held by a reader.
-    fn read_all(&self, reader: &IndexReader) -> AppResult<Vec<Candidate>> {
+    fn read_all(&self, reader: &IndexReader, provenance: Provenance) -> AppResult<Vec<Candidate>> {
         let searcher = reader.searcher();
         let addrs = searcher.search(&AllQuery, &DocSetCollector).ix()?;
         let mut out = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            out.push(Candidate::from_doc(&searcher, addr, &self.fields, 0.0, Provenance::Overlay)?);
+            out.push(Candidate::from_doc(&searcher, addr, &self.fields, 0.0, provenance)?);
         }
         Ok(out)
+    }
+
+    /// Every live (non-tombstoned, visible) document in base ∪ overlay as full
+    /// `IndexDoc`s — everything the schema STOREs (`url`, `title`, `body`,
+    /// `source_id`, `published_at`, ids), i.e. enough to rebuild a document
+    /// without touching the blob store. Deduped by `doc_id`: a newer overlay copy
+    /// wins over the base copy, exactly as `search` does it.
+    ///
+    /// Order is `doc_id`-sorted so two runs over the same index are byte-identical.
+    ///
+    /// Lossy by design: `headings` and `entities` are not STOREd, so they come back
+    /// empty (see [`Candidate::to_index_doc`]).
+    pub fn all_docs(&self) -> AppResult<Vec<IndexDoc>> {
+        self.base_reader.reload().ix()?;
+        self.overlay_reader.reload().ix()?;
+        let watermark = self.visible_generation();
+
+        let mut by_id: HashMap<String, Candidate> = HashMap::new();
+        for cand in self.read_all(&self.base_reader, Provenance::Snapshot)? {
+            by_id.insert(cand.doc_id.clone(), cand);
+        }
+        for cand in self.read_all(&self.overlay_reader, Provenance::Overlay)? {
+            match by_id.get(&cand.doc_id) {
+                Some(existing) if !cand.beats(existing) => {}
+                _ => {
+                    by_id.insert(cand.doc_id.clone(), cand);
+                }
+            }
+        }
+
+        let mut docs: Vec<IndexDoc> = by_id
+            .into_values()
+            .filter(|c| c.tombstone == 0 && c.visible_generation <= watermark)
+            .map(|c| c.to_index_doc(c.visible_generation))
+            .collect();
+        docs.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+        Ok(docs)
     }
 
     /// Doc count + segment count over base and overlay, deduped by `doc_id`,
@@ -861,6 +898,67 @@ mod tests {
         // A normal doc (generation 0 <= watermark) is visible.
         idx.index_batch(vec![doc("now", "Now doc", "present phrase here")]).unwrap();
         assert_eq!(idx.search("present phrase", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn all_docs_returns_every_live_doc_with_stored_fields() {
+        let (_t, idx) = tmp();
+        idx.index_batch(vec![
+            doc("d1", "Rust async", "tokio runtime body"),
+            doc("d2", "Python asyncio", "asyncio body"),
+            doc("d3", "Cooking", "pasta body"),
+        ])
+        .unwrap();
+        idx.publish_manifest().unwrap();
+
+        let docs = idx.all_docs().unwrap();
+        assert_eq!(docs.len(), 3, "all three live docs exported");
+        // Deterministic (doc_id-sorted) order: two runs must agree byte-for-byte.
+        let ids: Vec<&str> = docs.iter().map(|d| d.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["d1", "d2", "d3"]);
+        // The export source is the STOREd fields, not the blob store.
+        let d1 = docs.iter().find(|d| d.doc_id == "d1").unwrap();
+        assert_eq!(d1.title, "Rust async");
+        assert_eq!(d1.body, "tokio runtime body");
+        assert_eq!(d1.url, "https://example.com/d1");
+        // `index_batch` stores the doc's own generation (0 by default); it must
+        // never be reportable above the published watermark.
+        assert!(d1.visible_generation <= idx.visible_generation());
+
+        // Idempotent: a second export equals the first.
+        assert_eq!(idx.all_docs().unwrap(), docs);
+    }
+
+    #[test]
+    fn all_docs_drops_tombstoned_and_prefers_the_newer_overlay_copy() {
+        let (_t, idx) = tmp();
+        idx.index_batch(vec![
+            doc("d1", "Base title", "base body oldterm"),
+            doc("d2", "Doomed", "doomed body"),
+        ])
+        .unwrap();
+        idx.publish_manifest().unwrap();
+
+        // A newer overlay copy of d1 shadows the base copy...
+        idx.index_overlay(
+            IndexDoc::new(
+                "d1",
+                "res_d1",
+                "https://example.com/d1",
+                "Overlay title",
+                "overlay body newterm",
+            )
+            .with_version(2),
+        )
+        .unwrap();
+        // ...and a tombstone removes d2 entirely.
+        idx.index_overlay(IndexDoc::tombstone("d2", 2)).unwrap();
+
+        let docs = idx.all_docs().unwrap();
+        assert_eq!(docs.len(), 1, "d2 is tombstoned; d1 collapses to one doc");
+        assert_eq!(docs[0].doc_id, "d1");
+        assert_eq!(docs[0].body, "overlay body newterm", "overlay copy wins");
+        assert_eq!(docs[0].title, "Overlay title");
     }
 
     #[test]
