@@ -828,3 +828,112 @@ async fn a_stale_pending_backlog_does_not_starve_the_seed_list() {
         fx_a.paths()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// §21 browser escalation: a JS-only shell renders to text in a browser, a normal page does not
+// need one. The driver is the `BrowserFetcher` trait, so these run on `MockBrowser` (no
+// Chromium, no network) and pin the three outcomes that matter.
+// ---------------------------------------------------------------------------------------------
+
+/// A page whose HTML normalizes to no text: the shape a client-rendered site serves.
+const JS_SHELL: &str = "<html><head><title>App</title></head><body><div id=\"root\"></div>\
+                         <script>window.__DATA__={}</script></body></html>";
+
+#[tokio::test]
+async fn a_js_shell_is_indexed_from_the_browser_render_when_a_driver_is_attached() {
+    let (base, _fx) = spawn_recording_fixture(
+        vec![("/shell".to_string(), "text/html".to_string(), JS_SHELL.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/shell");
+
+    let rendered = "<html><head><title>App</title></head><body><article>\
+        <h1>Paged Attention</h1><p>Paged attention reduces KV cache memory in vLLM by \
+        storing keys and values in separate blocks.</p></article></body></html>";
+    let browser = search_browser::MockBrowser::new().with_fixture(
+        url.clone(),
+        search_browser::BrowserResult::new(url.clone(), rendered, 200),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.browser = Some(std::sync::Arc::new(browser));
+    opts.max_docs = 1;
+    let summary = crawl(opts, &cfg).await.unwrap();
+
+    assert_eq!(summary.ingested, 1, "the rendered page must be indexed: {summary:?}");
+    let lines = log_lines(&out);
+    let entry = lines.iter().find(|l| l["url"] == url.as_str()).expect("the url must be logged");
+    assert_eq!(entry["outcome"], "ingested", "{entry}");
+}
+
+#[tokio::test]
+async fn a_js_shell_stays_unsupported_when_the_render_is_no_better() {
+    // The mock returns a DOM that also has no text (a bot wall, a broken bundle): the page must
+    // still not become a zero-content document, and the crawl must not fail.
+    let (base, _fx) = spawn_recording_fixture(
+        vec![("/shell".to_string(), "text/html".to_string(), JS_SHELL.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/shell");
+    let browser = search_browser::MockBrowser::new().with_fixture(
+        url.clone(),
+        search_browser::BrowserResult::new(url.clone(), JS_SHELL.to_string(), 200),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.browser = Some(std::sync::Arc::new(browser));
+    opts.max_docs = 1;
+    let summary = crawl(opts, &cfg).await.unwrap();
+
+    assert_eq!(summary.ingested, 0, "nothing indexable was produced: {summary:?}");
+    let lines = log_lines(&out);
+    let entry = lines.iter().find(|l| l["url"] == url.as_str()).expect("the url must be logged");
+    assert_eq!(
+        entry["outcome"], "routed",
+        "a page with no text stays routed rather than indexed: {entry}"
+    );
+}
+
+#[tokio::test]
+async fn a_page_with_text_never_calls_the_browser() {
+    // Escalation must be a last resort: a driver that would fail loudly is attached, and the
+    // crawl must not touch it for a normal page.
+    let (base, _fx) = spawn_recording_fixture(
+        vec![(
+            "/doc".to_string(),
+            "text/html".to_string(),
+            "<html><body><article><h1>Rust</h1><p>Rust is a systems language with a borrow \
+             checker.</p></article></body></html>"
+                .to_string(),
+        )],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/doc");
+
+    // No fixture registered: any `fetch` would be `NoFixture`, i.e. a visible escalation attempt.
+    let browser = search_browser::MockBrowser::new();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.browser = Some(std::sync::Arc::new(browser));
+    opts.max_docs = 1;
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 1, "the page has text and must be indexed directly: {summary:?}");
+}

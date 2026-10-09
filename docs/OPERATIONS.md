@@ -70,6 +70,38 @@ Only the listed origins receive `access-control-allow-origin`; any other origin 
 is what makes the browser refuse the request. Production needs no CORS at all: serve the built UI
 from the same host (`deploy/nginx.conf`), which the `deploy` npm script prepares.
 
+## Browser escalation (rendering JS-only pages)
+
+Some real pages carry no text until their JavaScript runs: the HTML normalizes to nothing, so
+without help they would be indexed as empty or dropped. With the `chromium` feature the crawler
+escalates such a page **once** to a headless Chromium, indexes the rendered text, and falls back
+to the previous `html-no-text` route if the render is no better. Escalation is opt-in, because it
+costs far more than a plain fetch:
+
+```sh
+cargo build -p search-agent0 --features chromium
+SEARCH_BROWSER=1 SEARCH_CHROMIUM=/path/to/chrome agent0 crawl --seeds crawler/seeds/llm-tech.txt
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `SEARCH_BROWSER` | `1`/`true`/`yes` attaches the Chromium driver (needs `--features chromium`). |
+| `SEARCH_CHROMIUM` | Explicit Chromium/Chrome path; otherwise discovery is used. |
+| `SEARCH_CHROMIUM_NO_SANDBOX` | `1` runs Chromium with `--no-sandbox` (plus `--disable-dev-shm-usage`). |
+
+`SEARCH_CHROMIUM_NO_SANDBOX` is a **security trade-off, so it is explicit**: with the sandbox off,
+a renderer that exploits a bug is not contained. Chromium refuses to start as root without it
+(`Running as root without --no-sandbox is not supported`), which is how a container usually runs —
+so this box needs it, and a host that can run Chromium as an unprivileged user should not set it.
+One persistent browser is launched per crawl and each fetch gets a short-lived private context
+(cookies and storage do not carry between pages). Every fetch is bounded by `BrowserLimits`
+(`max_ms`). The driver is verified against a real browser by an ignored test:
+
+```sh
+SEARCH_CHROMIUM=/path/to/chrome cargo test -p search-browser --features chromium \
+  --test chromium_live -- --ignored
+```
+
 ## Read-only serving (crawl and serve at once)
 
 Tantivy's writer lock is exclusive per index directory, so a process that opens a writer cannot

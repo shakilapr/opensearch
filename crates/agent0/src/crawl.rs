@@ -83,6 +83,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use search_browser::BrowserFetcher;
+
 use serde::Serialize;
 use tokio::task::JoinSet;
 use url::Url;
@@ -121,7 +123,7 @@ pub const MAX_LINKS_PER_PAGE: usize = 200;
 const MAX_LINK_SCAN_BYTES: usize = 5_000_000;
 
 /// Tunables for one crawl run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrawlOptions {
     /// Path to the seeds file (one URL per line, `#` comments ignored).
     pub seeds_file: PathBuf,
@@ -145,6 +147,28 @@ pub struct CrawlOptions {
     /// rather than depth in a few sets a smaller value so the document budget
     /// spreads across more hosts.
     pub origin_cap: Option<usize>,
+    /// §21 escalation driver. `None` in production unless `SEARCH_BROWSER` asks for one;
+    /// tests attach a `MockBrowser` here to exercise the path hermetically.
+    pub browser: Option<Arc<dyn BrowserFetcher>>,
+}
+
+/// Manual `Debug`: the escalation driver is a trait object, which has no `Debug`; its
+/// presence is what matters when reading a run's options.
+impl std::fmt::Debug for CrawlOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrawlOptions")
+            .field("seeds_file", &self.seeds_file)
+            .field("out_dir", &self.out_dir)
+            .field("max_docs", &self.max_docs)
+            .field("max_urls", &self.max_urls)
+            .field("concurrency", &self.concurrency)
+            .field("follow_links", &self.follow_links)
+            .field("allow_loopback", &self.allow_loopback)
+            .field("origin_interval", &self.origin_interval)
+            .field("origin_cap", &self.origin_cap)
+            .field("browser", &self.browser.is_some())
+            .finish()
+    }
 }
 
 impl CrawlOptions {
@@ -161,7 +185,42 @@ impl CrawlOptions {
             allow_loopback: false,
             origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
             origin_cap: None,
+            browser: None,
         }
+    }
+}
+
+/// Build the escalation driver when `SEARCH_BROWSER` is truthy.
+///
+/// Off by default: the real driver launches a Chromium process, which a hermetic test run or a
+/// text-only deployment must not pay for. `1`/`true`/`yes` enables it, and only a build compiled
+/// with the `chromium` feature can satisfy the request — otherwise the crawl logs why and runs
+/// without escalation rather than failing.
+async fn browser_from_env() -> Option<Arc<dyn BrowserFetcher>> {
+    let wanted = std::env::var("SEARCH_BROWSER")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !wanted {
+        return None;
+    }
+    #[cfg(feature = "chromium")]
+    {
+        match search_browser::ChromiumBrowser::launch().await {
+            Ok(b) => Some(Arc::new(b)),
+            Err(e) => {
+                tracing::warn!(error = %e, "SEARCH_BROWSER is set but Chromium could not launch; \
+                    crawling without escalation");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "chromium"))]
+    {
+        tracing::warn!(
+            "SEARCH_BROWSER is set but this build has no `chromium` feature; crawling without \
+             escalation (rebuild with `--features chromium`)"
+        );
+        None
     }
 }
 
@@ -225,6 +284,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         allow_loopback: false,
         origin_interval: Duration::from_millis(interval_ms),
         origin_cap,
+        browser: browser_from_env().await,
     };
 
     let cfg = Config::from_env();
@@ -274,7 +334,12 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     let seen = read_log_urls(&log_path)?;
     let resumed_from = seen.len();
 
-    let pipeline = Arc::new(Pipeline::open_with(cfg, opts.allow_loopback)?);
+    let mut pipeline = Pipeline::open_with(cfg, opts.allow_loopback)?;
+    if let Some(browser) = opts.browser.clone() {
+        tracing::info!("browser escalation enabled for this crawl");
+        pipeline.set_browser(browser);
+    }
+    let pipeline = Arc::new(pipeline);
 
     // The fetcher used ONLY for discovery bodies (robots/sitemaps/feeds). It is
     // the same `Fetcher` type the pipeline holds; the pipeline does not expose

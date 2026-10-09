@@ -26,10 +26,17 @@ multi-week architecture work, gated by the plan on proven quality.
      seeds file now holds ~235 distinct roots ordered breadth-first, the crawl caps attempts per
      origin (`--origin-cap` / `ORIGIN_CAP`), and (as of this audit) the crawler runs *beside* the
      server, so the corpus can grow without taking the API down. It needs hours of crawl time.
-  2. **Browser escalation — code.** `crates/browser` (persistent Chromium, short-lived contexts,
-     `BrowserLimits`) has **no dependents**: nothing escalates a JS-only page, and no Chromium is
-     installed on this host. Needs: install Chromium, a router escalation rule (thin text / SPA
-     shell), pipeline wiring, and tests with `MockBrowser`.
+  2. **Browser escalation — done, live-verified.** `crates/browser` had **no dependents** and its
+     real driver had never been compiled. Both are fixed: an HTML page that normalizes to no text
+     escalates once to a `BrowserFetcher` and is indexed from the render (falling through to the
+     old `html-no-text` route if the render is no better), and `ChromiumBrowser` now compiles and
+     renders: `cargo test -p search-browser --features chromium --test chromium_live -- --ignored`
+     returns text that exists only after the page's JavaScript runs. Wiring: `SEARCH_BROWSER=1`
+     (feature `chromium`), `SEARCH_CHROMIUM` for the executable, `SEARCH_CHROMIUM_NO_SANDBOX=1`
+     where Chromium refuses to start as root. Policy is pinned by three hermetic `MockBrowser`
+     tests in `crates/agent0/tests/crawl.rs`.
+     *Remaining:* escalate on a *thin* (not only empty) normalisation, and a per-host escalation
+     budget so a JS-heavy origin cannot multiply crawl cost.
   3. **Entity graph *lane* — code.** `agent0 graph build` now populates entities, aliases,
      co-occurrence edges and works (9 294 / 2 109 / 73 413 / 210 on the last run), but §9.4 runs
      no personalised-PageRank activation at query time, and entity→document mapping needs a table

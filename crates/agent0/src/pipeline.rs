@@ -74,6 +74,7 @@ use search_frontier::queue::{FrontierEntry, Priority};
 use search_frontier::{Frontier, Lease};
 use search_indexer::{IndexDoc, Indexer, IndexerConfig};
 use search_ingest::{IngestCoordinator, IngestStage, Watermark};
+use search_browser::{BrowserFetcher, BrowserLimits};
 use search_metadata::{MetadataReader, MetadataWriter, Mutation};
 use search_parser::NormalizedDoc;
 use search_pdf::PdfLimits;
@@ -212,6 +213,10 @@ pub struct RefreshReport {
 pub struct Pipeline {
     cfg: Config,
     meta: Mutex<MetadataWriter>,
+    /// Optional §21 browser escalation. `None` (the default) means an HTML page that
+    /// normalizes to no text is routed as `html-no-text`; `Some` renders it once in a browser
+    /// and indexes what the browser sees, if that is any better.
+    browser: Option<Arc<dyn BrowserFetcher>>,
     frontier: Frontier,
     fetcher: Fetcher,
     /// Used only for the loopback-only test exemption path.
@@ -365,6 +370,7 @@ impl Pipeline {
         Ok(Self {
             cfg: cfg.clone(),
             meta: Mutex::new(writer),
+            browser: None,
             frontier,
             fetcher,
             http,
@@ -388,6 +394,16 @@ impl Pipeline {
             .map_err(|e| AppError::Internal(format!("failed to open trace sink: {e}")))?;
         self.trace = Some(Arc::new(PolicyTrace::new(Box::new(sink))));
         Ok(())
+    }
+
+    /// Attach a browser for §21 escalation (a JS-only page that renders to no text).
+    pub fn set_browser(&mut self, browser: Arc<dyn BrowserFetcher>) {
+        self.browser = Some(browser);
+    }
+
+    /// Whether an escalation driver is attached.
+    pub fn has_browser(&self) -> bool {
+        self.browser.is_some()
     }
 
     /// Whether this pipeline was opened without an index writer (no lock, no refresh).
@@ -968,6 +984,18 @@ impl Pipeline {
         // PDF branch above and the import-time invariant `empty record text cannot be indexed`,
         // and it keeps a 10K-document corpus from filling with zero-content rows.
         if doc.text.trim().is_empty() {
+            // §21 escalation: an HTML page that normalizes to no text is usually a JS shell
+            // rather than an empty page. Render it once (short-lived browser context, bounded
+            // time and DOM) and index what the browser sees; if the render is no better, fall
+            // through to exactly the old behaviour — never a zero-content row either way.
+            if kind == "html" {
+                if let Some(escalated) = self
+                    .escalate_to_browser(&canonical, &host, &domain_id, &resource_id, &outcome, now, lease.as_ref())
+                    .await?
+                {
+                    return Ok(escalated);
+                }
+            }
             self.observe_source(&host, true, true)?;
             if let Some(l) = &lease {
                 let _ = self.frontier.complete(l, now);
@@ -1001,6 +1029,73 @@ impl Pipeline {
     /// CONTENT->VERSION->BLOB_WRITTEN->METADATA_COMMITTED->freshness->
     /// LEXICAL_INDEXED->GRAPH_INDEXED->publish->VISIBLE and return the outcome.
     /// Performs no network I/O.
+    /// Render `url` in the browser and index the result, or `None` when that changes nothing.
+    ///
+    /// Returns `Some(IngestOutcome)` when the rendered page normalized to text and was committed
+    /// (as kind `html-browser`, so a reader can tell a render from a direct fetch). Returns `None`
+    /// — the caller's cue to keep the original `html-no-text` route — when no driver is attached,
+    /// the render failed, or it also produced no text. Every failure path is logged at debug:
+    /// escalation is best-effort and must never fail an ingest.
+    #[allow(clippy::too_many_arguments)]
+    async fn escalate_to_browser(
+        &self,
+        canonical: &str,
+        host: &str,
+        domain_id: &DomainId,
+        resource_id: &ResourceId,
+        outcome: &FetchOutcome,
+        now: i64,
+        lease: Option<&Lease>,
+    ) -> AppResult<Option<IngestOutcome>> {
+        let Some(browser) = &self.browser else {
+            return Ok(None);
+        };
+        let rendered = match browser.fetch(canonical, BrowserLimits::default()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(url = %canonical, error = %e, "browser escalation failed");
+                return Ok(None);
+            }
+        };
+        if rendered.html.trim().is_empty() {
+            tracing::debug!(url = %canonical, "browser escalation returned an empty DOM");
+            return Ok(None);
+        }
+        let rendered_doc = search_parser::normalize(
+            &rendered.final_url,
+            rendered.html.as_bytes(),
+            Some("text/html"),
+        )?;
+        if rendered_doc.text.trim().is_empty() {
+            tracing::debug!(
+                url = %canonical,
+                "browser escalation rendered a page that still has no text"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            url = %canonical,
+            bytes = rendered.html.len(),
+            elapsed_ms = rendered.elapsed_ms,
+            "indexing the browser-rendered page (the direct fetch had no text)"
+        );
+        self.commit_document(CommitDoc {
+            canonical,
+            host,
+            domain_id,
+            resource_id,
+            body: rendered.html.as_bytes(),
+            doc: &rendered_doc,
+            kind: "html-browser",
+            parser_version: PARSER_VERSION,
+            outcome,
+            now,
+            lease,
+            observe: true,
+        })
+        .map(Some)
+    }
+
     fn commit_document(&self, c: CommitDoc<'_>) -> AppResult<IngestOutcome> {
         // ContentId from the exact bytes + idempotency check.
         let content_id = ContentId::from_bytes(c.body);

@@ -210,6 +210,11 @@ impl BrowserFetcher for MockBrowser {
 #[cfg(feature = "chromium")]
 pub mod chromium;
 
+/// The real driver, re-exported at the crate root: callers that gate on the `chromium` feature
+/// otherwise have to know the module path, and `crates/agent0` wants one name for it.
+#[cfg(feature = "chromium")]
+pub use chromium::ChromiumBrowser;
+
 #[cfg(test)]
 mod tests {
     use super::*;
