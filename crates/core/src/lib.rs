@@ -10,6 +10,7 @@ pub mod error;
 pub mod ids;
 pub mod limits;
 pub mod manifest;
+pub mod text;
 pub mod time;
 
 pub use contract::{

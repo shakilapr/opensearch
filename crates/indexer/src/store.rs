@@ -441,7 +441,10 @@ impl Indexer {
         );
         parser.set_field_boost(self.fields.title_boost, 3.0);
         parser.set_field_boost(self.fields.body_boost, 1.0);
-        let parsed = match parser.parse_query(query) {
+        // Parse the pruned query: the index tokenizer keeps stop-words and
+        // single letters, over which an OR query degenerates into noise.
+        let pruned = search_core::text::prune_query(query);
+        let parsed = match parser.parse_query(&pruned) {
             Ok(q) => q,
             // A query we can't parse contributes no candidates rather than failing
             // the whole search (base search must still work).
@@ -458,7 +461,7 @@ impl Indexer {
         // searches) is not STORED, so the generator is built from a `body`-only
         // parse of the same query. No body parse -> no fragment -> head fallback.
         let mut body_parser = QueryParser::for_index(index, vec![self.fields.body]);
-        let body_query = body_parser.parse_query(query).ok();
+        let body_query = body_parser.parse_query(&pruned).ok();
         let mut generator = match body_query {
             Some(q) => SnippetGenerator::create(&searcher, &q, self.fields.body)
                 .ok()
