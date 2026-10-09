@@ -1,7 +1,7 @@
 //! Release packs: JSONL shards + a checksummed manifest, and the write/validate round-trip.
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +141,106 @@ pub fn validate_pack(dir: &Path) -> Result<PackManifest, DatasetError> {
     }
 
     Ok(manifest)
+}
+
+/// Read every record from a pack directory, verifying it against its manifest first.
+///
+/// Shards are returned in manifest order, records in file order. This is the convenience
+/// entry point for consumers that want the whole pack in memory; it delegates to
+/// [`PackReader`], which validates the pack with [`validate_pack`] before yielding anything.
+pub fn read_pack(dir: &Path) -> Result<Vec<Record>, DatasetError> {
+    PackReader::open(dir)?.collect()
+}
+
+/// Streaming reader over a validated pack: shard by shard, without holding the whole pack in
+/// memory.
+///
+/// [`open`](PackReader::open) verifies the pack with [`validate_pack`] (checksums, record
+/// counts and manifest totals) and only then yields records. Records arrive in manifest shard
+/// order then file order; a malformed JSON line surfaces as [`DatasetError::Parse`] naming the
+/// shard and its 1-based line number, never a panic. Implements [`Iterator`], so `collect`,
+/// `map`, `take` and friends work directly.
+pub struct PackReader {
+    dir: PathBuf,
+    manifest: PackManifest,
+    /// Index of the next shard to open; shards before it are fully consumed.
+    shard_index: usize,
+    reader: Option<BufReader<std::fs::File>>,
+    /// Path of the shard currently being read (relative to `dir`), for error messages.
+    current_path: String,
+    /// 1-based number of the line last read from the current shard.
+    line_no: usize,
+}
+
+impl PackReader {
+    /// Open `dir`, validate it against its manifest, and prepare to stream its records.
+    pub fn open(dir: &Path) -> Result<Self, DatasetError> {
+        let manifest = validate_pack(dir)?;
+        Ok(PackReader {
+            dir: dir.to_path_buf(),
+            manifest,
+            shard_index: 0,
+            reader: None,
+            current_path: String::new(),
+            line_no: 0,
+        })
+    }
+
+    /// The manifest's record count (the number of records the reader will yield).
+    pub fn total(&self) -> u64 {
+        self.manifest.records
+    }
+
+    /// The validated manifest this reader was opened with.
+    pub fn manifest(&self) -> &PackManifest {
+        &self.manifest
+    }
+
+    /// Pull the next record, or `None` once every shard is exhausted.
+    pub fn next_record(&mut self) -> Result<Option<Record>, DatasetError> {
+        loop {
+            if self.reader.is_none() {
+                if self.shard_index >= self.manifest.shards.len() {
+                    return Ok(None);
+                }
+                self.current_path = self.manifest.shards[self.shard_index].path.clone();
+                self.shard_index += 1;
+                let file = std::fs::File::open(self.dir.join(&self.current_path))?;
+                self.reader = Some(BufReader::new(file));
+                self.line_no = 0;
+            }
+
+            let mut line = String::new();
+            let n = self
+                .reader
+                .as_mut()
+                .expect("reader is open inside the loop")
+                .read_line(&mut line)?;
+            if n == 0 {
+                self.reader = None;
+                continue;
+            }
+            self.line_no += 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record = serde_json::from_str::<Record>(&line).map_err(|e| {
+                DatasetError::Parse(format!(
+                    "shard {} line {}: {e}",
+                    self.current_path, self.line_no
+                ))
+            })?;
+            return Ok(Some(record));
+        }
+    }
+}
+
+impl Iterator for PackReader {
+    type Item = Result<Record, DatasetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_record().transpose()
+    }
 }
 
 /// End-to-end: pull from an adapter until exhausted (bounded by `max_records`), write a pack.

@@ -18,7 +18,9 @@ mod pack;
 mod time;
 
 pub use adapters::{CommonCrawlAdapter, OaiPmhAdapter, OpenAlexAdapter, WikidataAdapter};
-pub use pack::{build_from_adapter, validate_pack, write_pack, PackManifest, ShardInfo};
+pub use pack::{
+    build_from_adapter, read_pack, validate_pack, write_pack, PackManifest, PackReader, ShardInfo,
+};
 
 /// Hard cap on `Record::text` (spec bound: 8 MiB per record).
 pub const MAX_RECORD_TEXT_BYTES: usize = 8 * 1024 * 1024;

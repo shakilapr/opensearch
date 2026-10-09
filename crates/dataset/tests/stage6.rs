@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use search_dataset::{
-    build_from_adapter, validate_pack, write_pack, CommonCrawlAdapter, DatasetAdapter,
-    DatasetError, OaiPmhAdapter, OpenAlexAdapter, Page, Record, WikidataAdapter,
+    build_from_adapter, read_pack, validate_pack, write_pack, CommonCrawlAdapter, DatasetAdapter,
+    DatasetError, OaiPmhAdapter, OpenAlexAdapter, PackReader, Page, Record, WikidataAdapter,
 };
 
 fn fixtures() -> PathBuf {
@@ -334,4 +334,162 @@ fn invalid_shard_size_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let err = write_pack(tmp.path(), "x", "1", sample_records(1), 0);
     assert!(matches!(err, Err(DatasetError::Parse(_))));
+}
+
+/// Records exercising every `Record` field, so a read is only equal if nothing was dropped.
+fn full_records() -> Vec<Record> {
+    (0..5)
+        .map(|i| {
+            let mut r = Record::new(format!("id-{i}"), "test-src");
+            r.url = Some(format!("https://example.com/{i}"));
+            r.title = Some(format!("Title {i}"));
+            r.text = format!("body {i}");
+            r.published_at = Some(1_700_000_000 + i as i64);
+            r.extras.insert("k".to_string(), format!("v{i}"));
+            r
+        })
+        .collect()
+}
+
+#[test]
+fn read_pack_round_trips_every_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let records = full_records();
+
+    write_pack(tmp.path(), "release", "1.0.0", records.clone(), 2).unwrap();
+    validate_pack(tmp.path()).unwrap();
+    let read = read_pack(tmp.path()).unwrap();
+
+    assert_eq!(read, records);
+    // Spot-check each field survives the JSONL trip, not just the aggregate equality.
+    let first = &read[0];
+    assert_eq!(first.id, "id-0");
+    assert_eq!(first.source, "test-src");
+    assert_eq!(first.url.as_deref(), Some("https://example.com/0"));
+    assert_eq!(first.title.as_deref(), Some("Title 0"));
+    assert_eq!(first.text, "body 0");
+    assert_eq!(first.published_at, Some(1_700_000_000));
+    assert_eq!(first.extras.get("k").map(String::as_str), Some("v0"));
+
+    // An empty pack reads back as zero records.
+    let empty_dir = tmp.path().join("empty");
+    write_pack(&empty_dir, "empty", "0", Vec::<Record>::new(), 10).unwrap();
+    assert!(read_pack(&empty_dir).unwrap().is_empty());
+}
+
+#[test]
+fn read_pack_rejects_tampered_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = write_pack(tmp.path(), "release", "1.0.0", full_records(), 2).unwrap();
+    validate_pack(tmp.path()).unwrap();
+
+    let shard = tmp.path().join(&manifest.shards[0].path);
+    let original = std::fs::read_to_string(&shard).unwrap();
+    let tampered = original.replacen("body 0", "body 999", 1);
+    assert_ne!(original, tampered);
+    std::fs::write(&shard, tampered).unwrap();
+
+    let err = read_pack(tmp.path()).unwrap_err();
+    assert!(matches!(err, DatasetError::Parse(msg) if msg.contains("checksum mismatch")));
+
+    // The streaming reader validates on open, so it fails before yielding anything.
+    assert!(PackReader::open(tmp.path()).is_err());
+}
+
+#[test]
+fn read_pack_preserves_manifest_shard_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let records = full_records(); // 5 records
+
+    let manifest = write_pack(tmp.path(), "release", "1.0.0", records.clone(), 2).unwrap();
+    assert_eq!(manifest.shards.len(), 3); // 2 + 2 + 1
+
+    let read = read_pack(tmp.path()).unwrap();
+    assert_eq!(read, records);
+    assert_eq!(
+        read.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["id-0", "id-1", "id-2", "id-3", "id-4"]
+    );
+
+    // The streaming reader yields the same order and reports the manifest total.
+    let mut reader = PackReader::open(tmp.path()).unwrap();
+    assert_eq!(reader.total(), 5);
+    assert_eq!(reader.manifest(), &manifest);
+
+    let mut streamed = Vec::new();
+    for record in &mut reader {
+        streamed.push(record.unwrap());
+    }
+    assert_eq!(streamed, records);
+    // Exhausted afterwards.
+    assert!(reader.next_record().unwrap().is_none());
+}
+
+#[test]
+fn read_pack_rejects_record_count_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = write_pack(tmp.path(), "release", "1.0.0", full_records(), 2).unwrap();
+
+    // Bump the manifest's total count only; the on-disk shards still hold 5 records.
+    let path = tmp.path().join("manifest.json");
+    let txt = std::fs::read_to_string(&path).unwrap();
+    let bad = txt.replacen(
+        &format!("\"records\": {}", manifest.records),
+        &format!("\"records\": {}", manifest.records + 1),
+        1,
+    );
+    assert_ne!(txt, bad);
+    std::fs::write(&path, bad).unwrap();
+
+    let err = validate_pack(tmp.path()).unwrap_err();
+    assert!(matches!(err, DatasetError::Parse(msg) if msg.contains("total record count mismatch")));
+    let err = read_pack(tmp.path()).unwrap_err();
+    assert!(matches!(err, DatasetError::Parse(msg) if msg.contains("record count mismatch")));
+}
+
+/// FNV-1a 64 (mirrors `crates/dataset/src/checksum.rs`) so a test can forge a manifest whose
+/// checksum matches deliberately malformed shard bytes.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[test]
+fn read_pack_reports_malformed_line_with_shard_and_line_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = write_pack(tmp.path(), "release", "1.0.0", full_records(), 10).unwrap();
+    let shard_rel = manifest.shards[0].path.clone();
+    let shard_path = tmp.path().join(&shard_rel);
+
+    // Replace line 2 with invalid JSON, keeping the surrounding lines valid.
+    let original = std::fs::read_to_string(&shard_path).unwrap();
+    let mut lines: Vec<&str> = original.lines().collect();
+    lines[1] = "{ this is not valid json";
+    let mut tampered = lines.join("\n");
+    tampered.push('\n');
+    std::fs::write(&shard_path, &tampered).unwrap();
+
+    // Forge the manifest checksum to match the tampered bytes so validation gets past the
+    // checksum check and reaches the JSONL parse (which names the shard and line number).
+    let manifest_path = tmp.path().join("manifest.json");
+    let manifest_txt = std::fs::read_to_string(&manifest_path).unwrap();
+    let forged = manifest_txt.replace(
+        &manifest.shards[0].checksum,
+        &format!("fnv1a64:{:016x}", fnv1a64(tampered.as_bytes())),
+    );
+    assert_ne!(manifest_txt, forged);
+    std::fs::write(&manifest_path, forged).unwrap();
+
+    let err = read_pack(tmp.path()).unwrap_err();
+    match err {
+        DatasetError::Parse(msg) => {
+            assert!(msg.contains(&shard_rel), "message missing shard path: {msg}");
+            assert!(msg.contains("line 2"), "message missing line number: {msg}");
+        }
+        other => panic!("expected DatasetError::Parse, got {other:?}"),
+    }
 }
