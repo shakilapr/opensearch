@@ -125,6 +125,34 @@ pub fn detect_identifier(text: &str) -> Option<(WorkIdKind, String)>;  // scans 
 arXiv → strip `arXiv:` and old-style `math.GT/0309136` kept verbatim; PMID → digits only.
 WorkId string form: `"doi:10.1234/x"`, `"arxiv:2301.00001"`, `"pmid:12345678"`.
 
+#### Populating the graph (`agent0 graph build`)
+
+The interfaces above are the *reader*; the writer is a separate pass over the index:
+
+```sh
+agent0 graph build [--limit N] [--min-count C] [--min-docs D] [--window W] [--max-mentions K]
+```
+
+It reads every indexed document (`Pipeline::all_docs`, so the *index* is the source of truth,
+not the crawl log), extracts entity mentions with the deterministic rules in
+`crates/graph/src/extract.rs`, and writes `entity`, `entity_alias`, `graph_edge` and `work`
+rows through the metadata writer.
+
+| flag | default | meaning |
+| :--- | :--- | :--- |
+| `--min-count` | 2 | occurrences of a name inside one document before it is a mention at all (this is what removes sentence-initial noise) |
+| `--min-docs` | 3 | documents a name must appear in before it becomes a node; anything rarer is dropped, and its edges with it |
+| `--window` | 50 | token distance inside which two mentions become a `cooccur` edge |
+| `--max-mentions` | 40 | mentions kept per document |
+
+Two properties worth knowing: the edge weight is the number of **documents** in which a pair
+co-occurs (not occurrences), so one repetitive page cannot dominate; and kinds are lexical only
+(an organisation word → `organization`, else `concept` — `person` and `place` are never guessed).
+Reproducible: same index in, same rows out — no model and no network are involved.
+
+The writer lock is exclusive, so stop `agent0 serve` before a build (or any crawl) against the
+same data root.
+
 ### retrieval (`search-retrieval`)
 
 ```rust
