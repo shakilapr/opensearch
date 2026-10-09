@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "bench"
 path = "src/main.rs"
 
+[features]
+# Passthrough to `search-embed/bge`: `cargo run -p search-bench --features bge -- --embedder bge`
+bge = ["search-embed/bge"]
+
 [dependencies]
 search-core = { path = "../core" }
 search-indexer = { path = "../indexer" }

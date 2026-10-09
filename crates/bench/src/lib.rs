@@ -9,9 +9,16 @@
 //! This is the library half of the crate. The `bench` binary is a thin CLI over [`run`]; the
 //! tests drive the very same function, so what ships is what is measured.
 //!
+//! The dense lane's embedder is **selectable** via [`Config::embedder`] / `--embedder hash|bge`:
+//! the deterministic [`HashEmbedder`] (the default — a *lexical* hashed bag-of-words), or the real
+//! BGE-small-en-v1.5 model behind `feature = "bge"` (a *semantic* model, 384-d). Every lane label
+//! and honesty note names the embedder actually in use, so the report can never claim a semantic
+//! lane it did not run. `--dim` sets the dimension of the hash embedder only; the reported
+//! `budget.embed_dim` is always the *actual* dimension of the selected embedder.
+//!
 //! Ablations (see `docs/STAGE2_SPEC.md`):
 //! * `bm25`                          — global lexical BM25 over the Tantivy index.
-//! * `bm25+dense`                    — RRF(bm25, HashEmbedder top-k).
+//! * `bm25+dense`                    — RRF(bm25, selected-embedder top-k over title+body).
 //! * `bm25+dense+sparse`             — RRF(bm25, dense, source-routed BM25 lane).
 //! * `source-routing`                — source-routed BM25 only (no global lane).
 //! * `source-routing+global`         — RRF(source-routed, global BM25).
@@ -47,6 +54,8 @@ pub enum BenchError {
     Eval(String),
     #[error("json error: {0}")]
     Json(String),
+    #[error("embedder error: {0}")]
+    Embed(String),
 }
 
 impl From<std::io::Error> for BenchError {
@@ -82,6 +91,99 @@ pub struct CorpusDoc {
     pub url: String,
 }
 
+/// Which dense embedder the `bm25+dense*` lanes run with.
+///
+/// [`HashEmbedder`] is the deterministic default: a *lexical* hashed bag-of-words, **not** a
+/// semantic model. [`EmbedderKind::Bge`] selects the real BGE-small-en-v1.5 model, which is only
+/// compiled in under `feature = "bge"`; in a default build it fails with an actionable rebuild
+/// message rather than silently falling back to hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedderKind {
+    /// Deterministic hashed bag-of-words (lexical). The default.
+    Hash,
+    /// Real BGE-small-en-v1.5 (semantic, 384-d); requires `feature = "bge"`.
+    Bge,
+}
+
+impl EmbedderKind {
+    /// Parse a `--embedder` value. Case-insensitive.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "hash" => Ok(EmbedderKind::Hash),
+            "bge" => Ok(EmbedderKind::Bge),
+            other => Err(format!(
+                "unknown embedder `{other}` (expected `hash` or `bge`)"
+            )),
+        }
+    }
+
+    /// Canonical CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbedderKind::Hash => "hash",
+            EmbedderKind::Bge => "bge",
+        }
+    }
+
+    /// Short name used in lane labels (e.g. `RRF(bm25, <short> top-k ...)`).
+    pub fn short_name(self) -> &'static str {
+        match self {
+            EmbedderKind::Hash => "HashEmbedder",
+            EmbedderKind::Bge => "BGE-small-en-v1.5",
+        }
+    }
+
+    /// Full display name recorded in the report (`budget.embedder`), stating exactly what the
+    /// dense lane is — and, for hash, that it is *not* a semantic model.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            EmbedderKind::Hash => {
+                "HashEmbedder (deterministic hashed bag-of-words; lexical, NOT a semantic model)"
+            }
+            EmbedderKind::Bge => "BGE-small-en-v1.5 (384-d, CLS-pooled, L2-normalized; semantic)",
+        }
+    }
+}
+
+impl Default for EmbedderKind {
+    fn default() -> Self {
+        EmbedderKind::Hash
+    }
+}
+
+impl std::str::FromStr for EmbedderKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        EmbedderKind::parse(s)
+    }
+}
+
+/// Build the lane's embedder from the config. This is the single place that maps a
+/// [`EmbedderKind`] to a concrete [`Embedder`].
+///
+/// * [`EmbedderKind::Hash`] → [`HashEmbedder::new(cfg.dim)`].
+/// * [`EmbedderKind::Bge`] with `feature = "bge"` → the real BGE embedder; construction can fail
+///   (e.g. missing weights), and that error is propagated, never swallowed.
+/// * [`EmbedderKind::Bge`] without `feature = "bge"` → an actionable error telling the caller how
+///   to rebuild; the harness never silently falls back to hash.
+pub fn build_embedder(cfg: &Config) -> Result<Box<dyn Embedder>, BenchError> {
+    match cfg.embedder {
+        EmbedderKind::Hash => Ok(Box::new(HashEmbedder::new(cfg.dim))),
+        #[cfg(feature = "bge")]
+        EmbedderKind::Bge => {
+            let e = search_embed::bge::BgeEmbedder::new()
+                .map_err(|e| BenchError::Embed(format!("could not build the bge embedder: {e}")))?;
+            Ok(Box::new(e))
+        }
+        #[cfg(not(feature = "bge"))]
+        EmbedderKind::Bge => Err(BenchError::Embed(
+            "the bge embedder requires rebuilding: \
+             cargo run -p search-bench --release --features bge -- --embedder bge"
+                .into(),
+        )),
+    }
+}
+
 /// Harness configuration. Paths default to the committed `benchmarks/` tree.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -90,8 +192,10 @@ pub struct Config {
     pub out_path: PathBuf,
     /// Ranked-list depth kept per query.
     pub k: usize,
-    /// HashEmbedder dimension.
+    /// Dimension for the hash embedder. Ignored by the BGE embedder (always 384).
     pub dim: usize,
+    /// Which dense embedder the `bm25+dense*` lanes use.
+    pub embedder: EmbedderKind,
     /// How many top candidates the cross-encoder reranks.
     pub ce_depth: usize,
 }
@@ -110,6 +214,7 @@ impl Default for Config {
             out_path: PathBuf::from(DEFAULT_OUT),
             k: 20,
             dim: 1024,
+            embedder: EmbedderKind::Hash,
             ce_depth: 50,
         }
     }
@@ -123,6 +228,8 @@ pub struct Budget {
     pub k: usize,
     pub ce_depth: usize,
     pub embed_dim: usize,
+    /// Display name of the dense embedder actually used for this run (see [`EmbedderKind::display_name`]).
+    pub embedder: String,
     /// Resident set size sampled from `/proc/self/statm` at report time (Linux only).
     pub peak_rss_kb: u64,
     /// Mean number of candidates each ablation scored per query, and the max.
@@ -434,8 +541,11 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
     )?;
     indexer.publish_manifest()?;
 
-    // --- dense lane data (HashEmbedder over title + body) --------------------------------------
-    let embedder = HashEmbedder::new(cfg.dim);
+    // --- dense lane data (selected embedder over title + body) ---------------------------------
+    // The embedding dimension comes from the embedder itself (BGE is 384, hash defaults to 1024);
+    // `cfg.dim` only feeds the hash embedder.
+    let embedder = build_embedder(cfg)?;
+    let embed_dim = embedder.dim();
     let doc_embs: Vec<(String, Embedding)> = docs
         .iter()
         .map(|d| {
@@ -612,7 +722,7 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
         budget_max = budget_max.max(max);
         ablations.push(AblationRow {
             name: name.to_string(),
-            note: ablation_note(name),
+            note: ablation_note(name, cfg.embedder.short_name()),
             metrics,
             mean_candidates: mean,
             max_candidates: max,
@@ -621,28 +731,54 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
     let n_abl = ablations.len() as f64;
     budget_mean /= n_abl.max(1.0);
 
-    let notes = vec![
+    let mut notes = vec![
         "SMOKE SET, NOT A RESEARCH CLAIM: 30-doc fixture corpus + 25 hand-labelled queries."
             .to_string(),
-        "Dense lane: HashEmbedder (deterministic hashed bag-of-words), NOT a semantic model."
-            .to_string(),
-        "UNAVAILABLE: real BGE-small weights (feature `bge`) are not bundled in this environment; \
-         the dense lane proves the path, it is not a semantic embedding."
-            .to_string(),
+    ];
+    match cfg.embedder {
+        EmbedderKind::Hash => {
+            notes.push(
+                "Dense lane: HashEmbedder (deterministic hashed bag-of-words), NOT a semantic model."
+                    .to_string(),
+            );
+            #[cfg(feature = "bge")]
+            notes.push(
+                "The semantic lane is available in this binary: rerun with `--embedder bge` to \
+                 measure BGE-small-en-v1.5 (384-d)."
+                    .to_string(),
+            );
+            #[cfg(not(feature = "bge"))]
+            notes.push(
+                "UNAVAILABLE: real BGE-small weights (feature `bge`) are not compiled into this \
+                 binary; rebuild with `--features bge -- --embedder bge` to measure the semantic lane."
+                    .to_string(),
+            );
+        }
+        EmbedderKind::Bge => {
+            notes.push(
+                "Dense lane: BGE-small-en-v1.5 (384-d, CLS-pooled, L2-normalized) — a semantic model."
+                    .to_string(),
+            );
+        }
+    }
+    notes.push(
         "UNAVAILABLE: a trained cross-encoder; the LexicalCrossEncoder (deterministic lexical \
          overlap) is used as an honest proxy."
             .to_string(),
+    );
+    notes.push(
         "Source routing uses lexical source hints in the query text (e.g. \"github\", \"reddit\", \
          \"docs\") and never reads class or relevance labels."
             .to_string(),
-    ];
+    );
 
     let budget = Budget {
         docs: docs.len(),
         queries: cases.len(),
         k: cfg.k,
         ce_depth: cfg.ce_depth,
-        embed_dim: cfg.dim,
+        embed_dim,
+        embedder: cfg.embedder.display_name().to_string(),
         peak_rss_kb: peak_rss_kb(),
         mean_candidates: budget_mean,
         max_candidates: budget_max,
@@ -667,10 +803,10 @@ pub fn run(cfg: &Config) -> Result<Report, BenchError> {
     Ok(report)
 }
 
-fn ablation_note(name: &str) -> String {
+fn ablation_note(name: &str, embedder_short: &str) -> String {
     match name {
         "bm25" => "global lexical BM25 over the Tantivy index (base lane)".into(),
-        "bm25+dense" => "RRF(bm25, HashEmbedder top-k over title+body)".into(),
+        "bm25+dense" => format!("RRF(bm25, {embedder_short} top-k over title+body)"),
         "bm25+dense+sparse" => "RRF(bm25, dense, source-routed BM25 lane)".into(),
         "source-routing" => "source-routed BM25 only; no global lane (empty when no source hint)".into(),
         "source-routing+global" => "RRF(source-routed, global BM25)".into(),
@@ -744,5 +880,88 @@ mod tests {
     fn rss_probe_is_nonzero_on_linux() {
         // /proc/self/statm exists on the CI Linux host; the value must be plausible.
         assert!(peak_rss_kb() > 0);
+    }
+
+    #[test]
+    fn default_embedder_is_hash_and_labels_say_lexical_not_semantic() {
+        // Default behaviour must be unchanged: HashEmbedder.
+        let cfg = Config::default();
+        assert_eq!(cfg.embedder, EmbedderKind::Hash);
+        assert_eq!(EmbedderKind::default(), EmbedderKind::Hash);
+        assert_eq!(cfg.embedder.as_str(), "hash");
+
+        // The lane label and the report's display name must name the hash embedder...
+        let note = ablation_note("bm25+dense", cfg.embedder.short_name());
+        assert!(note.contains("HashEmbedder"), "lane note was: {note}");
+
+        let disp = cfg.embedder.display_name();
+        assert!(disp.contains("HashEmbedder"), "display name was: {disp}");
+        // ...and must state that it is lexical and NOT a semantic model.
+        assert!(disp.contains("lexical"), "display name was: {disp}");
+        assert!(
+            disp.contains("NOT a semantic model"),
+            "display name was: {disp}"
+        );
+        // It must never claim to be a semantic/real model.
+        assert!(!disp.contains("BGE"), "hash name must not claim BGE: {disp}");
+        assert!(
+            !disp.contains("; semantic)"),
+            "hash name must not claim to be semantic: {disp}"
+        );
+    }
+
+    #[test]
+    fn embedder_selector_parses_hash_and_bge() {
+        assert_eq!(EmbedderKind::parse("hash").unwrap(), EmbedderKind::Hash);
+        assert_eq!(EmbedderKind::parse("bge").unwrap(), EmbedderKind::Bge);
+        assert_eq!(EmbedderKind::parse("BGE").unwrap(), EmbedderKind::Bge);
+        assert!("hge".parse::<EmbedderKind>().is_err());
+        assert!(EmbedderKind::parse("").is_err());
+    }
+
+    #[test]
+    fn hash_embedder_build_matches_dim() {
+        let cfg = Config {
+            dim: 256,
+            ..Config::default()
+        };
+        let e = build_embedder(&cfg).expect("hash builds");
+        assert_eq!(e.dim(), 256);
+    }
+
+    /// In a build without `feature = "bge"`, selecting the BGE embedder must fail loudly with an
+    /// actionable rebuild command — never silently fall back to hash.
+    #[cfg(not(feature = "bge"))]
+    #[test]
+    fn bge_without_feature_errors_actionably() {
+        let cfg = Config {
+            embedder: EmbedderKind::Bge,
+            ..Config::default()
+        };
+        let err = build_embedder(&cfg).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("--features bge"), "error was: {err}");
+        assert!(err.contains("--embedder bge"), "error was: {err}");
+    }
+
+    /// With `feature = "bge"`, the labels name BGE and the dimension is 384. Ignored by default:
+    /// it constructs the real model, which may require a weights download.
+    #[cfg(feature = "bge")]
+    #[test]
+    #[ignore = "constructs the real BGE-small model (may need a weights download)"]
+    fn bge_labels_name_bge_and_dim_is_384() {
+        let cfg = Config {
+            embedder: EmbedderKind::Bge,
+            ..Config::default()
+        };
+        let disp = cfg.embedder.display_name();
+        assert!(disp.contains("BGE-small-en-v1.5"), "display name was: {disp}");
+        assert!(disp.contains("384-d"), "display name was: {disp}");
+        assert!(disp.contains("CLS-pooled"), "display name was: {disp}");
+        assert!(disp.contains("L2-normalized"), "display name was: {disp}");
+        let note = ablation_note("bm25+dense", cfg.embedder.short_name());
+        assert!(note.contains("BGE-small-en-v1.5"), "lane note was: {note}");
+        let e = build_embedder(&cfg).expect("bge embedder builds");
+        assert_eq!(e.dim(), 384);
+        assert_eq!(e.dim(), search_embed::bge::BGE_SMALL_DIM);
     }
 }

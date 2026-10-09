@@ -7,22 +7,27 @@
 
 use std::path::PathBuf;
 
-use search_bench::{render_table, run, Config};
+use search_bench::{render_table, run, Config, EmbedderKind};
 
 fn usage() -> String {
-    format!(
-        "usage: bench [--corpus DIR] [--queries FILE] [--out FILE] [--k N] [--dim N] [--ce-depth N]\n\n\
-         defaults:\n  corpus : {}\n  queries: {}\n  out    : {}\n",
-        search_bench::DEFAULT_CORPUS_DIR,
-        search_bench::DEFAULT_QUERIES,
-        search_bench::DEFAULT_OUT,
-    )
+    "usage: bench [--corpus DIR] [--queries FILE] [--out FILE] [--k N] [--dim N] \
+     [--embedder hash|bge] [--ce-depth N]\n\n\
+     embedder:\n  hash  deterministic hashed bag-of-words (default; lexical, not semantic)\n  \
+     bge   real BGE-small-en-v1.5, 384-d (requires a build with --features bge)\n\n\
+     defaults:\n"
+        .to_string()
+        + &format!(
+            "  corpus : {}\n  queries: {}\n  out    : {}\n  embedder: hash\n  dim    : 1024 (hash embedder only)\n",
+            search_bench::DEFAULT_CORPUS_DIR,
+            search_bench::DEFAULT_QUERIES,
+            search_bench::DEFAULT_OUT,
+        )
 }
 
-fn parse_args() -> Result<(Config, bool), String> {
+fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<(Config, bool), String> {
     let mut cfg = Config::default();
     let mut per_case = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--corpus" => cfg.corpus_dir = PathBuf::from(args.next().ok_or("--corpus needs a value")?),
@@ -32,6 +37,10 @@ fn parse_args() -> Result<(Config, bool), String> {
             "--out" => cfg.out_path = PathBuf::from(args.next().ok_or("--out needs a value")?),
             "--k" => cfg.k = args.next().ok_or("--k needs a value")?.parse().map_err(|e| format!("--k: {e}"))?,
             "--dim" => cfg.dim = args.next().ok_or("--dim needs a value")?.parse().map_err(|e| format!("--dim: {e}"))?,
+            "--embedder" => {
+                let v = args.next().ok_or("--embedder needs a value")?;
+                cfg.embedder = EmbedderKind::parse(&v).map_err(|e| format!("--embedder: {e}"))?;
+            }
             "--ce-depth" => {
                 cfg.ce_depth = args.next().ok_or("--ce-depth needs a value")?.parse().map_err(|e| format!("--ce-depth: {e}"))?
             }
@@ -41,6 +50,10 @@ fn parse_args() -> Result<(Config, bool), String> {
         }
     }
     Ok((cfg, per_case))
+}
+
+fn parse_args() -> Result<(Config, bool), String> {
+    parse_args_from(std::env::args().skip(1))
 }
 
 fn main() {
@@ -62,8 +75,8 @@ fn main() {
 
     println!("Stage-2 ablation harness (search-bench v{})", report.version);
     println!(
-        "corpus: {} docs | queries: {} | k={} | embed_dim={} | ce_depth={}",
-        report.budget.docs, report.budget.queries, report.budget.k, report.budget.embed_dim, report.budget.ce_depth
+        "corpus: {} docs | queries: {} | k={} | embedder={} | embed_dim={} | ce_depth={}",
+        report.budget.docs, report.budget.queries, report.budget.k, report.budget.embedder, report.budget.embed_dim, report.budget.ce_depth
     );
     println!();
     print!("{}", render_table(&report));
@@ -104,4 +117,50 @@ fn main() {
     }
     println!();
     println!("wrote {}", cfg.out_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<(Config, bool), String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_to_hash_embedder() {
+        let (cfg, per_case) = parse(&[]).unwrap();
+        assert_eq!(cfg.embedder, EmbedderKind::Hash);
+        assert!(!per_case);
+    }
+
+    #[test]
+    fn selector_parses_embedder_bge() {
+        let (cfg, _) = parse(&["--embedder", "bge"]).unwrap();
+        assert_eq!(cfg.embedder, EmbedderKind::Bge);
+        // and explicit hash
+        let (cfg, _) = parse(&["--embedder", "hash"]).unwrap();
+        assert_eq!(cfg.embedder, EmbedderKind::Hash);
+    }
+
+    #[test]
+    fn selector_rejects_unknown_embedder() {
+        let err = parse(&["--embedder", "potion"]).unwrap_err();
+        assert!(err.contains("--embedder"), "error was: {err}");
+        assert!(err.contains("hash"), "error was: {err}");
+    }
+
+    #[test]
+    fn usage_mentions_embedder_and_bge() {
+        let u = usage();
+        assert!(u.contains("--embedder"), "usage was: {u}");
+        assert!(u.contains("bge"), "usage was: {u}");
+    }
+
+    #[test]
+    fn dim_and_embedder_combine() {
+        let (cfg, _) = parse(&["--dim", "256", "--embedder", "bge"]).unwrap();
+        assert_eq!(cfg.dim, 256);
+        assert_eq!(cfg.embedder, EmbedderKind::Bge);
+    }
 }

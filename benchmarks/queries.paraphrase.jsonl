@@ -1,0 +1,64 @@
+# benches/queries.paraphrase.jsonl -- SEMANTIC-ONLY paraphrase evaluation set (25 cases).
+# Purpose: measure whether a real semantic embedding retriever beats a lexical/BM25 one.
+# Every query is a hand-written PARAPHRASE of its target doc's topic: it would let a human or
+# an embedding model pick the right document, while sharing few or no content words with it, so
+# BM25 scores poorly by construction. Complement to queries.example.jsonl, whose queries reuse
+# the corpus's own vocabulary and are therefore lexical by design.
+# Labels are HAND-JUDGED by reading the corpus HTML (not from filenames or routing).
+# Schema: search_eval::QueryCase -> {"id","query","class","relevant","graded","observed_at"}.
+# classes used: papers | long_semantic | community | docs | github.
+# `graded` is used only to mark a near-neighbour that is related but NOT the target (gain 1);
+# where two docs are genuinely both relevant (p_bm25) both are listed in `relevant` and graded [].
+# Each case is preceded by a comment naming its target doc id(s) and why it is a paraphrase.
+
+
+# target arxiv/attention -- paraphrase of 'attention that replaces recurrence with parallel weighting'; the query contains none of the doc's terms (transformer, self-attention, encoder/decoder, positional encodings) and speaks of 'influencing words' instead of attention.
+{"id": "para_attention", "query": "how a system can take in a whole row of words and let each one influence every other one simultaneously, without stepping through them one at a time", "class": "papers", "relevant": ["arxiv/attention"], "graded": [], "observed_at": null}
+# target arxiv/chain-of-thought -- 'show its work before answering' paraphrases intermediate reasoning steps; no shared content words (chain-of-thought, prompting, reasoning, exemplars).
+{"id": "para_cot", "query": "getting a model to show its work in writing before it commits to an answer noticeably helps with sums and puzzles", "class": "papers", "relevant": ["arxiv/chain-of-thought"], "graded": [], "observed_at": null}
+# target arxiv/lora -- paraphrases low-rank adaptation (frozen base weights + small trainable matrices); avoids LoRA, low-rank, adaptation, parameters, fine-tuning.
+{"id": "para_lora", "query": "teaching a huge network a new job at a fraction of the usual cost by keeping the original numbers frozen and adding a small learned correction", "class": "papers", "relevant": ["arxiv/lora"], "graded": [], "observed_at": null}
+# target arxiv/mixture-of-experts -- paraphrases conditional computation / sparse routing; zero shared content words (experts, gating, token, capacity, parameters).
+{"id": "para_moe", "query": "scaling a system up to enormous size while only switching on a small specialised piece for each item it processes", "class": "papers", "relevant": ["arxiv/mixture-of-experts"], "graded": [], "observed_at": null}
+# target arxiv/rag -- paraphrases retrieve-then-generate with a dense retriever index; avoids retrieval, augmented, generator, retriever, passages.
+{"id": "para_rag", "query": "producing grounded answers by first fetching supporting text from an external store and then writing the reply from it", "class": "papers", "relevant": ["arxiv/rag"], "graded": [], "observed_at": null}
+# target arxiv/rlhf -- 'score from side-by-side choices' paraphrases a reward model trained on pairwise preference comparisons optimised with PPO. blog/what-is-rlhf is graded 1 (same idea, plain-English explainer, no PPO/InstructGPT detail).
+{"id": "para_rlhf_paper", "query": "turning a base model into an obedient assistant by learning a score from people's side-by-side choices and then pushing the model toward high scores", "class": "papers", "relevant": ["arxiv/rlhf"], "graded": [["arxiv/rlhf", 3], ["blog/what-is-rlhf", 1]], "observed_at": null}
+# target blog/what-is-rlhf -- the plain-English 'what is X' explainer; no shared content words (RLHF, reinforcement, feedback, reward, PPO) -- 'what people actually want' is the doc's own gloss of a reward proxy.
+{"id": "para_rlhf_explainer", "query": "a gentle, jargon-free introduction for newcomers to how systems are steered toward what people actually want", "class": "long_semantic", "relevant": ["blog/what-is-rlhf"], "graded": [], "observed_at": null}
+# target blog/async-rust-explained -- 'stops halfway / all-clear to continue' paraphrases futures suspending at await points and a waker signalling readiness; avoids future, poll, waker, executor, state machine. docs/tokio-tutorial graded 1 (polled/awaited mentioned but no waker mechanism).
+{"id": "para_async_mechanism", "query": "why a piece of work that stops halfway can carry on later, and who gives it the all-clear to continue", "class": "long_semantic", "relevant": ["blog/async-rust-explained"], "graded": [["blog/async-rust-explained", 3], ["docs/tokio-tutorial", 1]], "observed_at": null}
+# target blog/vector-search-guide -- paraphrases the recall-vs-latency trade-off and measuring retrieval quality before tuning index parameters; avoids vector, embeddings, nearest neighbour, HNSW, recall, latency.
+{"id": "para_vec_guide", "query": "choosing how much accuracy to surrender in exchange for speed when hunting for similar items, and checking the result before fiddling with the settings", "class": "long_semantic", "relevant": ["blog/vector-search-guide"], "graded": [], "observed_at": null}
+# target blog/llm-inference-optimization -- paraphrases continuous batching + quantization + paged KV cache; avoids batching, quantization, cache, memory bandwidth. github/vllm graded 1 (same techniques, but the doc is a serving library, not the general explainer).
+{"id": "para_inference_opt", "query": "bringing down what each generated word costs by serving several requests together, storing numbers in fewer bits, and reusing the stored attention state", "class": "long_semantic", "relevant": ["blog/llm-inference-optimization"], "graded": [["blog/llm-inference-optimization", 3], ["github/vllm", 1]], "observed_at": null}
+# target blog/kubernetes-history -- paraphrases Kubernetes' Borg origins and victory in the orchestration war; avoids Kubernetes, Borg, containers, Docker, orchestration.
+{"id": "para_k8s_history", "query": "where the dominant tool for packing and placing workloads across many machines came from, and how it won while staying hard to use", "class": "long_semantic", "relevant": ["blog/kubernetes-history"], "graded": [], "observed_at": null}
+# targets blog/bm25-explained AND community/stackoverflow-bm25 -- both genuinely cover term-frequency saturation, idf weighting and length normalisation, so both are judged relevant. Paraphrases saturation/idf/length-normalisation; avoids BM25, term frequency, inverse document frequency, k1, b.
+{"id": "para_bm25", "query": "why matching a word more often stops paying off after a while, and how uncommon words and long passages are factored into a relevance score", "class": "long_semantic", "relevant": ["blog/bm25-explained", "community/stackoverflow-bm25"], "graded": [], "observed_at": null}
+# target community/rust-forum-async -- paraphrases the tokio-vs-async-std advice thread (an async runtime is an executor plus an I/O reactor); avoids tokio, async-std, runtime, executor, reactor.
+{"id": "para_rust_forum_runtime", "query": "a beginner wondering which helper library to build their non-blocking program on, and whether the choice even matters", "class": "community", "relevant": ["community/rust-forum-async"], "graded": [], "observed_at": null}
+# target community/hn-vector-db -- paraphrases the 'pgvector vs a separate ANN service, operational overhead is the real cost' discussion; avoids Pinecone, Weaviate, Qdrant, pgvector, ANN, HNSW. github/lancedb graded 1 (one of the embedded options named in the thread).
+{"id": "para_hn_vector_db", "query": "a thread debating whether to stand up dedicated infrastructure for similarity lookups or just reuse the database already in place", "class": "community", "relevant": ["community/hn-vector-db"], "graded": [["community/hn-vector-db", 3], ["github/lancedb", 1]], "observed_at": null}
+# target community/reddit-local-llm -- paraphrases running quantized GGUF models locally and offloading layers under a memory budget; avoids llama.cpp, GGUF, quantized, GPU, key-value cache. github/llama-cpp graded 1 (the tool the thread is about).
+{"id": "para_reddit_local_llm", "query": "hobbyists swapping tips on fitting bigger models onto everyday hardware by trading some quality away", "class": "community", "relevant": ["community/reddit-local-llm"], "graded": [["community/reddit-local-llm", 3], ["github/llama-cpp", 1]], "observed_at": null}
+# target community/hn-rust-vs-go -- paraphrases the Rust-vs-Go backend debate (borrow checker & zero-cost abstractions vs goroutines & fast compiles); the query never names either language.
+{"id": "para_rust_vs_go", "query": "a long argument over whether to pick the memory-safe systems language or the simpler, quicker-to-build one for writing servers", "class": "community", "relevant": ["community/hn-rust-vs-go"], "graded": [], "observed_at": null}
+# target docs/tokio-tutorial -- paraphrases #[tokio::main] + tokio::spawn + awaiting a JoinHandle; avoids tokio, async fn, spawn, await, Future, runtime.
+{"id": "para_tokio_tutorial", "query": "a beginner's walkthrough of getting several jobs to run side by side in Rust, from the magic entry attribute to handing work to the scheduler", "class": "docs", "relevant": ["docs/tokio-tutorial"], "graded": [], "observed_at": null}
+# target docs/rust-ownership -- paraphrases single ownership, moves and borrowing preventing dangling pointers; avoids ownership, owner, borrow, reference, lifetimes, move.
+{"id": "para_rust_ownership", "query": "why Rust makes exactly one part of a program responsible for each value and how that stops you reading memory after it is freed", "class": "docs", "relevant": ["docs/rust-ownership"], "graded": [], "observed_at": null}
+# target docs/python-asyncio -- paraphrases the event loop scheduling coroutines cooperatively and offloading blocking calls; query shares only 'Python'.
+{"id": "para_python_asyncio", "query": "how Python lets lots of slow operations make progress together on a single worker", "class": "docs", "relevant": ["docs/python-asyncio"], "graded": [], "observed_at": null}
+# target docs/hnsw-algorithm -- paraphrases the multi-layer graph with sparse upper 'express highway' layers and greedy descent; avoids HNSW, nearest neighbour, graph, efSearch. github/hnswlib graded 1 (a concrete implementation of the same structure).
+{"id": "para_hnsw_algo", "query": "a search structure with a sparse top layer over denser layers beneath, so you can hop quickly toward the target instead of checking everything", "class": "docs", "relevant": ["docs/hnsw-algorithm"], "graded": [["docs/hnsw-algorithm", 3], ["github/hnswlib", 1]], "observed_at": null}
+# target docs/kubernetes-deployments -- paraphrases rolling updates and ReplicaSet replica guarantees; avoids Kubernetes, Deployment, ReplicaSet, pod, rolling.
+{"id": "para_k8s_deploy", "query": "replacing the running copies of an app a few at a time while always keeping the wanted number of them up", "class": "docs", "relevant": ["docs/kubernetes-deployments"], "graded": [], "observed_at": null}
+# target github/tokio -- paraphrases the runtime's work-stealing scheduler plus epoll/kqueue event loop; avoids tokio, runtime, scheduler, epoll, kqueue, futures.
+{"id": "para_tokio_repo", "query": "the project that supplies the thread pool and the operating-system event notifications a Rust concurrent program runs on", "class": "github", "relevant": ["github/tokio"], "graded": [], "observed_at": null}
+# target github/llama-cpp -- paraphrases CPU inference over quantized GGUF models; avoids llama.cpp, quantized, GGUF, Metal, key-value cache.
+{"id": "para_llamacpp", "query": "getting language models to run on ordinary processors using trimmed-down weight files, with no special hardware", "class": "github", "relevant": ["github/llama-cpp"], "graded": [], "observed_at": null}
+# target github/vllm -- paraphrases PagedAttention managing the KV cache in non-contiguous blocks to remove fragmentation; avoids vLLM, PagedAttention, key-value, cache, GPU.
+{"id": "para_vllm", "query": "a serving library that divides its stored attention state into non-uniform chunks so no device memory is wasted", "class": "github", "relevant": ["github/vllm"], "graded": [], "observed_at": null}
+# target github/tantivy -- paraphrases building an inverted index for full-text search; avoids tantivy, inverted index, BM25, Lucene, tokenizer, query.
+{"id": "para_tantivy", "query": "a Rust toolkit for turning piles of text into something you can look words up in fast", "class": "github", "relevant": ["github/tantivy"], "graded": [], "observed_at": null}

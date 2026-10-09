@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "generated_unix": 1791489191,
+  "generated_unix": 1791510364,
   "corpus_dir": "/root/projects/search/crates/bench/../../benchmarks/corpus",
   "queries_path": "/root/projects/search/crates/bench/../../benchmarks/queries.example.jsonl",
   "budget": {
@@ -9,14 +9,15 @@
     "k": 20,
     "ce_depth": 50,
     "embed_dim": 1024,
-    "peak_rss_kb": 18060,
+    "embedder": "HashEmbedder (deterministic hashed bag-of-words; lexical, NOT a semantic model)",
+    "peak_rss_kb": 18072,
     "mean_candidates": 13.154285714285715,
     "max_candidates": 24
   },
   "notes": [
     "SMOKE SET, NOT A RESEARCH CLAIM: 30-doc fixture corpus + 25 hand-labelled queries.",
     "Dense lane: HashEmbedder (deterministic hashed bag-of-words), NOT a semantic model.",
-    "UNAVAILABLE: real BGE-small weights (feature `bge`) are not bundled in this environment; the dense lane proves the path, it is not a semantic embedding.",
+    "UNAVAILABLE: real BGE-small weights (feature `bge`) are not compiled into this binary; rebuild with `--features bge -- --embedder bge` to measure the semantic lane.",
     "UNAVAILABLE: a trained cross-encoder; the LexicalCrossEncoder (deterministic lexical overlap) is used as an honest proxy.",
     "Source routing uses lexical source hints in the query text (e.g. \"github\", \"reddit\", \"docs\") and never reads class or relevance labels."
   ],
