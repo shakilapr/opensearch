@@ -37,10 +37,17 @@ multi-week architecture work, gated by the plan on proven quality.
      tests in `crates/agent0/tests/crawl.rs`.
      *Remaining:* escalate on a *thin* (not only empty) normalisation, and a per-host escalation
      budget so a JS-heavy origin cannot multiply crawl cost.
-  3. **Entity graph *lane* — code.** `agent0 graph build` now populates entities, aliases,
-     co-occurrence edges and works (9 294 / 2 109 / 73 413 / 210 on the last run), but §9.4 runs
-     no personalised-PageRank activation at query time, and entity→document mapping needs a table
-     the schema does not have (documents are not linked to the entities they mention).
+  3. **Entity graph *lane* — built and live.** `agent0 graph build` populates entities, aliases,
+     co-occurrence edges and works, and now also writes the **entity→document sidecar** (the join
+     the frozen schema cannot hold). `search_graph::activate` runs bounded personalised PageRank
+     over the co-occurrence edges, and `crates/api/src/graph_lane.rs` seeds it from the entities a
+     query names, joins them to documents, and stamps the hits `Lane::Graph` — which is exactly
+     what the API already reported as `graph_expansion`, so the signal is now measured rather than
+     a placeholder. Wiring is automatic: the binary loads the sidecar when it exists, beside the
+     dense lane.
+     *Remaining:* the lane cannot honour a source scope (it returns empty for a scoped search
+     instead of leaking), it contributes only when the query names a known entity, and its weight
+     in the fused ranking has not been tuned or measured against the eval set.
   4. ~~UI provenance verified live.~~ **Done** — verified in a browser (see the exit gate above),
      with the CORS gap that blocked it closed (`SEARCH_CORS_ORIGIN`, tested in
      `crates/api/tests/cors.rs`).

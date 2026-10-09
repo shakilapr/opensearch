@@ -102,6 +102,37 @@ SEARCH_CHROMIUM=/path/to/chrome cargo test -p search-browser --features chromium
   --test chromium_live -- --ignored
 ```
 
+## The entity graph and its query-time lane (§9.4)
+
+`agent0 graph build` populates the entity graph and writes a sidecar the serving process reads at
+startup:
+
+```sh
+SEARCH_DATA_DIR=/var/lib/search agent0 graph build [--reset] \
+  [--min-count 2] [--window 50] [--max-mentions 40] [--min-docs 3]
+# → <data_dir>/graph/entities.bin  (entities, aliases, entity→document join, co-occurrence edges)
+```
+
+The sidecar exists because the index schema is **frozen and hash-asserted**: the join cannot become
+a table without invalidating every index, so it travels beside the index exactly as the dense
+lane's `vectors.bin` does. `agent0 serve` picks it up automatically — the graph lane runs beside
+the lexical and dense lanes and its hits are reported as the `graph_expansion` provenance signal.
+No sidecar means no graph lane (logged at info); an unreadable sidecar is skipped with a warning
+rather than preventing the server from starting.
+
+Two behaviours are deliberate and worth knowing before reading a trace:
+
+* **A source-scoped search returns no graph hits.** The lane cannot scope to a source and will not
+  answer with unscoped documents; the source-first lane serves those queries.
+* **A query naming no known entity contributes nothing.** The lane is fused with lexical
+  retrieval, not a replacement for it.
+
+Rebuild the sidecar after a corpus change (it is a snapshot, as `graph_version` implies):
+
+```sh
+SEARCH_DATA_DIR=/var/lib/search SEARCH_READ_ONLY=1 agent0 graph build   # safe beside a crawl
+```
+
 ## Read-only serving (crawl and serve at once)
 
 Tantivy's writer lock is exclusive per index directory, so a process that opens a writer cannot
