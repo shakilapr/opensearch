@@ -1,6 +1,15 @@
 //! §10 Candidate fusion and the ranking cascade. OWNER: engine-rank agent.
+//!
+//! Frozen contract: `docs/ENGINE_SPEC.md` §10 and `engine/engine-architecture.md` §10.
+//!
+//! Two entry points:
+//! * [`fuse`] — weighted reciprocal rank fusion over one family of lanes (the primitive).
+//! * [`fuse_families`] — the §10 rule that a *variant family* (near-identical query
+//!   rewrites) cannot outvote the original query family.
+//! * [`run_cascade`] — the named §10 cascade stages with per-stage caps and recorded sizes.
 
 use crate::LaneId;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 /// One lane's ranked document ids, best first (rank 1 = index 0).
@@ -35,8 +44,12 @@ pub struct Fused {
 }
 
 /// Weighted reciprocal rank fusion (§10): `score(d) = sum_l w_l / (c + rank_l(d))`.
-/// Ranks begin at 1; a lane missing `d` contributes zero. Result is score-descending,
-/// ties broken by doc_id so the order is deterministic.
+/// Ranks begin at 1; a lane missing `d` contributes zero, and so does a lane whose weight is
+/// absent from `policy.weights` (an unknown lane has weight 0). The result is
+/// score-descending with `doc_id` ascending as the deterministic tie-break.
+///
+/// This is the single-family primitive: it fuses the lanes it is given. The variant-family
+/// cap lives in [`fuse_families`].
 pub fn fuse(lanes: &[LaneHits], policy: &FusionPolicy) -> Vec<Fused> {
     let mut acc: BTreeMap<String, f64> = BTreeMap::new();
     for lh in lanes {
@@ -56,7 +69,71 @@ pub fn fuse(lanes: &[LaneHits], policy: &FusionPolicy) -> Vec<Fused> {
     out.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    out
+}
+
+/// Fuse several *variant families* and merge them into one ranking, enforcing the §10 rule:
+/// "Prevent numerous near-identical query rewrites from outvoting the original query: fuse
+/// within a variant family first or cap that family's total weight."
+///
+/// Each `families` entry is a `(family_id, lanes)` pair; the lanes of one family are fused
+/// with [`fuse`] first. The family with the **smallest id** is treated as the original query
+/// family (by convention `family == 0` is the original, consistent with
+/// `plan::QueryVariant.family`). Every non-original family's total score mass is capped at
+/// `policy.variant_family_cap` times the original family's total mass, scaling the whole
+/// family proportionally when it exceeds the cap. The capped families are then merged and
+/// sorted exactly like [`fuse`] (score-descending, `doc_id` ascending).
+///
+/// The cap is a *ratio* against the original family; to guarantee that no rewrite family can
+/// outvote the original, a coordinator sets `variant_family_cap <= 1.0`. The scaffold default
+/// of `2.0` merely bounds a runaway family to twice the original's mass. If the original
+/// family is empty or has non-positive mass the cap is not applied (a rewrite is not zeroed
+/// out just because the original returned nothing).
+pub fn fuse_families(families: &[(u8, &[LaneHits])], policy: &FusionPolicy) -> Vec<Fused> {
+    if families.is_empty() {
+        return Vec::new();
+    }
+
+    let fused: Vec<(u8, Vec<Fused>)> = families
+        .iter()
+        .map(|(id, lanes)| (*id, fuse(lanes, policy)))
+        .collect();
+
+    // The original family is the one with the smallest id.
+    let mut original_idx: usize = 0;
+    for (i, (id, _)) in fused.iter().enumerate() {
+        if *id < fused[original_idx].0 {
+            original_idx = i;
+        }
+    }
+    let original_total: f64 = fused[original_idx].1.iter().map(|f| f.score).sum();
+
+    let mut merged: BTreeMap<String, f64> = BTreeMap::new();
+    for (i, (_, docs)) in fused.iter().enumerate() {
+        let family_total: f64 = docs.iter().map(|f| f.score).sum();
+        let scale = if i == original_idx || original_total <= 0.0 {
+            1.0
+        } else if family_total > policy.variant_family_cap * original_total {
+            (policy.variant_family_cap * original_total) / family_total
+        } else {
+            1.0
+        };
+        for f in docs {
+            *merged.entry(f.doc_id.clone()).or_insert(0.0) += f.score * scale;
+        }
+    }
+
+    let mut out: Vec<Fused> = merged
+        .into_iter()
+        .map(|(doc_id, score)| Fused { doc_id, score })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| a.doc_id.cmp(&b.doc_id))
     });
     out
@@ -79,18 +156,60 @@ pub struct CascadeOutput {
     pub stage_sizes: Vec<usize>,
 }
 
-/// Run the cascade: fusion survivors -> feature ranker cap -> reranker cap -> verification cap.
-/// Stage sizes are recorded so the trace can show where documents were dropped (§10: a
-/// reranker cannot recover documents that never reached its candidate set).
+/// Stage 1 of the cascade (§10 "Feature ranker", "Up to 300"): fast relevance,
+/// source/type/time and constraint features. The input order is preserved (the scored
+/// features are injected by the coordinator); this stage only enforces its cap.
+fn stage_feature_ranker(docs: &[Fused], cap: usize) -> Vec<Fused> {
+    docs.iter().take(cap).cloned().collect()
+}
+
+/// Stage 2 (§10 "Cross-encoder or late interaction", "40–100 documents"): expensive semantic
+/// matching of the surviving passages. Order-preserving; cap-enforcing.
+fn stage_cross_encoder(docs: &[Fused], cap: usize) -> Vec<Fused> {
+    docs.iter().take(cap).cloned().collect()
+}
+
+/// Stage 3 (§10 "Evidence verification", "10–30 documents"): required predicates, relation
+/// joins, contradictions. Order-preserving; cap-enforcing.
+fn stage_evidence_verification(docs: &[Fused], cap: usize) -> Vec<Fused> {
+    docs.iter().take(cap).cloned().collect()
+}
+
+/// Stage 4 (§10 "Diversification", "Requested count"): redundant stories removed; the final
+/// `k` is the request limit. Order-preserving; cap-enforcing.
+fn stage_diversification(docs: &[Fused], cap: usize) -> Vec<Fused> {
+    docs.iter().take(cap).cloned().collect()
+}
+
+/// Run the §10 cascade. The stages mirror the spec table exactly:
+///
+/// `parallel retrieval -> union/version resolution -> feature ranker (feature_cap) ->
+///  cross-encoder / late interaction (cross_encoder_cap) -> evidence verification
+///  (verify_cap) -> diversification (final_k)`.
+///
+/// `input.fused` is the output of the union/version-resolution stage. Each named stage
+/// (a) preserves input order, (b) records how many documents entered and left via
+/// [`CascadeOutput::stage_sizes`], and (c) can never *increase* the document count — so the
+/// stage sizes are monotone non-increasing. `stage_sizes` is exactly
+/// `[entered_fusion, after_feature, after_ce, after_verify, final]`.
+///
+/// This function is **deadline-agnostic**: it performs no clock reads and no waiting. Under a
+/// short deadline the coordinator tightens the caps it passes in (§10: "Under a short
+/// deadline, reduce expensive stages while retaining an eligible lexical fallback").
 pub fn run_cascade(input: CascadeInput) -> CascadeOutput {
-    let n = input.fused.len();
-    let after_feature = n.min(input.feature_cap);
-    let after_ce = after_feature.min(input.cross_encoder_cap);
-    let after_verify = after_ce.min(input.verify_cap);
-    let final_n = after_verify.min(input.final_k);
-    let ranked = input.fused.into_iter().take(final_n).collect();
-    CascadeOutput {
-        ranked,
-        stage_sizes: vec![n, after_feature, after_ce, after_verify, final_n],
-    }
+    let entered = input.fused.len();
+
+    let after_feature = stage_feature_ranker(&input.fused, input.feature_cap);
+    let after_ce = stage_cross_encoder(&after_feature, input.cross_encoder_cap);
+    let after_verify = stage_evidence_verification(&after_ce, input.verify_cap);
+    let final_docs = stage_diversification(&after_verify, input.final_k);
+
+    let stage_sizes = vec![
+        entered,
+        after_feature.len(),
+        after_ce.len(),
+        after_verify.len(),
+        final_docs.len(),
+    ];
+    CascadeOutput { ranked: final_docs, stage_sizes }
 }
