@@ -39,5 +39,19 @@ echo "== raw-dataset =="
 echo "blobs: $(find "$OUT/blobs" -type f | wc -l)"
 echo "log lines: $(wc -l < "$OUT/crawl-log.jsonl")"
 
-echo "== index =="
-SEARCH_DATA_DIR="$DATA_DIR" "$BIN" stats || true
+echo "== corpus summary =="
+python3 - "$OUT/crawl-log.jsonl" <<'PY'
+import collections, json, sys, urllib.parse
+counts, hosts = collections.Counter(), collections.Counter()
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    counts[r.get("outcome")] += 1
+    if r.get("outcome") == "ingested":
+        hosts[urllib.parse.urlparse(r.get("url", "")).netloc] += 1
+print("attempts:", sum(counts.values()), dict(counts))
+print("sources:", len(hosts))
+print("top sources:", hosts.most_common(10))
+PY
