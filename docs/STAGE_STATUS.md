@@ -45,8 +45,15 @@ multi-week architecture work, gated by the plan on proven quality.
   1. **Labelled benchmark at scale — data/decision.** The plan asks for 500–2000 queries across
      classes with LLM-judge + manual labels; `benchmarks/` holds 50 over a 30-document fixture.
      Generating labels costs model calls and a decision to spend them.
-  2. **Dense/semantic as the default — decision taken: make BGE the default** (cheapest real
-     quality win). Not yet done in code: the default build still uses `HashEmbedder`.
+  2. **The dense lane does not exist in the serving path — code.** This is stronger than "opt-in":
+     the Tantivy schema has no vector field, `crates/retrieval` has no dense module, and the only
+     consumer of `search-embed` is `crates/bench`. A `/search` request therefore cannot use
+     embeddings at all, and the BGE numbers (paraphrase nDCG@10 0.4238 → 0.5842) are a
+     *benchmark-harness* result, not a serving result. Making BGE the default (the decision taken)
+     means building the lane: persist per-document vectors, embed the corpus, expose a
+     `LaneSearcher`, and fuse it. The schema is frozen (hash-asserted), so vectors belong in a
+     sidecar keyed by `doc_id` — which also means the backfill only needs *read* access and can run
+     beside a crawl.
   3. **Real sparse weights and a trained cross-encoder — decision taken: ship the documented
      proxies.** They stay proxies, labelled as such in `docs/ROADMAP.md` gaps 5–6.
   4. **Ablations measured on the real corpus — code.** Ablations exist, but only on the fixture.
