@@ -373,6 +373,54 @@ async fn answerer_prefers_stored_document_text_over_the_fragment() {
     );
 }
 
+/// A searcher that can serve stored bodies, used to prove that §16 coverage is
+/// verified against real document text and that question words in the query
+/// ("what", "is") do not make verification fail.
+struct TextSearcher(StubSearcher);
+
+impl Searcher for TextSearcher {
+    fn search(
+        &self,
+        q: &str,
+        limit: usize,
+        filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        self.0.search(q, limit, filters)
+    }
+
+    fn doc_text(&self, _doc_id: &str) -> AppResult<Option<String>> {
+        Ok(Some(
+            "retrieval augmented generation grounds a model on a corpus".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn coverage_is_verified_against_document_text_not_titles() {
+    // Neither title nor snippet says "augmented", and the query carries the
+    // function words "what"/"is": with title-only matching this scored 0.0
+    // coverage against 115 matching documents in a live run.
+    let addr = boot(AppState::new(Arc::new(TextSearcher(StubSearcher::new(3))))).await;
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"what is retrieval augmented generation","engine":true,"mode":"fast","limit":3}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let coverage = b["coverage"]["coverage"].as_f64().unwrap_or(-1.0);
+    assert!(
+        coverage > 0.0,
+        "coverage must be > 0 when the stored text supports the unit, got {coverage}: {b}"
+    );
+    let unsupported = b["coverage"]["unsupported"].as_array().cloned().unwrap_or_default();
+    assert!(
+        unsupported.is_empty(),
+        "no unit should be unsupported once verified against text: {unsupported:?}"
+    );
+}
+
 #[tokio::test]
 async fn limit_clamping_applies_on_engine_path() {
     let addr = simple_boot(150).await;

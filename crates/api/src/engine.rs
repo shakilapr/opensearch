@@ -359,6 +359,18 @@ impl<'a> TextVerifier<'a> {
     }
 }
 
+/// Function words that carry no content: a unit like "what is retrieval
+/// augmented generation" must not fail verification because the page never
+/// writes "what" or "is" (this is exactly what made coverage read 0 against 115
+/// matching documents). Only the *unit* side is filtered — a stopword appearing
+/// in the document is harmless.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do", "does", "for", "from",
+    "how", "in", "into", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there",
+    "these", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "will",
+    "with",
+];
+
 /// Lowercase alphanumeric tokens (the same normalisation the engine applies to
 /// titles, so a hyphenated "Retrieval-Augmented" matches "retrieval augmented").
 fn tokens(s: &str) -> Vec<String> {
@@ -369,9 +381,26 @@ fn tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Content tokens of a query unit: [`tokens`] minus [`STOPWORDS`]. Falls back to
+/// the unfiltered tokens when a unit is nothing but stopwords, so a purely
+/// functional query still gets verified instead of auto-failing.
+fn content_tokens(s: &str) -> Vec<String> {
+    let all = tokens(s);
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        all
+    } else {
+        kept
+    }
+}
+
 impl EvidenceVerifier for TextVerifier<'_> {
     fn supports(&self, unit_text: &str, doc_id: &str) -> bool {
-        let unit = tokens(unit_text);
+        let unit = content_tokens(unit_text);
         if unit.is_empty() {
             return false;
         }

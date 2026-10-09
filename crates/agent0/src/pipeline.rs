@@ -2020,6 +2020,13 @@ impl SourceFirstSearcher {
 }
 
 impl Searcher for SourceFirstSearcher {
+    /// Delegate to the index-backed inner searcher: without this the trait's
+    /// `Ok(None)` default makes every stored-body read (answers, §16 coverage)
+    /// see no text at all.
+    fn doc_text(&self, doc_id: &str) -> AppResult<Option<String>> {
+        self.inner.doc_text(doc_id)
+    }
+
     fn search(
         &self,
         q: &str,
