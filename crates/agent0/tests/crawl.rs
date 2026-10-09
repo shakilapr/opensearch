@@ -6,6 +6,7 @@
 //! per-origin interval.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use axum::{
 };
 
 use search_agent0::crawl::{crawl, CrawlOptions, MAX_LINKS_PER_PAGE};
+use search_agent0::pipeline::Pipeline;
 use search_core::config::Config;
 
 // Fixture bodies. Their SHA-256 values are asserted verbatim in the log.
@@ -936,4 +938,95 @@ async fn a_page_with_text_never_calls_the_browser() {
     opts.max_docs = 1;
     let summary = crawl(opts, &cfg).await.unwrap();
     assert_eq!(summary.ingested, 1, "the page has text and must be indexed directly: {summary:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// §44 deletion detection. A URL that was indexed and then starts answering 404 is no longer a
+// resource: it must be marked DELETED so it stops being served, while its stored bytes and crawl
+// history are kept — the architecture is explicit that historical results may still matter.
+// ---------------------------------------------------------------------------------------------
+
+/// A fixture whose `/doc` route flips from 200 to 404 on command. A resource "disappearing" is the
+/// only way to observe deletion detection: the same URL, the same port, a different answer.
+async fn spawn_vanishing_fixture() -> (String, Arc<AtomicBool>) {
+    let alive = Arc::new(AtomicBool::new(true));
+    let doc_alive = alive.clone();
+    let router = Router::new()
+        .route(
+            "/robots.txt",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], ROBOTS_OPEN) }),
+        )
+        .route(
+            "/doc",
+            get(move || {
+                let alive = doc_alive.clone();
+                async move {
+                    if alive.load(Ordering::SeqCst) {
+                        ([(header::CONTENT_TYPE, "text/html")], P1).into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{addr}"), alive)
+}
+
+#[tokio::test]
+async fn a_page_that_disappears_is_marked_deleted_and_keeps_its_history() {
+    let (base, alive) = spawn_vanishing_fixture().await;
+    let url = format!("{base}/doc");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    // First run: the page is live and indexed.
+    let first = crawl(options(seeds.clone(), out.clone()), &cfg).await.unwrap();
+    assert_eq!(first.ingested, 1, "the live page must be indexed first: {first:?}");
+    assert_eq!(first.deleted, 0, "nothing was deleted while the page was up: {first:?}");
+
+    let before = {
+        let ro = Pipeline::open_read_only(&cfg, true).expect("read-only open");
+        ro.all_docs().expect("all_docs")
+    };
+    assert!(
+        before.iter().any(|d| d.url == url),
+        "the page must be in the index before it disappears"
+    );
+
+    // The resource disappears, and the crawl log is dropped so the URL is not suppressed as
+    // already-seen (that suppression is the resume behaviour, and it would mean never asking again).
+    alive.store(false, Ordering::SeqCst);
+    let _ = std::fs::remove_file(out.join("crawl-log.jsonl"));
+
+    let second = crawl(options(seeds, out.clone()), &cfg).await.unwrap();
+    assert_eq!(second.failed, 0, "a 404 for an indexed URL is a deletion, not a failure: {second:?}");
+    assert_eq!(second.deleted, 1, "the disappearance must be recorded: {second:?}");
+
+    let lines = log_lines(&out);
+    assert!(
+        lines.iter().any(|l| l["url"] == url.as_str() && l["outcome"] == "deleted"),
+        "the log must say the URL was deleted: {lines:?}"
+    );
+
+    // DELETED means not served, and the bytes stay on disk: history is kept, not erased.
+    let after = {
+        let ro = Pipeline::open_read_only(&cfg, true).expect("read-only open");
+        ro.all_docs().expect("all_docs")
+    };
+    assert!(
+        !after.iter().any(|d| d.url == url),
+        "a deleted page must not be returned by the index"
+    );
+    assert!(
+        !blob_files(&out).is_empty(),
+        "the fetched bytes must remain on disk after a deletion: history is kept"
+    );
 }

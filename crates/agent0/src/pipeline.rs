@@ -211,6 +211,13 @@ pub struct RefreshReport {
 /// One process owns the metadata writer (`SQLite` single-writer rule): the
 /// writer sits behind a `std::sync::Mutex` and is never held across an `.await`.
 pub struct Pipeline {
+    /// §44 deletion detection: `doc_id → version` for every live document, built on first use.
+    ///
+    /// A tombstone must carry a version *above* the copy it replaces or the older copy wins, and the
+    /// store has no single-document version lookup — so the map is built once, lazily, only when a
+    /// 404/410 is actually seen, and an id is removed from it as soon as it is tombstoned (which
+    /// also makes a repeat 404 idempotent instead of counting as a second deletion).
+    live_doc_versions: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>>,
     cfg: Config,
     meta: Mutex<MetadataWriter>,
     /// Optional §21 browser escalation. `None` (the default) means an HTML page that
@@ -368,6 +375,7 @@ impl Pipeline {
         };
 
         Ok(Self {
+            live_doc_versions: std::sync::Mutex::new(None),
             cfg: cfg.clone(),
             meta: Mutex::new(writer),
             browser: None,
@@ -427,6 +435,48 @@ impl Pipeline {
     /// needed. `doc_id`-sorted and tombstone-free, so an export is reproducible.
     pub fn all_docs(&self) -> AppResult<Vec<IndexDoc>> {
         self.indexer.all_docs()
+    }
+
+    /// `doc_id → version` for live documents, built once per process on first use.
+    fn live_doc_versions(
+        &self,
+    ) -> AppResult<std::sync::MutexGuard<'_, Option<std::collections::HashMap<String, u64>>>> {
+        let mut guard = self.live_doc_versions.lock().map_err(|_| {
+            AppError::Internal("the live-document map was poisoned by a panicking thread".into())
+        })?;
+        if guard.is_none() {
+            *guard = Some(
+                self.indexer
+                    .all_docs()?
+                    .into_iter()
+                    .map(|d| (d.doc_id, d.version))
+                    .collect(),
+            );
+        }
+        Ok(guard)
+    }
+
+    /// §44: a previously indexed URL that now answers 404/410 is marked **DELETED** (tombstoned) so
+    /// it stops being served, while its stored bytes and crawl history stay — the architecture is
+    /// explicit that "historical results may still matter", so this is not a hard delete.
+    ///
+    /// Returns whether a live document was actually marked: a 404 for a URL that was never indexed
+    /// is a failed attempt, not a deletion. A read-only pipeline cannot write, and returns `false`
+    /// rather than pretending.
+    pub fn mark_deleted(&self, url: &str) -> AppResult<bool> {
+        if self.indexer.is_read_only() {
+            return Ok(false);
+        }
+        let doc_id = self.resource_id_for(url)?;
+        let mut versions = self.live_doc_versions()?;
+        let Some(map) = versions.as_mut() else {
+            return Ok(false);
+        };
+        let Some(version) = map.remove(&doc_id) else {
+            return Ok(false);
+        };
+        self.indexer.index_overlay(IndexDoc::tombstone(doc_id, version + 1))?;
+        Ok(true)
     }
 
     /// Deterministic resource id for a URL (canonicalized first), matching the

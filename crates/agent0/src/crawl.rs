@@ -231,6 +231,8 @@ pub struct CrawlSummary {
     pub unchanged: usize,
     pub denied: usize,
     pub failed: usize,
+    /// Documents marked DELETED this run because their URL now answers 404/410 (§44).
+    pub deleted: usize,
     pub urls_attempted: usize,
     pub blobs: usize,
     pub bytes: u64,
@@ -418,6 +420,8 @@ struct Counters {
     unchanged: usize,
     denied: usize,
     failed: usize,
+    /// §44: documents tombstoned because their URL answered 404/410 after being indexed.
+    deleted: usize,
     blobs: usize,
     bytes: u64,
 }
@@ -574,6 +578,7 @@ impl Drainer {
             unchanged: self.counters.unchanged,
             denied: self.counters.denied,
             failed: self.counters.failed,
+            deleted: self.counters.deleted,
             urls_attempted: self.attempts,
             blobs: self.counters.blobs,
             bytes: self.counters.bytes,
@@ -715,6 +720,7 @@ impl Drainer {
             "unchanged" => self.counters.unchanged += 1,
             "denied" => self.counters.denied += 1,
             "failed" => self.counters.failed += 1,
+            "deleted" => self.counters.deleted += 1,
             _ => {}
         }
 
@@ -788,17 +794,30 @@ async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: Stri
             }
             per
         }
-        Err(e) => PerUrl {
-            url: url.clone(),
-            origin,
-            final_url: url,
-            outcome: "failed",
-            error: Some(e.to_string()),
-            sha256: None,
-            bytes: 0,
-            content_type: None,
-            raw: None,
-        },
+        Err(e) => {
+            // §44 deletion detection. A 404/410 for a URL that is already indexed means the
+            // resource is gone: mark the document DELETED so it stops being served, keeping its
+            // stored bytes and history (the architecture is explicit that historical results may
+            // still matter, so this is not a hard delete). A 404 for a URL never indexed stays an
+            // ordinary failed attempt.
+            let not_found = matches!(e, search_core::error::AppError::NotFound(_));
+            let deleted = not_found
+                && pipeline.mark_deleted(&url).unwrap_or_else(|err| {
+                    eprintln!("deletion detection: could not mark {url} deleted: {err}");
+                    false
+                });
+            PerUrl {
+                url: url.clone(),
+                origin,
+                final_url: url,
+                outcome: if deleted { "deleted" } else { "failed" },
+                error: Some(e.to_string()),
+                sha256: None,
+                bytes: 0,
+                content_type: None,
+                raw: None,
+            }
+        }
     }
 }
 

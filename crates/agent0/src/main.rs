@@ -31,6 +31,8 @@ use search_core::config::Config;
 /// * `SEARCH_READ_ONLY=1` — always read-only (a crawl may be running; never fails on the lock).
 /// * `SEARCH_READ_ONLY=0` — always take the writer; fail if the index is locked.
 /// * unset / `auto` — writer if possible, read-only otherwise.
+mod evalrun;
+
 fn open_for_serve(cfg: &search_core::config::Config) -> search_core::error::AppResult<Pipeline> {
     let mode = std::env::var("SEARCH_READ_ONLY").unwrap_or_default().trim().to_ascii_lowercase();
     match mode.as_str() {
@@ -161,8 +163,10 @@ async fn main() -> ExitCode {
         Some("crawl") => search_agent0::crawl::run_crawl(&args).await,
         Some("eval") => match args.get(2).map(String::as_str) {
             Some("build-set") => search_agent0::evalset::run(&args).await,
+            Some("run") => evalrun::run(&args).await,
             _ => {
                 eprintln!("usage: agent0 eval build-set [--out FILE] [--sample N] [--min-title-words N] [--max-title-words N] [--min-body-chars N]");
+                eprintln!("       agent0 eval run [--set FILE] [--limit N] [--out metrics.json]");
                 ExitCode::from(2)
             }
         },
@@ -359,7 +363,9 @@ async fn run_export(args: &[String]) -> ExitCode {
     let version = flag_str(args, "--version").unwrap_or_else(|| "1".to_string());
 
     let cfg = config();
-    let pipeline = match Pipeline::open(&cfg) {
+    // Read-only: an export reads stored documents and writes only the pack, so it must not take the
+    // writer lock from a running server or crawl (the same reason `graph build` opens read-only).
+    let pipeline = match Pipeline::open_read_only(&cfg, false) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to open pipeline: {e}");
