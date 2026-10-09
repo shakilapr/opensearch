@@ -140,6 +140,11 @@ pub struct CrawlOptions {
     pub allow_loopback: bool,
     /// Minimum interval between two requests to the same origin.
     pub origin_interval: Duration,
+    /// Explicit per-origin attempt cap. `None` keeps the derived default of
+    /// `max(200, max_docs / 10)`; a corpus run whose goal is *many sources*
+    /// rather than depth in a few sets a smaller value so the document budget
+    /// spreads across more hosts.
+    pub origin_cap: Option<usize>,
 }
 
 impl CrawlOptions {
@@ -155,6 +160,7 @@ impl CrawlOptions {
             follow_links: true,
             allow_loopback: false,
             origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
+            origin_cap: None,
         }
     }
 }
@@ -184,7 +190,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         _ => {
             eprintln!(
                 "usage: agent0 crawl <seedsfile> [--max-docs N] [--concurrency C] \
-                 [--out DIR] [--max-urls N] [--no-follow-links]"
+                 [--out DIR] [--max-urls N] [--origin-cap N] [--no-follow-links]"
             );
             return ExitCode::from(2);
         }
@@ -196,6 +202,14 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
     let max_urls = flag_usize(args, "--max-urls").unwrap_or_else(|| max_docs.saturating_mul(10));
     // Link following is on by default; `--no-follow-links` turns it off.
     let follow_links = !args.iter().any(|a| a == "--no-follow-links");
+    // Breadth knob: the derived cap (max(200, max_docs/10)) suits a depth-first
+    // run; a corpus run that wants hundreds of sources spreads the same budget
+    // further with a smaller cap.
+    let origin_cap = flag_usize(args, "--origin-cap").or_else(|| {
+        std::env::var("SEARCH_CRAWL_ORIGIN_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
     let interval_ms = std::env::var("SEARCH_CRAWL_ORIGIN_INTERVAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -210,6 +224,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         follow_links,
         allow_loopback: false,
         origin_interval: Duration::from_millis(interval_ms),
+        origin_cap,
     };
 
     let cfg = Config::from_env();
@@ -286,15 +301,18 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         frontier_path,
     );
 
-    // Pending frontier from a previous run.
-    for u in read_frontier(&drain.frontier_path) {
-        drain.enqueue(u);
-    }
-
     let seeds = parse_seeds(&opts.seeds_file)?;
 
     // Interleave discovery and draining: discover one unseen seed, enqueue its
     // frontier, drain, then move on. Stops as soon as a bound is met.
+    //
+    // This runs BEFORE the resumed backlog on purpose. The pending frontier
+    // left by a previous run can be dominated by one host's sitemap (a live
+    // run had 2 355 pending docs.rs URLs against 1 203 from everything else);
+    // draining it first parked the whole run inside a single origin and the
+    // seeds listed below were never even discovered. Seeds first makes a
+    // resumed crawl breadth-first; the stale backlog goes last, and the
+    // document bound normally stops the run before reaching it.
     for seed in &seeds {
         if drain.is_seen(seed) {
             continue;
@@ -306,6 +324,12 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         if drain.bound_reached() {
             break;
         }
+    }
+
+    // The pending frontier from a previous run, drained last: everything in it
+    // is already queued, and the bound is usually reached first.
+    for u in read_frontier(&drain.frontier_path) {
+        drain.enqueue(u);
     }
 
     // Final drain for anything still queued (no-op when the bound was met).
@@ -456,15 +480,20 @@ impl Drainer {
         }
     }
 
-    /// Per-origin attempt cap: one tenth of the document goal, never below 200.
-    /// Keeps the corpus broad (many sources) instead of deep in one host.
+    /// Per-origin attempt cap. The derived default is one tenth of the document
+    /// goal, never below 200, which keeps the corpus broad instead of deep in
+    /// one host; `opts.origin_cap` overrides it so a breadth-first run can
+    /// spread a 10 000-document budget across hundreds of hosts.
     fn origin_cap(&self) -> usize {
-        std::cmp::max(200, self.opts.max_docs / 10)
+        self.opts
+            .origin_cap
+            .unwrap_or_else(|| std::cmp::max(200, self.opts.max_docs / 10))
     }
 
     fn bound_reached(&self) -> bool {
         self.attempts >= self.opts.max_urls || self.ingested >= self.opts.max_docs
     }
+
 
     fn queues_empty(&self) -> bool {
         self.queues.values().all(|q| q.is_empty())

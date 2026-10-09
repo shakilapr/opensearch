@@ -758,3 +758,73 @@ async fn huge_anchor_page_is_capped() {
     );
     assert!(!distinct.is_empty(), "some links were still followed");
 }
+
+/// A resumed crawl must not let a stale pending backlog starve the seeds that
+/// were added since. The bug: the pending frontier was enqueued *before* the
+/// seed loop, so the run spent its whole attempt budget inside the backlog's
+/// origins and the newly listed seeds were never even discovered (live: 2 355
+/// pending docs.rs URLs, and 88 of 145 seeds never fetched).
+///
+/// One attempt is all this test allows: with the backlog queued first the
+/// round-robin picks it and the new seed is never reached; with seeds first the
+/// new seed owns the only attempt.
+#[tokio::test]
+async fn a_stale_pending_backlog_does_not_starve_the_seed_list() {
+    let (base_a, fx_a) = spawn_recording_fixture(
+        vec![(
+            "/docs/stale-article".to_string(),
+            "text/html".to_string(),
+            P1.to_string(),
+        )],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let (base_b, fx_b) = spawn_recording_fixture(
+        vec![("/seed".to_string(), "text/html".to_string(), P2.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // A stale frontier from a previous run: document-shaped pending URLs for
+    // origin A, so the enqueue gate keeps them.
+    let pending: Vec<String> = (0..50)
+        .map(|i| format!("{base_a}/docs/stale-article-{i:03}"))
+        .collect();
+    std::fs::write(
+        out.join("frontier.json"),
+        serde_json::to_string(&pending).unwrap(),
+    )
+    .unwrap();
+
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base_b}/seed")]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.max_urls = 1;
+    opts.max_docs = 1;
+    let summary = crawl(opts, &cfg).await.unwrap();
+
+    assert_eq!(summary.urls_attempted, 1, "the bound must hold: {summary:?}");
+    // Discovery fetches a seed page once to look for a sitemap or feed, and the
+    // drain fetches it again to ingest it: two requests mean the seed actually
+    // got the attempt.
+    assert!(
+        fx_b.count("/seed") >= 2,
+        "the newly listed seed must get the attempt, not just discovery: {:?}",
+        fx_b.paths()
+    );
+    let backlog_hits = fx_a
+        .paths()
+        .iter()
+        .filter(|p| p.starts_with("/docs/stale-article"))
+        .count();
+    assert_eq!(
+        backlog_hits, 0,
+        "the stale backlog must not be reached while the seed list still has entries: {:?}",
+        fx_a.paths()
+    );
+}
