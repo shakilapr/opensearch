@@ -26,6 +26,7 @@
 //! per-phase trace emitter, and [`Pipeline::deep_search`] (see
 //! `docs/STAGE4_SPEC.md`).
 
+pub mod crawl;
 pub mod deep;
 pub mod pipeline;
 pub mod portable;

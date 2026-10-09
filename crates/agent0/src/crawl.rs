@@ -1,0 +1,1003 @@
+//! `agent0 crawl` — a resumable, multi-document crawl driver.
+//!
+//! ```text
+//! agent0 crawl SEEDSFILE [--max-docs N] [--concurrency C] [--out DIR] [--max-urls N]
+//! ```
+//!
+//! The driver expands a seeds file (one URL per line, `#` comments and blank
+//! lines ignored) into a work queue, then drains it through the **existing**
+//! single-URL ingest path ([`Pipeline::crawl_one`]) so robots, the SSRF guard,
+//! normalization, dedup and indexing behave exactly as `agent0 ingest`.
+//!
+//! ## What lands on disk (under `--out`, default `raw-dataset/`)
+//!
+//! * `crawl-log.jsonl` — one JSON line per fetch attempt:
+//!   `{url, final_url, sha256, bytes, content_type, fetched_at, outcome, error}`.
+//!   `outcome` is one of `ingested|unchanged|denied|routed|failed`. The line
+//!   carries **only** these fields — never a header, credential or cookie.
+//! * `blobs/<sha256>.<ext>` — the RAW fetched body bytes for every successful
+//!   fetch, `ext` derived from the (sniffed) content type, `.bin` when unknown.
+//!   Deduped by `sha256`: identical bytes are written once and never rewritten.
+//! * `frontier.json` — the not-yet-processed URLs, so a kill/restart resumes
+//!   mid-corpus instead of restarting.
+//!
+//! ## Resumability
+//!
+//! On start the driver reads any existing `crawl-log.jsonl` and treats every URL
+//! already present as done (all five outcomes are terminal in this schema), then
+//! loads `frontier.json` for the pending queue. `resumed_from` reports how many
+//! previously-logged URLs were recognised. Every log append and frontier write is
+//! atomic (`write temp + rename`) so an interrupted run never leaves a partial
+//! JSONL line or a truncated frontier.
+//!
+//! ## Discovery + draining
+//!
+//! Seeds are processed one at a time: each unseen seed is expanded with the
+//! existing discovery path ([`Pipeline::discover`]: robots.txt `Sitemap:` lines,
+//! sitemap indexes, feeds advertised by the seed HTML) **and** by re-fetching the
+//! advertised sitemap/feed bodies and re-parsing them with
+//! `search_discovery::{parse_sitemap, parse_feed, sitemaps_in_robots,
+//! sitemap_index_urls}`. The work queue is drained before moving to the next
+//! seed, so `--max-docs`/`--max-urls` are reached without first discovering the
+//! whole seed set. Every discovered URL enters the same queue (`frontier.json`)
+//! after dedup against the log and the queue.
+//!
+//! ## The raw-body seam
+//!
+//! `Pipeline::crawl_one` drives robots/SSRF/normalize/dedup/index but does not
+//! hand back the response body. The pipeline already writes the **exact** fetched
+//! bytes to its blob store (`cfg.blob_path(<content-hash>)`), so the raw spill
+//! reads them from there rather than fetching around the pipeline — no second
+//! network client, and robots/SSRF are honoured because the bytes came through
+//! `crawl_one`. `crawl_one` also does not surface the response `Content-Type`, so
+//! the log's `content_type` is sniffed from those same bytes via
+//! `search_router::classify` (an ingested body is only ever HTML or PDF).
+//!
+//! ## Politeness
+//!
+//! Concurrency is bounded **across different origins** (`--concurrency`,
+//! default 8). Within an origin at most one request is ever in flight, and a
+//! minimum interval separates consecutive requests to the same origin. The
+//! interval defaults to 1000 ms and is configurable with
+//! `SEARCH_CRAWL_ORIGIN_INTERVAL_MS`. This is implemented locally (a per-origin
+//! `busy` flag + last-request timestamp); the `search_frontier` per-origin model
+//! is not rewired because doing so would require changing another crate.
+
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tokio::task::JoinSet;
+use url::Url;
+
+use search_core::config::Config;
+use search_core::{AppError, AppResult};
+use search_discovery::{parse_feed, parse_sitemap, sitemap_index_urls, sitemaps_in_robots};
+use search_fetcher::http::Fetcher;
+use search_router::{classify, Route};
+
+use crate::pipeline::{IngestOutcome, Pipeline};
+
+/// Default destination for the raw corpus.
+const DEFAULT_OUT: &str = "raw-dataset";
+/// Default bound on successfully ingested documents.
+const DEFAULT_MAX_DOCS: usize = 10_000;
+/// Default bound on in-flight fetches across different origins.
+const DEFAULT_CONCURRENCY: usize = 8;
+/// Default per-origin minimum interval between requests (milliseconds).
+const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
+
+/// Discovery fan-out bounds (mirror the pipeline's own limits).
+const MAX_SITEMAPS: usize = 8;
+const MAX_CHILD_SITEMAPS: usize = 16;
+const MAX_FEEDS: usize = 8;
+const MAX_DISCOVERED: usize = 512;
+
+/// Tunables for one crawl run.
+#[derive(Debug, Clone)]
+pub struct CrawlOptions {
+    /// Path to the seeds file (one URL per line, `#` comments ignored).
+    pub seeds_file: PathBuf,
+    /// Output directory for `crawl-log.jsonl`, `blobs/` and `frontier.json`.
+    pub out_dir: PathBuf,
+    /// Stop after this many *successfully ingested* documents.
+    pub max_docs: usize,
+    /// Stop after this many total fetch attempts.
+    pub max_urls: usize,
+    /// Maximum in-flight fetches across different origins.
+    pub concurrency: usize,
+    /// Test-only: exempt loopback targets from the SSRF guard.
+    pub allow_loopback: bool,
+    /// Minimum interval between two requests to the same origin.
+    pub origin_interval: Duration,
+}
+
+impl CrawlOptions {
+    /// Production defaults: `raw-dataset/`, 10 000 docs, 8 origins in flight.
+    pub fn new(seeds_file: impl Into<PathBuf>) -> Self {
+        let max_docs = DEFAULT_MAX_DOCS;
+        Self {
+            seeds_file: seeds_file.into(),
+            out_dir: PathBuf::from(DEFAULT_OUT),
+            max_docs,
+            max_urls: max_docs.saturating_mul(10),
+            concurrency: DEFAULT_CONCURRENCY,
+            allow_loopback: false,
+            origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
+        }
+    }
+}
+
+/// One JSON line printed at the end of a run.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CrawlSummary {
+    pub ingested: usize,
+    pub unchanged: usize,
+    pub denied: usize,
+    pub failed: usize,
+    pub urls_attempted: usize,
+    pub blobs: usize,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+    pub resumed_from: usize,
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+/// `agent0 crawl <seedsfile> [--max-docs N] [--concurrency C] [--out DIR] [--max-urls N]`
+pub async fn run_crawl(args: &[String]) -> ExitCode {
+    let seeds = match args.get(2) {
+        Some(s) if !s.trim().is_empty() => s.clone(),
+        _ => {
+            eprintln!(
+                "usage: agent0 crawl <seedsfile> [--max-docs N] [--concurrency C] \
+                 [--out DIR] [--max-urls N]"
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    let max_docs = flag_usize(args, "--max-docs").unwrap_or(DEFAULT_MAX_DOCS);
+    let concurrency = flag_usize(args, "--concurrency").unwrap_or(DEFAULT_CONCURRENCY).max(1);
+    let out = flag_str(args, "--out").unwrap_or_else(|| DEFAULT_OUT.to_string());
+    let max_urls = flag_usize(args, "--max-urls").unwrap_or_else(|| max_docs.saturating_mul(10));
+    let interval_ms = std::env::var("SEARCH_CRAWL_ORIGIN_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ORIGIN_INTERVAL_MS);
+
+    let opts = CrawlOptions {
+        seeds_file: PathBuf::from(seeds),
+        out_dir: PathBuf::from(out),
+        max_docs,
+        max_urls,
+        concurrency,
+        allow_loopback: false,
+        origin_interval: Duration::from_millis(interval_ms),
+    };
+
+    let cfg = Config::from_env();
+    match crawl(opts, &cfg).await {
+        Ok(summary) => {
+            println!("{}", serde_json::to_string(&summary).unwrap());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("crawl failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn flag_usize(args: &[String], flag: &str) -> Option<usize> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+fn flag_str(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.trim().is_empty())
+        .cloned()
+}
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+/// Run one crawl to completion, returning the summary. Library entry point used
+/// directly by tests (which pass a hermetic `Config` + loopback fixture).
+pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> {
+    let started = Instant::now();
+
+    std::fs::create_dir_all(&opts.out_dir)?;
+    let blobs_dir = opts.out_dir.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)?;
+    let log_path = opts.out_dir.join("crawl-log.jsonl");
+    let frontier_path = opts.out_dir.join("frontier.json");
+
+    // Resume: every URL already in the log counts as done.
+    let seen = read_log_urls(&log_path)?;
+    let resumed_from = seen.len();
+
+    let pipeline = Arc::new(Pipeline::open_with(cfg, opts.allow_loopback)?);
+
+    // The fetcher used ONLY for discovery bodies (robots/sitemaps/feeds). It is
+    // the same `Fetcher` type the pipeline holds; the pipeline does not expose
+    // its instance, so one is built here. `fetch` re-validates SSRF on every
+    // hop; the loopback escape is enabled only for the hermetic test path.
+    let fetcher = Fetcher::new(cfg.limits.clone(), cfg.user_agent.clone())
+        .with_allowed_types(vec![
+            "text/*".to_string(),
+            "application/xml".to_string(),
+            "application/rss+xml".to_string(),
+            "application/atom+xml".to_string(),
+            "application/xhtml+xml".to_string(),
+            "application/json".to_string(),
+        ])
+        .allow_private_addresses_for_tests(opts.allow_loopback);
+
+    let mut drain = Drainer::new(
+        pipeline.clone(),
+        cfg.clone(),
+        opts.clone(),
+        seen,
+        log_path,
+        blobs_dir,
+        frontier_path,
+    );
+
+    // Pending frontier from a previous run.
+    for u in read_frontier(&drain.frontier_path) {
+        drain.enqueue(u);
+    }
+
+    let seeds = parse_seeds(&opts.seeds_file)?;
+
+    // Interleave discovery and draining: discover one unseen seed, enqueue its
+    // frontier, drain, then move on. Stops as soon as a bound is met.
+    for seed in &seeds {
+        if drain.is_seen(seed) {
+            continue;
+        }
+        discover_seed(&pipeline, &fetcher, seed, &mut drain).await;
+        drain.enqueue(seed.clone());
+        drain.persist();
+        drain.run().await;
+        if drain.bound_reached() {
+            break;
+        }
+    }
+
+    // Final drain for anything still queued (no-op when the bound was met).
+    if !drain.bound_reached() {
+        drain.run().await;
+    }
+
+    // Clear the persisted frontier: everything has been logged.
+    persist_frontier(&drain.frontier_path, std::iter::empty::<String>());
+
+    Ok(drain.summary(resumed_from, started.elapsed()))
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler + drain loop
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Counters {
+    ingested: usize,
+    unchanged: usize,
+    denied: usize,
+    failed: usize,
+    blobs: usize,
+    bytes: u64,
+}
+
+/// One dispatched URL's result, ready to be logged.
+struct PerUrl {
+    url: String,
+    origin: String,
+    final_url: String,
+    outcome: &'static str,
+    error: Option<String>,
+    sha256: Option<String>,
+    bytes: u64,
+    content_type: Option<String>,
+    /// Raw fetched bytes for the spill (present for ingested/unchanged).
+    raw: Option<Vec<u8>>,
+}
+
+/// Owns the work queue, the per-origin politeness state and the counters.
+/// Concurrency is across origins; at most one in-flight request per origin.
+struct Drainer {
+    pipeline: Arc<Pipeline>,
+    cfg: Config,
+    opts: CrawlOptions,
+    log_path: PathBuf,
+    blobs_dir: PathBuf,
+    frontier_path: PathBuf,
+    /// URLs already logged (previous runs) — never re-attempted.
+    seen: HashSet<String>,
+    queues: HashMap<String, VecDeque<String>>,
+    order: Vec<String>,
+    busy: HashSet<String>,
+    last: HashMap<String, Instant>,
+    rr: usize,
+    in_flight: usize,
+    attempts: usize,
+    ingested: usize,
+    /// Every URL enqueued-but-not-yet-logged (queued + in-flight); persisted to
+    /// `frontier.json` so a kill loses nothing.
+    remaining: BTreeSet<String>,
+    counters: Counters,
+}
+
+impl Drainer {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        pipeline: Arc<Pipeline>,
+        cfg: Config,
+        opts: CrawlOptions,
+        seen: HashSet<String>,
+        log_path: PathBuf,
+        blobs_dir: PathBuf,
+        frontier_path: PathBuf,
+    ) -> Self {
+        Self {
+            pipeline,
+            cfg,
+            opts,
+            log_path,
+            blobs_dir,
+            frontier_path,
+            seen,
+            queues: HashMap::new(),
+            order: Vec::new(),
+            busy: HashSet::new(),
+            last: HashMap::new(),
+            rr: 0,
+            in_flight: 0,
+            attempts: 0,
+            ingested: 0,
+            remaining: BTreeSet::new(),
+            counters: Counters::default(),
+        }
+    }
+
+    fn is_seen(&self, url: &str) -> bool {
+        self.seen.contains(url)
+    }
+
+    fn enqueue(&mut self, url: String) {
+        if !url.starts_with("http") {
+            return;
+        }
+        if self.seen.contains(&url) || !self.remaining.insert(url.clone()) {
+            return;
+        }
+        let o = origin_of(&url);
+        if !self.queues.contains_key(&o) {
+            self.order.push(o.clone());
+        }
+        self.queues.entry(o).or_default().push_back(url);
+    }
+
+    fn bound_reached(&self) -> bool {
+        self.attempts >= self.opts.max_urls || self.ingested >= self.opts.max_docs
+    }
+
+    fn queues_empty(&self) -> bool {
+        self.queues.values().all(|q| q.is_empty())
+    }
+
+    fn persist(&self) {
+        persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
+    }
+
+    fn summary(&self, resumed_from: usize, elapsed: Duration) -> CrawlSummary {
+        CrawlSummary {
+            ingested: self.counters.ingested,
+            unchanged: self.counters.unchanged,
+            denied: self.counters.denied,
+            failed: self.counters.failed,
+            urls_attempted: self.attempts,
+            blobs: self.counters.blobs,
+            bytes: self.counters.bytes,
+            elapsed_ms: elapsed.as_millis() as u64,
+            resumed_from,
+        }
+    }
+
+    /// Drain the queue until it is empty or a bound is reached.
+    async fn run(&mut self) {
+        let mut joinset: JoinSet<PerUrl> = JoinSet::new();
+        loop {
+            if self.in_flight == 0 {
+                if self.queues_empty() || self.bound_reached() {
+                    break;
+                }
+                let n = self.dispatch(&mut joinset);
+                if n == 0 {
+                    // Nothing dispatchable right now (interval not elapsed).
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                } else {
+                    self.persist();
+                }
+                continue;
+            }
+
+            if let Some(res) = joinset.try_join_next() {
+                self.handle(res);
+                self.persist();
+                continue;
+            }
+
+            if !self.bound_reached() {
+                let n = self.dispatch(&mut joinset);
+                if n > 0 {
+                    self.persist();
+                    continue;
+                }
+            }
+
+            if let Some(res) = joinset.join_next().await {
+                self.handle(res);
+                self.persist();
+            }
+        }
+        while let Some(res) = joinset.join_next().await {
+            self.handle(res);
+        }
+    }
+
+    /// Dispatch as many eligible URLs as the concurrency + per-origin politeness
+    /// allow. Returns how many tasks were spawned. Never blocks.
+    fn dispatch(&mut self, joinset: &mut JoinSet<PerUrl>) -> usize {
+        let interval = self.opts.origin_interval;
+        let concurrency = self.opts.concurrency;
+        let mut spawned = 0;
+        loop {
+            if self.in_flight >= concurrency
+                || self.attempts >= self.opts.max_urls
+                || self.ingested >= self.opts.max_docs
+                || self.order.is_empty()
+            {
+                break;
+            }
+            let now = Instant::now();
+            let n = self.order.len();
+            let mut chosen: Option<String> = None;
+            for k in 0..n {
+                let o = &self.order[(self.rr + k) % n];
+                if self.busy.contains(o) {
+                    continue;
+                }
+                match self.queues.get(o) {
+                    Some(q) if !q.is_empty() => {}
+                    _ => continue,
+                }
+                if let Some(t) = self.last.get(o) {
+                    if now.saturating_duration_since(*t) < interval {
+                        continue;
+                    }
+                }
+                chosen = Some(o.clone());
+                self.rr = (self.rr + k + 1) % n;
+                break;
+            }
+            let Some(o) = chosen else { break };
+
+            let url = self.queues.get_mut(&o).unwrap().pop_front().unwrap();
+            self.busy.insert(o.clone());
+            self.last.insert(o.clone(), now);
+            self.in_flight += 1;
+            self.attempts += 1;
+            spawned += 1;
+
+            let pl: Arc<Pipeline> = self.pipeline.clone();
+            let c = self.cfg.clone();
+            joinset.spawn(async move { attempt(pl, c, url, o).await });
+        }
+        spawned
+    }
+
+    /// Apply one completed task: counters, blob spill, log append.
+    fn handle(&mut self, res: Result<PerUrl, tokio::task::JoinError>) {
+        let per = match res {
+            Ok(p) => p,
+            Err(e) => {
+                // A panicked task: count it as a failure; no URL to log.
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.counters.failed += 1;
+                eprintln!("crawl task panicked: {e}");
+                return;
+            }
+        };
+
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.busy.remove(&per.origin);
+        self.remaining.remove(&per.url);
+        // Mark as done so a later frontier re-read never re-queues it.
+        self.seen.insert(per.url.clone());
+
+        match per.outcome {
+            "ingested" => {
+                self.counters.ingested += 1;
+                self.ingested += 1;
+            }
+            "unchanged" => self.counters.unchanged += 1,
+            "denied" => self.counters.denied += 1,
+            "failed" => self.counters.failed += 1,
+            _ => {}
+        }
+
+        // Raw spill: dedupe by sha256.
+        if let (Some(raw), Some(sha)) = (&per.raw, &per.sha256) {
+            let ext = ext_for(per.content_type.as_deref());
+            let path = self.blobs_dir.join(format!("{sha}.{ext}"));
+            if !path.exists() {
+                if let Err(e) = write_atomic(&path, raw) {
+                    eprintln!("failed to write blob {sha}: {e}");
+                } else {
+                    self.counters.blobs += 1;
+                    self.counters.bytes += raw.len() as u64;
+                }
+            }
+        }
+
+        let line = serde_json::json!({
+            "url": per.url,
+            "final_url": per.final_url,
+            "sha256": per.sha256,
+            "bytes": per.bytes,
+            "content_type": per.content_type,
+            "fetched_at": search_core::time::now_unix_s(),
+            "outcome": per.outcome,
+            "error": per.error,
+        });
+        if let Err(e) = append_log_atomic(&self.log_path, &line.to_string()) {
+            eprintln!("failed to append crawl log line: {e}");
+        }
+    }
+}
+
+/// Run one URL through the existing ingest path and package the result.
+async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: String) -> PerUrl {
+    match pipeline.crawl_one(&url).await {
+        Ok(outcome) => {
+            let (name, content_id, error) = match &outcome {
+                IngestOutcome::Ingested { content_id, .. } => {
+                    ("ingested", Some(content_id.clone()), None)
+                }
+                IngestOutcome::Unchanged { content_id, .. } => {
+                    ("unchanged", Some(content_id.clone()), None)
+                }
+                IngestOutcome::Denied { reason, .. } => ("denied", None, Some(reason.clone())),
+                IngestOutcome::Routed { .. } => ("routed", None, None),
+            };
+            let final_url = outcome_url(&outcome).unwrap_or_else(|| url.clone());
+
+            let mut per = PerUrl {
+                url: url.clone(),
+                origin,
+                final_url,
+                outcome: name,
+                error,
+                sha256: None,
+                bytes: 0,
+                content_type: None,
+                raw: None,
+            };
+
+            if let Some(cid) = content_id {
+                if let Some(raw) = read_pipeline_blob(&cfg, &cid) {
+                    let sha = sha256_hex(&raw);
+                    let ct = sniff_media_type(&per.final_url, &raw);
+                    per.bytes = raw.len() as u64;
+                    per.content_type = Some(ct.to_string());
+                    per.sha256 = Some(sha);
+                    per.raw = Some(raw);
+                }
+            }
+            per
+        }
+        Err(e) => PerUrl {
+            url: url.clone(),
+            origin,
+            final_url: url,
+            outcome: "failed",
+            error: Some(e.to_string()),
+            sha256: None,
+            bytes: 0,
+            content_type: None,
+            raw: None,
+        },
+    }
+}
+
+fn outcome_url(o: &IngestOutcome) -> Option<String> {
+    match o {
+        IngestOutcome::Ingested { url, .. }
+        | IngestOutcome::Unchanged { url, .. }
+        | IngestOutcome::Denied { url, .. }
+        | IngestOutcome::Routed { url, .. } => Some(url.clone()),
+    }
+}
+
+/// Read the exact raw bytes the pipeline persisted for a content id.
+///
+/// Seam: `crawl_one` -> `write_content_files` writes the fetched body to
+/// `cfg.blob_path(<content-hash>)`; the content id is `cnt_<hex>`.
+fn read_pipeline_blob(cfg: &Config, content_id: &str) -> Option<Vec<u8>> {
+    let hex = content_id.strip_prefix("cnt_").unwrap_or(content_id);
+    if hex.len() < 2 {
+        return None;
+    }
+    std::fs::read(cfg.blob_path(hex)).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+/// Expand one seed: the existing pipeline discovery path plus a direct
+/// sitemap/feed re-parse, enqueuing every discovered URL.
+async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain: &mut Drainer) {
+    // (1) Existing discovery path: robots -> sitemaps -> feeds, persisted and
+    // pushed to the metadata frontier. Errors are non-fatal.
+    if let Err(e) = pipeline.discover(seed).await {
+        tracing::warn!(target: "agent0::crawl", seed = %seed, error = %e, "discovery pass failed (continuing)");
+    }
+
+    // (2) Direct sitemap expansion from the origin's robots.txt.
+    let origin = origin_of(seed);
+    if !origin.is_empty() {
+        let robots_url = format!("{origin}/robots.txt");
+        if let Some(bytes) = fetch_body(fetcher, &robots_url).await {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            let sitemaps: Vec<String> = sitemaps_in_robots(&text)
+                .into_iter()
+                .map(|u| resolve_against(&origin, &u))
+                .filter(|u| u.starts_with("http"))
+                .take(MAX_SITEMAPS)
+                .collect();
+            for sm in sitemaps {
+                expand_sitemap(fetcher, &origin, &sm, drain).await;
+            }
+        }
+    }
+
+    // (3) Feeds the pipeline persisted for this seed's domain, re-parsed.
+    for feed_url in metadata_urls(pipeline, "SELECT url FROM feed LIMIT ?1", MAX_FEEDS as i64) {
+        if let Some(bytes) = fetch_body(fetcher, &feed_url).await {
+            let entries = parse_feed(&bytes, &feed_url).unwrap_or_default();
+            for r in entries.into_iter().take(MAX_DISCOVERED) {
+                drain.enqueue(r.url);
+            }
+        }
+    }
+
+    // (4) Everything the pipeline pushed into the frontier.
+    for u in metadata_urls(
+        pipeline,
+        "SELECT url FROM frontier_entry LIMIT ?1",
+        MAX_DISCOVERED as i64,
+    ) {
+        drain.enqueue(u);
+    }
+}
+
+/// Fetch a sitemap; if it is an index, follow exactly one level of children.
+async fn expand_sitemap(fetcher: &Fetcher, origin: &str, sm_url: &str, drain: &mut Drainer) {
+    let Some(bytes) = fetch_body(fetcher, sm_url).await else {
+        return;
+    };
+    let children = sitemap_index_urls(&bytes).unwrap_or_default();
+    if !children.is_empty() {
+        for child in children.into_iter().take(MAX_CHILD_SITEMAPS) {
+            let child = resolve_against(origin, &child);
+            if !child.starts_with("http") {
+                continue;
+            }
+            let Some(cb) = fetch_body(fetcher, &child).await else {
+                continue;
+            };
+            let resources = parse_sitemap(&cb, &child).unwrap_or_default();
+            for r in resources.into_iter().take(MAX_DISCOVERED) {
+                drain.enqueue(r.url);
+            }
+        }
+    } else {
+        let resources = parse_sitemap(&bytes, sm_url).unwrap_or_default();
+        for r in resources.into_iter().take(MAX_DISCOVERED) {
+            drain.enqueue(r.url);
+        }
+    }
+}
+
+/// Read a string column from the pipeline's metadata DB (read-only).
+fn metadata_urls(pipeline: &Pipeline, sql: &str, limit: i64) -> Vec<String> {
+    pipeline
+        .with_meta_conn(|conn| {
+            let mut stmt = conn.prepare(sql).map_err(search_metadata::db_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit], |r| r.get::<_, String>(0))
+                .map_err(search_metadata::db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(search_metadata::db_err)?;
+            Ok(rows)
+        })
+        .unwrap_or_default()
+}
+
+/// Fetch a discovery body (2xx only). Respects SSRF (validated per hop by the
+/// fetcher); returns raw bytes.
+async fn fetch_body(fetcher: &Fetcher, url: &str) -> Option<Vec<u8>> {
+    match fetcher.fetch(url, None, None).await {
+        Ok(o) if (200..300).contains(&o.status) => o.body,
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_seeds(path: &Path) -> AppResult<Vec<String>> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        AppError::Invalid(format!("failed to read seeds file {}: {e}", path.display()))
+    })?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+fn read_log_urls(path: &Path) -> AppResult<HashSet<String>> {
+    let mut set = HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(u) = v.get("url").and_then(|x| x.as_str()) {
+                    set.insert(u.to_string());
+                }
+            }
+        }
+    }
+    Ok(set)
+}
+
+fn read_frontier(path: &Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn persist_frontier(path: &Path, urls: impl Iterator<Item = String>) {
+    let v: Vec<String> = urls.collect();
+    if let Ok(bytes) = serde_json::to_vec(&v) {
+        if let Err(e) = write_atomic(path, &bytes) {
+            eprintln!("failed to persist frontier: {e}");
+        }
+    }
+}
+
+fn append_log_atomic(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut buf = std::fs::read(path).unwrap_or_default();
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    write_atomic(path, &buf)
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename).
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Origin (`scheme://host[:port]`) of a URL, else the raw string for an
+/// unparseable URL so it still gets its own scheduler bucket.
+fn origin_of(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(host), Some(port)) => format!("{}://{}:{}", u.scheme(), host, port),
+            (Some(host), None) => format!("{}://{}", u.scheme(), host),
+            (None, _) => raw.to_string(),
+        },
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn resolve_against(origin: &str, url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return url.to_string();
+    }
+    match Url::parse(origin).and_then(|b| b.join(url)) {
+        Ok(u) => u.to_string(),
+        Err(_) => url.to_string(),
+    }
+}
+
+/// Best-effort media type for the raw bytes `crawl_one` ingested. The router
+/// cannot see a plain-HTML body without a declared type, so an HTML-looking body
+/// is reported as `text/html` (a `crawl_one` ingest is only ever HTML or PDF).
+fn sniff_media_type(url: &str, raw: &[u8]) -> &'static str {
+    let sniff = &raw[..raw.len().min(4096)];
+    match classify(None, url, sniff).route {
+        Route::Pdf => "application/pdf",
+        _route if looks_like_html(sniff) => "text/html",
+        route => media_type(&route),
+    }
+}
+
+fn looks_like_html(sniff: &[u8]) -> bool {
+    let mut s = sniff;
+    while let Some((&b, rest)) = s.split_first() {
+        if b.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    if s.first() == Some(&b'<') {
+        return true;
+    }
+    let window = &sniff[..sniff.len().min(1024)];
+    let lower: Vec<u8> = window.iter().map(|b| b.to_ascii_lowercase()).collect();
+    contains_bytes(&lower, b"<html") || contains_bytes(&lower, b"<!doctype html")
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Map a sniffed router route onto a media type for the log + blob extension.
+fn media_type(route: &Route) -> &'static str {
+    match route {
+        Route::Html => "text/html",
+        Route::Pdf => "application/pdf",
+        Route::Feed => "application/rss+xml",
+        Route::Json => "application/json",
+        Route::Xml => "application/xml",
+        Route::PlainText => "text/plain",
+        Route::Image => "image/unknown",
+        Route::Archive => "application/octet-stream",
+        Route::Other(_) => "application/octet-stream",
+    }
+}
+
+/// Blob file extension for a content type (`.bin` when unknown).
+fn ext_for(content_type: Option<&str>) -> &'static str {
+    match content_type.unwrap_or("") {
+        "application/pdf" => "pdf",
+        "text/html" => "html",
+        "application/json" => "json",
+        "application/xml" => "xml",
+        "application/rss+xml" | "application/atom+xml" => "xml",
+        "text/plain" => "txt",
+        "image/unknown" => "img",
+        _ => "bin",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 (self-contained: the agent0 crate does not depend on `sha2`)
+// ---------------------------------------------------------------------------
+
+const K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K256[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_empty_and_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn extension_mapping() {
+        assert_eq!(ext_for(Some("application/pdf")), "pdf");
+        assert_eq!(ext_for(Some("text/html")), "html");
+        assert_eq!(ext_for(None), "bin");
+    }
+}

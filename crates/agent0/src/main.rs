@@ -43,11 +43,13 @@ async fn main() -> ExitCode {
             None => usage("agent0 search <query> [limit]"),
         },
         Some("serve") => run_serve().await,
+        Some("crawl") => search_agent0::crawl::run_crawl(&args).await,
         Some("refresh") => run_refresh().await,
         Some("export") => run_export(&args).await,
         Some("import") => run_import(&args).await,
         _ => usage(
             "agent0 <ingest <url> | search <query> [limit] | refresh | serve \
+             | crawl <seedsfile> [--max-docs N] [--concurrency C] [--out DIR] [--max-urls N] \
              | export <dir> [--limit N] [--raw] [--name NAME] | import <dir> [--limit N]>",
         ),
     }

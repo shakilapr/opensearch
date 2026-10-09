@@ -916,6 +916,23 @@ impl Pipeline {
             ),
         };
 
+        // A page that normalizes to no text is not a document: an empty body (a bot wall, a
+        // JS-only shell, a truncated transfer) must never enter the index. This mirrors both the
+        // PDF branch above and the import-time invariant `empty record text cannot be indexed`,
+        // and it keeps a 10K-document corpus from filling with zero-content rows.
+        if doc.text.trim().is_empty() {
+            self.observe_source(&host, true, true)?;
+            if let Some(l) = &lease {
+                let _ = self.frontier.complete(l, now);
+            }
+            return Ok(IngestOutcome::Routed {
+                url: canonical,
+                resource_id: resource_id.into_string(),
+                route: format!("{kind}-no-text"),
+                discovered: 0,
+            });
+        }
+
         self.commit_document(CommitDoc {
             canonical: &canonical,
             host: &host,
