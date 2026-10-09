@@ -8,7 +8,22 @@ export type SearchCategory = 'all' | 'space' | 'tech' | 'news' | 'images';
 
 export type TimeFilter = 'all' | '24h' | '7d' | '30d';
 
+/** Agentic engine execution mode sent with the request (`POST /search`). */
+export type EngineMode = 'fast' | 'auto' | 'deep';
+
 export type NodeStatusType = 'ONLINE' | 'STANDBY' | 'DEGRADED' | 'SIMULATION';
+
+/**
+ * Additive coverage report from the agentic engine (optional — absent on older
+ * servers). `supported`/`unsupported` are the predicate flag lists, `mandatoryOk`
+ * mirrors the server's `mandatory_ok`, and `coverage` is the covered fraction.
+ */
+export interface EngineCoverage {
+  readonly supported: readonly string[];
+  readonly unsupported: readonly string[];
+  readonly mandatoryOk: boolean;
+  readonly coverage: number | null;
+}
 
 export interface SearchSitelink {
   readonly title: string;
@@ -40,6 +55,13 @@ export interface SearchResult {
   readonly signals?: readonly SearchSignal[];
   /** True when the result came from the recent overlay window. */
   readonly liveOverlay?: boolean;
+  /**
+   * Per-lane rank from the agentic engine (optional): stable lowercase lane name
+   * -> 1-based rank, e.g. `{ bm25: 3, source_first: 12 }`.
+   */
+  readonly laneRanks?: Readonly<Record<string, number>>;
+  /** Evidence units that support this result (optional, `unit_support`). */
+  readonly unitSupport?: readonly string[];
   readonly aerospaceTelemetry?: {
     readonly mission: string;
     readonly orbitAltitudeKm?: number;

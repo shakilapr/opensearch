@@ -1,11 +1,14 @@
 /**
  * @file useSearchEngine.ts
- * @description Hook managing search execution pipeline, filters, history, and metrics.
- * Adheres to NASA JPL Rules of Ten with zero use of `any`.
+ * @description Hook managing the search execution pipeline, filters, history,
+ * metrics, engine mode, and error state. There is no fallback: a failed search
+ * surfaces a `SearchUnavailableError` for the UI to render. Zero use of `any`.
  */
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  EngineCoverage,
+  EngineMode,
   IsoQualityAudit,
   SearchCategory,
   SearchExecutionMetrics,
@@ -13,6 +16,8 @@ import {
   SearchResult,
   TimeFilter,
 } from '../domain/models';
+import { hexxicaClientInstance } from '../services/hexxicaClient';
+import { SearchUnavailableError } from '../services/searchErrors';
 import { searchEngineServiceInstance } from '../services/searchEngineService';
 
 const DEFAULT_AUDIT: IsoQualityAudit = {
@@ -22,7 +27,7 @@ const DEFAULT_AUDIT: IsoQualityAudit = {
   boundedLoopsEnforced: true,
   memoryCapBytes: 6400,
   assertionPassingRate: 100,
-  targetEndpoint: 'https://search.hexxica.space',
+  targetEndpoint: hexxicaClientInstance.getBaseUrl(),
 };
 
 export function useSearchEngine() {
@@ -46,6 +51,7 @@ export function useSearchEngine() {
   });
 
   const [timeFilter, setTimeFilter] = useState<TimeFilter>('all');
+  const [mode, setMode] = useState<EngineMode>('auto');
   const [page, setPage] = useState<number>(1);
   const [results, setResults] = useState<readonly SearchResult[]>([]);
   const [metrics, setMetrics] = useState<SearchExecutionMetrics | null>(null);
@@ -53,6 +59,12 @@ export function useSearchEngine() {
   const [audit, setAudit] = useState<IsoQualityAudit>(DEFAULT_AUDIT);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [history, setHistory] = useState<readonly SearchHistoryEntry[]>([]);
+  const [coverage, setCoverage] = useState<EngineCoverage | null>(null);
+  const [stopReason, setStopReason] = useState<string | null>(null);
+  const [trace, setTrace] = useState<readonly string[]>([]);
+  const [answer, setAnswer] = useState<string | null>(null);
+  const [engineActive, setEngineActive] = useState<boolean>(false);
+  const [searchError, setSearchError] = useState<SearchUnavailableError | null>(null);
 
   const syncUrlParams = useCallback((newQuery: string, newCategory: SearchCategory) => {
     const url = new URL(window.location.href);
@@ -75,6 +87,7 @@ export function useSearchEngine() {
       setQuery(cleanTarget);
       setHasSubmitted(cleanTarget.length > 0);
       setIsLoading(true);
+      setSearchError(null);
 
       try {
         const response = await searchEngineServiceInstance.executeSearch({
@@ -82,20 +95,40 @@ export function useSearchEngine() {
           category: targetCategory,
           timeFilter,
           page: targetPage,
+          mode,
         });
 
         setResults(response.results);
         setMetrics(response.metrics);
         setSuggestions(response.suggestions);
         setAudit(response.audit);
+        setCoverage(response.coverage);
+        setStopReason(response.stopReason);
+        setTrace(response.trace);
+        setAnswer(response.answer);
+        setEngineActive(response.engine);
         setHistory(searchEngineServiceInstance.getHistory());
         setPage(targetPage);
         syncUrlParams(cleanTarget, targetCategory);
+      } catch (err: unknown) {
+        // Honest failure state: clear any prior results, keep nothing synthetic.
+        setResults([]);
+        setMetrics(null);
+        setCoverage(null);
+        setStopReason(null);
+        setTrace([]);
+        setAnswer(null);
+        setEngineActive(false);
+        setSearchError(
+          err instanceof SearchUnavailableError
+            ? err
+            : new SearchUnavailableError(hexxicaClientInstance.getBaseUrl(), 'unreachable')
+        );
       } finally {
         setIsLoading(false);
       }
     },
-    [timeFilter, syncUrlParams]
+    [timeFilter, mode, syncUrlParams]
   );
 
   // Initial load if query in URL
@@ -108,8 +141,7 @@ export function useSearchEngine() {
   const handleQueryChange = (newQuery: string) => {
     setQuery(newQuery);
     if (newQuery.trim().length > 0) {
-      const computed = searchEngineServiceInstance.computeSuggestions(newQuery);
-      setSuggestions(computed);
+      setSuggestions(searchEngineServiceInstance.computeSuggestions(newQuery));
     } else {
       setSuggestions([]);
     }
@@ -120,9 +152,22 @@ export function useSearchEngine() {
     void triggerSearch(query, newCategory, 1);
   };
 
+  const handleModeChange = (newMode: EngineMode) => {
+    setMode(newMode);
+    if (hasSubmitted && query.trim().length > 0) {
+      void triggerSearch(query, category, 1);
+    }
+  };
+
   const handlePageChange = (newPage: number) => {
     void triggerSearch(query, category, newPage);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const retry = () => {
+    if (query.trim().length > 0) {
+      void triggerSearch(query, category, page);
+    }
   };
 
   const resetToHome = () => {
@@ -130,6 +175,7 @@ export function useSearchEngine() {
     setHasSubmitted(false);
     setResults([]);
     setSuggestions([]);
+    setSearchError(null);
     syncUrlParams('', 'all');
   };
 
@@ -137,6 +183,7 @@ export function useSearchEngine() {
     query,
     category,
     timeFilter,
+    mode,
     page,
     results,
     metrics,
@@ -145,11 +192,20 @@ export function useSearchEngine() {
     isLoading,
     history,
     hasSubmitted,
+    coverage,
+    stopReason,
+    trace,
+    answer,
+    engineActive,
+    searchError,
+    baseUrl: hexxicaClientInstance.getBaseUrl(),
     setQuery: handleQueryChange,
     setCategory: handleCategorySelect,
     setTimeFilter,
+    setMode: handleModeChange,
     triggerSearch,
     handlePageChange,
+    retry,
     resetToHome,
   };
 }

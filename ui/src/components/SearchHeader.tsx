@@ -6,9 +6,10 @@
  */
 
 import React, { useState } from 'react';
-import { NodeHealthTelemetry, SearchCategory, TimeFilter } from '../domain/models';
+import { EngineMode, NodeHealthTelemetry, SearchCategory, TimeFilter } from '../domain/models';
 import { HexxicaBrand } from './HexxicaBrand';
 import { MoonIcon, SunIcon } from './Icons';
+import { ModeSelector } from './ModeSelector';
 import { SearchInput } from './SearchInput';
 
 interface SearchHeaderProps {
@@ -18,6 +19,8 @@ interface SearchHeaderProps {
   readonly telemetry: NodeHealthTelemetry;
   readonly isDarkMode: boolean;
   readonly suggestions: readonly string[];
+  readonly mode: EngineMode;
+  readonly onModeChange: (mode: EngineMode) => void;
   readonly onQueryChange: (q: string) => void;
   readonly onSearch: (q: string) => void;
   readonly onSelectCategory: (c: SearchCategory) => void;
@@ -34,6 +37,8 @@ export const SearchHeader: React.FC<SearchHeaderProps> = ({
   telemetry,
   isDarkMode,
   suggestions,
+  mode,
+  onModeChange,
   onQueryChange,
   onSearch,
   onSelectCategory,
@@ -54,7 +59,7 @@ export const SearchHeader: React.FC<SearchHeaderProps> = ({
         <div className="hx-header-actions">
           <button type="button" onClick={onOpenTelemetry} className="hx-telemetry-pill" title={telemetry.diagnosticsMessage}>
             <span className={`hx-status-dot ${telemetry.status === 'ONLINE' ? 'hx-dot-green' : 'hx-dot-amber'}`} />
-            <span>{telemetry.status === 'ONLINE' ? 'Online' : 'Simulation'}</span>
+            <span>{telemetry.status === 'ONLINE' ? 'Online' : 'Offline'}</span>
             <span className="hx-latency-tag">{telemetry.latencyMs}ms</span>
           </button>
           <button type="button" onClick={onToggleTheme} className="hx-theme-btn" aria-label="Toggle visual theme">
@@ -82,6 +87,7 @@ export const SearchHeader: React.FC<SearchHeaderProps> = ({
               <option value="7d">Past week</option>
               <option value="30d">Past month</option>
             </select>
+            <ModeSelector mode={mode} onModeChange={onModeChange} />
           </div>
         )}
       </nav>

@@ -6,9 +6,10 @@
  */
 
 import React from 'react';
-import { NodeHealthTelemetry } from '../domain/models';
+import { EngineMode, NodeHealthTelemetry } from '../domain/models';
 import { HexxicaBrand } from './HexxicaBrand';
 import { MoonIcon, SunIcon } from './Icons';
+import { ModeSelector } from './ModeSelector';
 import { SearchInput } from './SearchInput';
 
 interface SearchHomeProps {
@@ -16,6 +17,8 @@ interface SearchHomeProps {
   readonly suggestions: readonly string[];
   readonly telemetry: NodeHealthTelemetry;
   readonly isDarkMode: boolean;
+  readonly mode: EngineMode;
+  readonly onModeChange: (mode: EngineMode) => void;
   readonly onQueryChange: (q: string) => void;
   readonly onSearch: (q: string) => void;
   readonly onOpenTelemetry: () => void;
@@ -27,6 +30,8 @@ export const SearchHome: React.FC<SearchHomeProps> = ({
   suggestions,
   telemetry,
   isDarkMode,
+  mode,
+  onModeChange,
   onQueryChange,
   onSearch,
   onOpenTelemetry,
@@ -38,7 +43,7 @@ export const SearchHome: React.FC<SearchHomeProps> = ({
         <a href="https://code.hexxica.space" target="_blank" rel="noopener noreferrer" className="hx-nav-link">VS Code</a>
         <button type="button" onClick={onOpenTelemetry} className="hx-telemetry-pill">
           <span className={`hx-status-dot ${telemetry.status === 'ONLINE' ? 'hx-dot-green' : 'hx-dot-amber'}`} />
-          <span>{telemetry.status === 'ONLINE' ? 'Online' : 'Simulation'}</span>
+          <span>{telemetry.status === 'ONLINE' ? 'Online' : 'Offline'}</span>
           <span className="hx-latency-tag">{telemetry.latencyMs}ms</span>
         </button>
         <button type="button" onClick={onToggleTheme} className="hx-theme-btn" aria-label="Toggle visual theme">
@@ -53,6 +58,8 @@ export const SearchHome: React.FC<SearchHomeProps> = ({
           <SearchInput query={query} suggestions={suggestions} autoFocus onQueryChange={onQueryChange} onSubmit={onSearch} />
         </div>
 
+        <ModeSelector mode={mode} onModeChange={onModeChange} />
+
         <div className="hx-quick-chips">
           <button type="button" onClick={() => onSearch('NASA JPL')} className="hx-chip">NASA JPL</button>
           <button type="button" onClick={() => onSearch('Deep Space Network')} className="hx-chip">Deep Space Network</button>
@@ -62,7 +69,7 @@ export const SearchHome: React.FC<SearchHomeProps> = ({
       </main>
 
       <footer className="hx-home-footer">
-        <span>Node: {telemetry.endpoint} • TLS 1.3 Active</span>
+        <span>Node: {telemetry.endpoint}</span>
         <span>•</span>
         <button type="button" onClick={onOpenTelemetry} className="hx-footer-link-btn">NASA JPL &amp; ISO 25010 Verified</button>
       </footer>

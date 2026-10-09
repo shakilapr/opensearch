@@ -1,11 +1,13 @@
 /**
  * @file hexxicaClient.test.ts
- * @description Unit tests for the real HTTP client's SearchResponse mapping.
+ * @description Unit tests for the real HTTP client: request shape, SearchResponse
+ * mapping, engine-field mapping, and the absence of any fabricated fallback.
  * Zero use of `any`.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { HexxicaClient, mapSearchResponse } from './hexxicaClient';
+import { HexxicaClient, mapSearchResponse, mapSearchResponseData } from './hexxicaClient';
+import { SearchUnavailableError } from './searchErrors';
 
 function responseOf(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -18,8 +20,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('HexxicaClient.executeRemoteQuery mapping', () => {
-  it('POSTs to /search and maps the SearchResponse into UI models', async () => {
+describe('HexxicaClient.executeRemoteQuery', () => {
+  it('POSTs to /search with engine:true and mode, and maps results', async () => {
     const client = new HexxicaClient('http://api.test');
     const payload = {
       results: [
@@ -60,9 +62,8 @@ describe('HexxicaClient.executeRemoteQuery mapping', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const out = await client.executeRemoteQuery('rust');
-    expect(out).not.toBeNull();
-    const results = out ?? [];
+    const out = await client.executeRemoteQuery('rust', 'deep');
+    const results = out.results;
     expect(results).toHaveLength(2);
 
     const r1 = results[0];
@@ -82,30 +83,128 @@ describe('HexxicaClient.executeRemoteQuery mapping', () => {
     expect(r2.score).toBeCloseTo(0.5, 5);
     expect(r2.signals).toEqual([]);
 
-    // The request is a JSON POST to <base>/search.
+    // The request is a JSON POST carrying engine + mode.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(capturedUrl).toBe('http://api.test/search');
     expect(capturedInit?.method).toBe('POST');
-    expect(capturedInit?.body).toBe(JSON.stringify({ query: 'rust' }));
+    expect(capturedInit?.body).toBe(JSON.stringify({ query: 'rust', engine: true, mode: 'deep' }));
   });
 
-  it('returns null on a non-OK response so the caller can fall back', async () => {
+  it('maps lane_ranks, unit_support and the engine envelope', async () => {
+    const client = new HexxicaClient('http://api.test');
+    const payload = {
+      engine: true,
+      coverage: { supported: ['time', 'source'], mandatory_ok: true, coverage: 0.7 },
+      stop_reason: 'budget',
+      trace: ['lane:bm25', 'lane:source_first'],
+      answer: 'A short generated answer.',
+      results: [
+        {
+          doc_id: 'd1',
+          title: 'Result with provenance',
+          canonical_url: 'https://ex.test/a',
+          snippet: 's',
+          score: 3,
+          lane_ranks: { bm25: 3, source_first: 12 },
+          unit_support: ['u-1', 'u-2'],
+        },
+      ],
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => responseOf(payload)));
+
+    const out = await client.executeRemoteQuery('q');
+    expect(out.engine).toBe(true);
+    expect(out.coverage).toEqual({
+      supported: ['time', 'source'],
+      unsupported: [],
+      mandatoryOk: true,
+      coverage: 0.7,
+    });
+    expect(out.stopReason).toBe('budget');
+    expect(out.trace).toEqual(['lane:bm25', 'lane:source_first']);
+    expect(out.answer).toBe('A short generated answer.');
+    expect(out.results[0].laneRanks).toEqual({ bm25: 3, source_first: 12 });
+    expect(out.results[0].unitSupport).toEqual(['u-1', 'u-2']);
+  });
+
+  it('reads the coverage unsupported-flag shape returned by the engine route', async () => {
+    const client = new HexxicaClient('http://api.test');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        responseOf({
+          engine: true,
+          coverage: { coverage: 0.55, mandatory_ok: false, unsupported: ['date'] },
+          results: [],
+        })
+      )
+    );
+    const out = await client.executeRemoteQuery('q');
+    expect(out.coverage).toEqual({
+      supported: [],
+      unsupported: ['date'],
+      mandatoryOk: false,
+      coverage: 0.55,
+    });
+  });
+
+  it('defaults engine fields when the server omits them (older server)', async () => {
+    const client = new HexxicaClient('http://api.test');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        responseOf({ results: [{ doc_id: 'd1', title: 't', canonical_url: 'https://a.test', snippet: '', score: 1 }] })
+      )
+    );
+    const out = await client.executeRemoteQuery('q');
+    expect(out.engine).toBe(false);
+    expect(out.coverage).toBeNull();
+    expect(out.stopReason).toBeNull();
+    expect(out.trace).toEqual([]);
+    expect(out.answer).toBeNull();
+    expect(out.results[0].laneRanks).toBeUndefined();
+    expect(out.results[0].unitSupport).toBeUndefined();
+  });
+
+  it('throws SearchUnavailableError on a non-OK response (no silent fallback)', async () => {
     const client = new HexxicaClient('http://api.test');
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })));
-    await expect(client.executeRemoteQuery('rust')).resolves.toBeNull();
+    await expect(client.executeRemoteQuery('rust')).rejects.toBeInstanceOf(SearchUnavailableError);
+    await client.executeRemoteQuery('rust').catch((e: unknown) => {
+      expect(e).toBeInstanceOf(SearchUnavailableError);
+      if (e instanceof SearchUnavailableError) {
+        expect(e.reason).toBe('http_error');
+        expect(e.httpStatusCode).toBe(500);
+        expect(e.baseUrl).toBe('http://api.test');
+      }
+    });
   });
 
-  it('returns null on a malformed payload', async () => {
+  it('throws SearchUnavailableError on a transport failure', async () => {
+    const client = new HexxicaClient('http://api.test');
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('connection refused');
+    }));
+    await client.executeRemoteQuery('rust').catch((e: unknown) => {
+      expect(e).toBeInstanceOf(SearchUnavailableError);
+      if (e instanceof SearchUnavailableError) {
+        expect(e.reason).toBe('unreachable');
+      }
+    });
+  });
+
+  it('throws SearchUnavailableError on a malformed payload', async () => {
     const client = new HexxicaClient('http://api.test');
     vi.stubGlobal('fetch', vi.fn(async () => responseOf({ not_results: [] })));
-    await expect(client.executeRemoteQuery('rust')).resolves.toBeNull();
+    await expect(client.executeRemoteQuery('rust')).rejects.toBeInstanceOf(SearchUnavailableError);
   });
 
   it('short-circuits an empty query without calling the network', async () => {
     const client = new HexxicaClient('http://api.test');
     const fetchMock = vi.fn(async () => responseOf({ results: [] }));
     vi.stubGlobal('fetch', fetchMock);
-    await expect(client.executeRemoteQuery('   ')).resolves.toEqual([]);
+    const out = await client.executeRemoteQuery('   ');
+    expect(out.results).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -132,5 +231,19 @@ describe('mapSearchResponse', () => {
       ],
     });
     expect(mapped?.map((r) => r.id)).toEqual(['good']);
+  });
+});
+
+describe('mapSearchResponseData', () => {
+  it('returns null for a malformed payload', () => {
+    expect(mapSearchResponseData(null)).toBeNull();
+    expect(mapSearchResponseData({ nope: true })).toBeNull();
+  });
+
+  it('maps an empty result set honestly', () => {
+    const out = mapSearchResponseData({ results: [] });
+    expect(out?.results).toEqual([]);
+    expect(out?.answer).toBeNull();
+    expect(out?.coverage).toBeNull();
   });
 });

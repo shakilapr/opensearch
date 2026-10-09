@@ -6,12 +6,11 @@
  */
 
 import React, { useState } from 'react';
-import { ImageResultGrid } from './components/ImageResultGrid';
 import { SearchFooter } from './components/SearchFooter';
 import { SearchHeader } from './components/SearchHeader';
 import { SearchHome } from './components/SearchHome';
-import { SearchItem } from './components/SearchItem';
 import { SearchPagination } from './components/SearchPagination';
+import { SearchResultsView } from './components/SearchResultsView';
 import { TelemetryModal } from './components/TelemetryModal';
 import { useHexxicaTelemetry } from './hooks/useHexxicaTelemetry';
 import { useSearchEngine } from './hooks/useSearchEngine';
@@ -25,6 +24,7 @@ export const App: React.FC = () => {
     query,
     category,
     timeFilter,
+    mode,
     page,
     results,
     metrics,
@@ -32,11 +32,19 @@ export const App: React.FC = () => {
     audit,
     isLoading,
     hasSubmitted,
+    coverage,
+    stopReason,
+    answer,
+    engineActive,
+    searchError,
+    baseUrl,
     setQuery,
     setCategory,
     setTimeFilter,
+    setMode,
     triggerSearch,
     handlePageChange,
+    retry,
     resetToHome,
   } = useSearchEngine();
 
@@ -49,6 +57,7 @@ export const App: React.FC = () => {
   };
 
   const isHome = !hasSubmitted;
+  const showPagination = !isLoading && searchError === null && results.length > 0;
 
   return (
     <div className="hx-app" data-theme={isDarkMode ? 'dark' : 'light'}>
@@ -58,6 +67,8 @@ export const App: React.FC = () => {
           suggestions={suggestions}
           telemetry={telemetry}
           isDarkMode={isDarkMode}
+          mode={mode}
+          onModeChange={setMode}
           onQueryChange={setQuery}
           onSearch={(q) => void triggerSearch(q, category, 1)}
           onOpenTelemetry={() => setIsTelemetryOpen(true)}
@@ -72,6 +83,8 @@ export const App: React.FC = () => {
             telemetry={telemetry}
             isDarkMode={isDarkMode}
             suggestions={suggestions}
+            mode={mode}
+            onModeChange={setMode}
             onQueryChange={setQuery}
             onSearch={(q) => void triggerSearch(q, category, 1)}
             onSelectCategory={setCategory}
@@ -84,30 +97,32 @@ export const App: React.FC = () => {
           <main className="hx-results-layout">
             <section className="hx-results-stream">
               <div className="hx-stats-bar">
-                {metrics?.totalMatches ?? results.length} results ({metrics?.executionTimeMs ?? 24}ms) • Node: {telemetry.endpoint}
+                {metrics !== null
+                  ? `${metrics.totalMatches} results (${metrics.executionTimeMs}ms) • Node: ${baseUrl}`
+                  : `Node: ${baseUrl}`}
               </div>
 
-              {isLoading ? (
-                <div className="empty-state-container">
-                  <p>Searching index...</p>
-                </div>
-              ) : category === 'images' ? (
-                <ImageResultGrid results={results} />
-              ) : (
-                <>
-                  <div className="hx-results-list">
-                    {results.map((item) => (
-                      <SearchItem key={item.id} result={item} query={query} />
-                    ))}
-                  </div>
+              <SearchResultsView
+                results={results}
+                isLoading={isLoading}
+                category={category}
+                query={query}
+                searchError={searchError}
+                baseUrl={baseUrl}
+                engine={engineActive}
+                coverage={coverage}
+                stopReason={stopReason}
+                answer={answer}
+                onRetry={retry}
+              />
 
-                  <SearchPagination
-                    currentPage={page}
-                    totalMatches={metrics?.totalMatches ?? results.length}
-                    pageSize={metrics?.pageSize ?? 6}
-                    onPageChange={handlePageChange}
-                  />
-                </>
+              {showPagination && (
+                <SearchPagination
+                  currentPage={page}
+                  totalMatches={metrics?.totalMatches ?? results.length}
+                  pageSize={metrics?.pageSize ?? 6}
+                  onPageChange={handlePageChange}
+                />
               )}
             </section>
           </main>

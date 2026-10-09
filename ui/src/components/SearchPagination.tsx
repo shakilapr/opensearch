@@ -20,8 +20,13 @@ export const SearchPagination: React.FC<SearchPaginationProps> = ({
   pageSize,
   onPageChange,
 }) => {
-  const calculatedPages = Math.ceil(Math.max(totalMatches, pageSize * 3) / pageSize);
-  const maxPages = Math.min(6, Math.max(2, calculatedPages));
+  // Pages derived strictly from the real result count — never invented.
+  const calculatedPages = Math.ceil(Math.max(totalMatches, 0) / pageSize);
+  const maxPages = Math.min(10, Math.max(1, calculatedPages));
+
+  if (maxPages <= 1) {
+    return null;
+  }
 
   const pages: number[] = [];
   for (let p = 1; p <= maxPages; p += 1) {

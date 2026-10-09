@@ -671,3 +671,186 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Engine mode selector */
+.hx-mode-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin: 0.75rem 0;
+}
+
+.hx-mode-label {
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+  margin-right: 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.hx-mode-btn {
+  background: var(--hx-bg-surface);
+  border: 1px solid var(--hx-border);
+  color: var(--hx-text-muted);
+  border-radius: 4px;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  cursor: pointer;
+}
+
+.hx-mode-btn:hover {
+  color: var(--hx-text-bright);
+}
+
+.hx-mode-active {
+  border-color: var(--hx-accent);
+  color: var(--hx-accent);
+}
+
+/* Engine coverage / stop-reason strip */
+.hx-engine-strip {
+  font-family: var(--hx-mono);
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+  border: 1px solid var(--hx-border);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 1.25rem;
+}
+
+/* Generated answer panel */
+.hx-answer-panel {
+  border: 1px solid var(--hx-border);
+  border-left: 3px solid var(--hx-accent);
+  border-radius: 4px;
+  padding: 0.85rem 1rem;
+  margin-bottom: 1.5rem;
+  background: var(--hx-bg-surface);
+}
+
+.hx-answer-header {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hx-text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.hx-answer-body {
+  font-size: 0.9rem;
+  color: var(--hx-text-bright);
+  line-height: 1.55;
+}
+
+.hx-answer-disclaimer {
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+  margin-top: 0.5rem;
+  font-style: italic;
+}
+
+/* Honest error / empty states */
+.hx-error-state {
+  border: 1px solid var(--hx-border);
+  border-left: 3px solid #d97706;
+  border-radius: 4px;
+  padding: 1rem 1.15rem;
+}
+
+.hx-error-title {
+  font-size: 1rem;
+  color: var(--hx-text-bright);
+  margin-bottom: 0.5rem;
+}
+
+.hx-error-message {
+  font-size: 0.88rem;
+  color: var(--hx-text-bright);
+}
+
+.hx-error-detail {
+  font-size: 0.82rem;
+  color: var(--hx-text-muted);
+  margin-top: 0.25rem;
+}
+
+.hx-error-hint {
+  font-size: 0.8rem;
+  color: var(--hx-text-muted);
+  margin-top: 0.6rem;
+  line-height: 1.5;
+}
+
+.hx-error-retry {
+  margin-top: 0.85rem;
+  background: var(--hx-bg-surface);
+  border: 1px solid var(--hx-accent);
+  color: var(--hx-accent);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+}
+
+.empty-state-container {
+  padding: 1.5rem 0;
+  color: var(--hx-text-muted);
+  font-size: 0.9rem;
+}
+
+/* Result provenance: lane ranks + unit support */
+.hx-lane-ranks,
+.hx-unit-support-list {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.35rem 0;
+  padding: 0;
+}
+
+.hx-lane-rank-item,
+.hx-unit-support-item {
+  font-family: var(--hx-mono);
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+  border: 1px solid var(--hx-border);
+  border-radius: 3px;
+  padding: 0.1rem 0.4rem;
+}
+
+.hx-unit-support-label {
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.hx-signals {
+  margin-top: 0.5rem;
+}
+
+.hx-signals-summary {
+  font-size: 0.78rem;
+  color: var(--hx-text-muted);
+  cursor: pointer;
+}
+
+.hx-signals-list {
+  list-style: none;
+  margin: 0.35rem 0;
+  padding: 0;
+}
+
+.hx-signal-item {
+  display: flex;
+  gap: 0.6rem;
+  font-family: var(--hx-mono);
+  font-size: 0.72rem;
+  color: var(--hx-text-muted);
+}
+
+.hx-signal-name {
+  color: var(--hx-text-bright);
+  min-width: 7rem;
+}

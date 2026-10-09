@@ -2,6 +2,7 @@
  * @file SearchItem.tsx
  * @description Pure Search Result Item adhering to NASA JPL Rule 4 (< 60 LOC).
  * Clean typographic layout with zero card frames, zero emojis, and pure SVG iconography.
+ * Surfaces per-signal, per-lane (lane_ranks) and unit_support provenance.
  * Zero use of `any`.
  */
 
@@ -30,9 +31,21 @@ const SignalRow: React.FC<{ readonly signal: SearchSignal }> = ({ signal }) => (
   </li>
 );
 
+/** `{ bm25: 3 }` -> `bm25 #3` rows, sorted by lane name for stable output. */
+function laneRankEntries(ranks: Readonly<Record<string, number>>): readonly string[] {
+  return Object.keys(ranks)
+    .sort()
+    .map((lane) => `${lane} #${ranks[lane]}`)
+    .filter((entry) => !entry.endsWith('#undefined'));
+}
+
 export const SearchItem: React.FC<SearchItemProps> = ({ result, query }) => {
   const fragments = highlightKeywords(result.snippet, query);
   const signals = result.signals ?? [];
+  const laneRanks = result.laneRanks ?? {};
+  const lanes = laneRankEntries(laneRanks);
+  const unitSupport = result.unitSupport ?? [];
+  const hasProvenance = signals.length > 0 || lanes.length > 0 || unitSupport.length > 0;
 
   return (
     <article className="hx-result-row">
@@ -78,14 +91,36 @@ export const SearchItem: React.FC<SearchItemProps> = ({ result, query }) => {
         </div>
       )}
 
-      {signals.length > 0 && (
+      {hasProvenance && (
         <details className="hx-signals">
           <summary className="hx-signals-summary">Why this result?</summary>
-          <ul className="hx-signals-list" aria-label="Ranking signals">
-            {signals.map((signal) => (
-              <SignalRow key={signal.name} signal={signal} />
-            ))}
-          </ul>
+
+          {lanes.length > 0 && (
+            <ul className="hx-lane-ranks" aria-label="Lane ranks">
+              {lanes.map((lane) => (
+                <li key={lane} className="hx-lane-rank-item">{lane}</li>
+              ))}
+            </ul>
+          )}
+
+          {signals.length > 0 && (
+            <ul className="hx-signals-list" aria-label="Ranking signals">
+              {signals.map((signal) => (
+                <SignalRow key={signal.name} signal={signal} />
+              ))}
+            </ul>
+          )}
+
+          {unitSupport.length > 0 && (
+            <div className="hx-unit-support">
+              <span className="hx-unit-support-label">Unit support</span>
+              <ul className="hx-unit-support-list" aria-label="Supporting evidence units">
+                {unitSupport.map((unit) => (
+                  <li key={unit} className="hx-unit-support-item">{unit}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </details>
       )}
     </article>

@@ -10,12 +10,12 @@ import { hexxicaClientInstance } from '../services/hexxicaClient';
 
 const INITIAL_TELEMETRY: NodeHealthTelemetry = {
   endpoint: hexxicaClientInstance.getBaseUrl(),
-  status: 'ONLINE',
-  latencyMs: 38,
+  status: 'STANDBY',
+  latencyMs: 0,
   lastCheckedIso: new Date().toISOString(),
-  httpStatusCode: 200,
-  isSslActive: true,
-  diagnosticsMessage: 'Connected to search.hexxica.space relay node. Channel lock verified.',
+  httpStatusCode: 0,
+  isSslActive: hexxicaClientInstance.getBaseUrl().startsWith('https://'),
+  diagnosticsMessage: 'Probing the local search API...',
 };
 
 export function useHexxicaTelemetry() {
