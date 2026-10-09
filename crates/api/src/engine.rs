@@ -230,6 +230,66 @@ impl<S: Searcher + ?Sized> LaneSearcher for SearcherLane<'_, S> {
 }
 
 // ---------------------------------------------------------------------------
+// Passage text for the answerer
+// ---------------------------------------------------------------------------
+
+/// Wraps the injected [`Answerer`] so it receives real passage **text**.
+///
+/// The engine is hermetic: it knows a result only by `doc_id`, so the `passages`
+/// it hands the answerer are document ids, and an LLM given ids alone cannot
+/// ground anything (a live run answered "the evidence contains no content—only
+/// passage identifiers"). The lanes, however, retain the full `IndexHit` — title
+/// and snippet — for exactly those ids. This adapter resolves each id to
+/// "<title>. <snippet>" at answer time, which happens after the lanes have run.
+///
+/// A document whose retained hit carries no text resolves to its id, so the
+/// answerer sees a missing passage rather than invented content.
+pub struct SnippetAnswerer<'a, A: Answerer + ?Sized> {
+    inner: &'a A,
+    retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
+}
+
+impl<'a, A: Answerer + ?Sized> SnippetAnswerer<'a, A> {
+    /// Wrap `inner`, resolving passages against the lanes' retained hit maps.
+    pub fn new(inner: &'a A, retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>) -> Self {
+        Self { inner, retained }
+    }
+
+    /// The passage text for one doc id: title + snippet from the first retained
+    /// map that knows the id, or the id itself when no text was retained.
+    fn passage(&self, doc_id: &str) -> String {
+        for map in &self.retained {
+            let Ok(guard) = map.lock() else { continue };
+            let Some(hit) = guard.get(doc_id) else { continue };
+            let mut text = String::with_capacity(hit.title.len() + hit.snippet.len() + 2);
+            if !hit.title.trim().is_empty() {
+                text.push_str(hit.title.trim());
+                text.push_str(". ");
+            }
+            if !hit.snippet.trim().is_empty() {
+                text.push_str(hit.snippet.trim());
+            }
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+        doc_id.to_string()
+    }
+}
+
+impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
+    fn answer(
+        &self,
+        query: &str,
+        evidence: &[search_engine::evidence::EvidenceRecord],
+        passages: &[String],
+    ) -> Result<String, String> {
+        let resolved: Vec<String> = passages.iter().map(|id| self.passage(id)).collect();
+        self.inner.answer(query, evidence, &resolved)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
 
@@ -294,10 +354,17 @@ pub fn run_engine_search(
         tz_offset_min: 0,
     };
 
+    // Passage-text adapter: see [`SnippetAnswerer`]. Built from the same shared
+    // maps the lanes populate, so it is read only after they have run.
+    let retained_maps = vec![Arc::clone(&retained_bm25), Arc::clone(&retained_source)];
+    let wrapped = answerer.map(|a| SnippetAnswerer::new(a, retained_maps));
+
     let deps = Deps {
         lanes: &lanes,
         selector: &selector,
-        answerer,
+        // The engine hands the answerer doc ids (§ hermetic); resolve them to
+        // real title+snippet text from the hits the lanes just retained.
+        answerer: wrapped.as_ref().map(|w| w as &dyn Answerer),
         aliases: &aliases,
         stats,
         now: now_ms,

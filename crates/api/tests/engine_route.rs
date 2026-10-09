@@ -111,6 +111,20 @@ impl Answerer for StubAnswerer {
     }
 }
 
+/// Answerer stub that hands back the first passage verbatim, so a test can
+/// assert what text the API actually resolved for the engine's doc ids.
+struct FirstPassageAnswerer;
+impl Answerer for FirstPassageAnswerer {
+    fn answer(
+        &self,
+        _query: &str,
+        _evidence: &[search_engine::EvidenceRecord],
+        passages: &[String],
+    ) -> Result<String, String> {
+        Ok(passages.first().cloned().unwrap_or_default())
+    }
+}
+
 // --- harness -------------------------------------------------------------
 
 async fn boot(state: AppState) -> std::net::SocketAddr {
@@ -284,6 +298,40 @@ async fn answerer_text_appears_and_results_unchanged() {
             .collect()
     };
     assert_eq!(ids(&with), ids(&without), "answerer must not change results");
+}
+
+#[tokio::test]
+async fn answerer_receives_resolved_passage_text_not_doc_ids() {
+    // Regression: the engine passes doc ids as "passages"; the API must resolve
+    // them to real title+snippet text before the answerer sees them, otherwise an
+    // LLM gets identifiers it cannot ground an answer in.
+    let addr = boot(
+        AppState::new(Arc::new(StubSearcher::new(3)))
+            .with_answerer(Arc::new(FirstPassageAnswerer)),
+    )
+    .await;
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","engine":true,"mode":"fast","limit":3}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let answer = b["answer"].as_str().unwrap_or_default();
+    assert!(
+        !answer.is_empty(),
+        "answerer saw no passages at all: {b}"
+    );
+    assert!(
+        !answer.starts_with("doc-"),
+        "passage is still a bare doc id: {answer}"
+    );
+    // The stub corpus titles/snippets are "rust doc {i}" / "snippet about rust number {i}".
+    assert!(
+        answer.contains("rust doc") && answer.contains("snippet about rust"),
+        "passage text was not resolved from the retained hits: {answer}"
+    );
 }
 
 #[tokio::test]
