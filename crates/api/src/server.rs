@@ -36,8 +36,8 @@ pub struct Inner {
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     /// Optional §22.1 answer generator; `None` keeps the engine lexical-only.
     answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
-    /// Extra retrieval lanes fused into every engine query (today: the dense lane). Built by
-    /// the binary, which owns the feature and environment decisions.
+    /// Extra retrieval lanes fused into every engine query (today: the dense lane and the §9.4
+    /// entity-graph lane). Built by the binary, which owns the feature and environment decisions.
     extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
     started: Instant,
 }

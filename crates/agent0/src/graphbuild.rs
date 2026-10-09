@@ -253,6 +253,34 @@ pub async fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // The sidecar carries the join the meta store cannot: which documents mention each entity
+    // (computed above to decide which entities recur, then otherwise discarded), plus the edges.
+    // Written last, so a query-time lane never reads a mapping the graph rows do not have.
+    let sidecar = search_graph::sidecar::GraphSidecar {
+        entities: entities
+            .iter()
+            .map(|(key, agg)| search_graph::sidecar::SidecarEntity {
+                entity_id: entity_id(key),
+                name: agg.name.clone(),
+                aliases: agg.aliases.iter().cloned().collect(),
+                docs: agg.docs.iter().cloned().collect(),
+            })
+            .collect(),
+        edges: edges
+            .iter()
+            .map(|((a, b), docs)| search_graph::sidecar::SidecarEdge {
+                from: entity_id(a),
+                to: entity_id(b),
+                weight: docs.len() as f32,
+            })
+            .collect(),
+    };
+    let sidecar_path = cfg.graph_sidecar();
+    if let Err(e) = search_graph::sidecar::write(&sidecar_path, &sidecar) {
+        eprintln!("failed to write the graph sidecar to {}: {e}", sidecar_path.display());
+        return ExitCode::from(1);
+    }
+
     println!("graph build: {} document(s) scanned{}", scanned, if opts.reset { " (graph reset first)" } else { "" });
     println!(
         "  entities: {written_entities} (aliases {written_aliases}); dropped as too rare: kept threshold --min-docs {}",
@@ -260,6 +288,12 @@ pub async fn run(args: &[String]) -> ExitCode {
     );
     println!("  edges (cooccur, weight = document count): {written_edges}");
     println!("  works (doi/arxiv/pmid): {written_works}");
+    println!(
+        "  sidecar: {} ({} entities, {} edges) — the entity→document join the query lane reads",
+        sidecar_path.display(),
+        sidecar.entity_count(),
+        sidecar.edge_count()
+    );
     println!("  thresholds: --min-count {} --window {} --max-mentions {}", opts.min_count, opts.window, opts.max_mentions);
     ExitCode::SUCCESS
 }

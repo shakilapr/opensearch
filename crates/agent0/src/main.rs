@@ -104,6 +104,38 @@ fn build_dense_lane(
     }
 }
 
+/// Build the §9.4 graph lane over the sidecar `agent0 graph build` writes.
+///
+/// Absent sidecar = no lane (the graph has not been built): a normal state, logged at info. A
+/// present-but-unreadable sidecar is skipped with a warning rather than failing the server, because
+/// a serving API that refuses to start is worse than one without graph expansion.
+fn build_graph_lane(
+    cfg: &search_core::config::Config,
+) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
+    let path = cfg.graph_sidecar();
+    if !path.exists() {
+        tracing::info!(
+            path = %path.display(),
+            "no graph sidecar: the graph lane is off (build one with `agent0 graph build`)"
+        );
+        return Vec::new();
+    }
+    match search_api::graph_lane::GraphLaneSearcher::from_path(&path) {
+        Ok(lane) => {
+            tracing::info!(
+                path = %path.display(),
+                entities = lane.entity_count(),
+                "graph lane enabled"
+            );
+            vec![std::sync::Arc::new(lane)]
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "graph sidecar unusable: serving without the graph lane");
+            Vec::new()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Honour RUST_LOG (default `info`); without this the deploy unit's RUST_LOG
@@ -294,7 +326,8 @@ async fn run_serve() -> ExitCode {
         tracing::info!("{}", search_answer::disabled_reason().message());
     }
 
-    let extra_lanes = build_dense_lane(&cfg);
+    let mut extra_lanes = build_dense_lane(&cfg);
+    extra_lanes.extend(build_graph_lane(&cfg));
     if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, extra_lanes).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod activate;
 pub mod extract;
+pub mod sidecar;
 pub mod work;
 
 pub use extract::{

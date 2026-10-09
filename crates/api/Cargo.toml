@@ -18,6 +18,8 @@ real-indexer = ["dep:search-indexer"]
 search-core = { path = "../core" }
 search-engine = { path = "../engine" }
 search-retrieval = { path = "../retrieval" }
+# §9.4 graph lane: query-time activation over the entity graph.
+search-graph = { path = "../graph" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

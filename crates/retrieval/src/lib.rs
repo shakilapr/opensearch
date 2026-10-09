@@ -40,6 +40,9 @@ pub enum Lane {
     SourceFirst,
     /// Semantic lane over a document-vector store (plan §9.3).
     Dense,
+    /// Entity-graph lane: candidates reached by activating the entity graph around the entities a
+    /// query names (plan §9.4). Its hits are what the API reports as `graph_expansion`.
+    Graph,
 }
 
 /// A scored retrieval candidate carrying enough provenance for the UI's

@@ -44,6 +44,12 @@ impl Config {
     pub fn meta_db(&self) -> PathBuf {
         self.data_dir.join("meta").join("meta.sqlite")
     }
+    /// The graph sidecar: the entity→document mapping plus co-occurrence edges. Written by
+    /// `agent0 graph build`, read by the query-time graph lane. It is a sidecar because the index
+    /// schema is frozen and hash-asserted, so the join cannot live in the meta store.
+    pub fn graph_sidecar(&self) -> PathBuf {
+        self.data_dir.join("graph").join("entities.bin")
+    }
     pub fn tantivy_base(&self) -> PathBuf {
         self.data_dir.join("tantivy").join("base")
     }

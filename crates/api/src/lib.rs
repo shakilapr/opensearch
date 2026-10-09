@@ -8,6 +8,7 @@
 
 pub mod deep;
 pub mod engine;
+pub mod graph_lane;
 pub mod query;
 pub mod server;
 
