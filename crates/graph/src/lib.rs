@@ -19,8 +19,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+pub mod extract;
 pub mod work;
 
+pub use extract::{
+    canonical_key, cooccurrence_pairs, entity_id, extract_mentions, kind_for, Mention,
+    DEFAULT_COOC_WINDOW, MAX_PHRASE_WORDS,
+};
 pub use work::{detect_identifier, work_id_from_identifier, WorkIdKind};
 
 /// Maximum number of entities `expand` will return regardless of hops (cycle/blow-up guard).

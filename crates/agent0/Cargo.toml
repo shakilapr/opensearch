@@ -25,6 +25,8 @@ search-discovery = { path = "../discovery" }
 search-router = { path = "../router" }
 search-pdf = { path = "../pdf" }
 search-sources = { path = "../sources" }
+# Stage-1 entity/concept graph: extractor + WorkId resolution for `agent0 graph build`.
+search-graph = { path = "../graph" }
 search-retrieval = { path = "../retrieval" }
 # Stage-3 freshness scheduler wired into the crawl loop.
 search-scheduler = { path = "../scheduler" }

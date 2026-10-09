@@ -44,6 +44,13 @@ async fn main() -> ExitCode {
         },
         Some("serve") => run_serve().await,
         Some("crawl") => search_agent0::crawl::run_crawl(&args).await,
+        Some("graph") => match args.get(2).map(String::as_str) {
+            Some("build") => search_agent0::graphbuild::run(&args).await,
+            _ => {
+                eprintln!("usage: agent0 graph build [--limit N] [--min-count C] [--min-docs D] [--window W]");
+                ExitCode::from(2)
+            }
+        },
         Some("refresh") => run_refresh().await,
         Some("export") => run_export(&args).await,
         Some("import") => run_import(&args).await,
