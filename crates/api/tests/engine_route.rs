@@ -335,6 +335,45 @@ async fn answerer_receives_resolved_passage_text_not_doc_ids() {
 }
 
 #[tokio::test]
+async fn answerer_prefers_stored_document_text_over_the_fragment() {
+    // A searcher that can serve stored bodies must be preferred: the fragment is
+    // only a fallback. Proves the answer prompt carries real page content.
+    struct BodySearcher(StubSearcher);
+    impl Searcher for BodySearcher {
+        fn search(
+            &self,
+            q: &str,
+            limit: usize,
+            filters: Option<&SearchFilters>,
+        ) -> AppResult<Vec<IndexHit>> {
+            self.0.search(q, limit, filters)
+        }
+        fn doc_text(&self, _doc_id: &str) -> AppResult<Option<String>> {
+            Ok(Some("full stored body: transformers replaced recurrence in 2017".into()))
+        }
+    }
+
+    let addr = boot(
+        AppState::new(Arc::new(BodySearcher(StubSearcher::new(2))))
+            .with_answerer(Arc::new(FirstPassageAnswerer)),
+    )
+    .await;
+    let (s, b) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","engine":true,"mode":"fast","limit":2}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let answer = b["answer"].as_str().unwrap_or_default();
+    assert!(
+        answer.contains("full stored body"),
+        "stored body was not used as the passage: {answer}"
+    );
+}
+
+#[tokio::test]
 async fn limit_clamping_applies_on_engine_path() {
     let addr = simple_boot(150).await;
     // 500 is clamped to the 100 cap.

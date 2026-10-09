@@ -41,6 +41,10 @@ impl Searcher for IndexerSearcher {
         Ok(out)
     }
 
+    fn doc_text(&self, doc_id: &str) -> AppResult<Option<String>> {
+        self.indexer.doc_text(doc_id)
+    }
+
     fn manifest(&self) -> AppResult<IndexManifest> {
         // Read the published manifest through the indexer's own read-side API.
         // No file-path coupling: the persisted manifest location stays private

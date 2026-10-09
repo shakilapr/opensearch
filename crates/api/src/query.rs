@@ -251,6 +251,15 @@ pub trait Searcher: Send + Sync {
         filters: Option<&SearchFilters>,
     ) -> AppResult<Vec<IndexHit>>;
 
+    /// The stored text of one document, when this implementation can read it.
+    ///
+    /// Defaulted to `Ok(None)` so a stub searcher stays a stub: the engine is
+    /// hermetic and never calls this, but the answer path uses it to turn the
+    /// engine's doc ids into real content instead of a fragment.
+    fn doc_text(&self, _doc_id: &str) -> AppResult<Option<String>> {
+        Ok(None)
+    }
+
     /// The manifest describing the index snapshot these answers come from.
     ///
     /// Defaulted so a stub stays a stub; real implementations override this to

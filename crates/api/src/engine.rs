@@ -22,6 +22,7 @@ use search_core::{AppError, AppResult, QueryAnalysis, SearchFilters, SearchReque
 use search_engine::{
     AliasPriors, Answerer, Deps, IndexStats, Mode as EngineCoreMode, StopReason,
 };
+use search_engine::evidence::EvidenceVerifier;
 // `RuleSelector` ships in the crate's `coord` module but is not re-exported at
 // the crate root; reach it through its module path (the engine crate is frozen
 // and not owned here).
@@ -133,6 +134,7 @@ pub fn lane_name(lane: Lane) -> &'static str {
 /// Stable lowercase wire name for the engine's stop reason (§17).
 pub fn stop_reason_name(reason: StopReason) -> &'static str {
     match reason {
+        StopReason::LimitReached => "limit_reached",
         StopReason::Deadline => "deadline",
         StopReason::BudgetExhausted => "budget_exhausted",
         StopReason::SufficientCoverage => "sufficient_coverage",
@@ -238,26 +240,51 @@ impl<S: Searcher + ?Sized> LaneSearcher for SearcherLane<'_, S> {
 /// The engine is hermetic: it knows a result only by `doc_id`, so the `passages`
 /// it hands the answerer are document ids, and an LLM given ids alone cannot
 /// ground anything (a live run answered "the evidence contains no content—only
-/// passage identifiers"). The lanes, however, retain the full `IndexHit` — title
-/// and snippet — for exactly those ids. This adapter resolves each id to
-/// "<title>. <snippet>" at answer time, which happens after the lanes have run.
+/// passage identifiers").
 ///
-/// A document whose retained hit carries no text resolves to its id, so the
-/// answerer sees a missing passage rather than invented content.
+/// Resolution order per id:
+/// 1. the document's **stored body** via [`Searcher::doc_text`], truncated to
+///    [`MAX_PASSAGE_CHARS`] — the real content, so the answer is grounded in
+///    what the page says rather than in its header;
+/// 2. the lane-retained hit's `title. snippet` (a query-relevant fragment), when
+///    the index cannot serve the body;
+/// 3. the id itself, so a missing passage is visible as a missing passage and
+///    never invented.
 pub struct SnippetAnswerer<'a, A: Answerer + ?Sized> {
     inner: &'a A,
+    searcher: &'a dyn Searcher,
     retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
 }
 
+/// Characters kept from one document's stored body for the answer prompt
+/// (`search-answer` truncates again to its own per-passage cap).
+const MAX_PASSAGE_CHARS: usize = 1500;
+
 impl<'a, A: Answerer + ?Sized> SnippetAnswerer<'a, A> {
-    /// Wrap `inner`, resolving passages against the lanes' retained hit maps.
-    pub fn new(inner: &'a A, retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>) -> Self {
-        Self { inner, retained }
+    /// Wrap `inner`, resolving passages against the index and the lanes' hits.
+    pub fn new(
+        inner: &'a A,
+        searcher: &'a dyn Searcher,
+        retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
+    ) -> Self {
+        Self {
+            inner,
+            searcher,
+            retained,
+        }
     }
 
-    /// The passage text for one doc id: title + snippet from the first retained
-    /// map that knows the id, or the id itself when no text was retained.
+    /// The passage text for one doc id (see the type docs for the order).
     fn passage(&self, doc_id: &str) -> String {
+        if let Ok(Some(body)) = self.searcher.doc_text(doc_id) {
+            let trimmed = body.trim();
+            if !trimmed.is_empty() {
+                if trimmed.chars().count() <= MAX_PASSAGE_CHARS {
+                    return trimmed.to_string();
+                }
+                return trimmed.chars().take(MAX_PASSAGE_CHARS).collect();
+            }
+        }
         for map in &self.retained {
             let Ok(guard) = map.lock() else { continue };
             let Some(hit) = guard.get(doc_id) else { continue };
@@ -286,6 +313,74 @@ impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
     ) -> Result<String, String> {
         let resolved: Vec<String> = passages.iter().map(|id| self.passage(id)).collect();
         self.inner.answer(query, evidence, &resolved)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §16 evidence verification against real content
+// ---------------------------------------------------------------------------
+
+/// [`EvidenceVerifier`] over the retrieved documents' stored text.
+///
+/// The engine is hermetic and can only compare a unit against a document
+/// *title*, which is why a real query like "retrieval augmented generation"
+/// scored zero coverage against 115 matching documents. This implementation has
+/// the text the engine does not: it normalises both sides to alphanumeric
+/// tokens and requires every unit token to be present in the document's stored
+/// body (falling back to the lane-retained title+snippet when the index cannot
+/// serve the body).
+///
+/// Bounded per call: one stored-body read, then a token-set comparison.
+pub struct TextVerifier<'a> {
+    searcher: &'a dyn Searcher,
+    retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
+}
+
+impl<'a> TextVerifier<'a> {
+    /// A verifier reading `searcher`, with the lanes' retained hits as fallback.
+    pub fn new(searcher: &'a dyn Searcher, retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>) -> Self {
+        Self { searcher, retained }
+    }
+
+    /// The best text this layer can obtain for a document id.
+    fn text_of(&self, doc_id: &str) -> String {
+        if let Ok(Some(body)) = self.searcher.doc_text(doc_id) {
+            if !body.trim().is_empty() {
+                return body;
+            }
+        }
+        for map in &self.retained {
+            let Ok(guard) = map.lock() else { continue };
+            if let Some(hit) = guard.get(doc_id) {
+                return format!("{} {}", hit.title, hit.snippet);
+            }
+        }
+        String::new()
+    }
+}
+
+/// Lowercase alphanumeric tokens (the same normalisation the engine applies to
+/// titles, so a hyphenated "Retrieval-Augmented" matches "retrieval augmented").
+fn tokens(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+impl EvidenceVerifier for TextVerifier<'_> {
+    fn supports(&self, unit_text: &str, doc_id: &str) -> bool {
+        let unit = tokens(unit_text);
+        if unit.is_empty() {
+            return false;
+        }
+        let text = self.text_of(doc_id);
+        if text.trim().is_empty() {
+            return false;
+        }
+        let doc = tokens(&text);
+        unit.iter().all(|t| doc.contains(t))
     }
 }
 
@@ -357,11 +452,14 @@ pub fn run_engine_search(
     // Passage-text adapter: see [`SnippetAnswerer`]. Built from the same shared
     // maps the lanes populate, so it is read only after they have run.
     let retained_maps = vec![Arc::clone(&retained_bm25), Arc::clone(&retained_source)];
-    let wrapped = answerer.map(|a| SnippetAnswerer::new(a, retained_maps));
+    let wrapped = answerer.map(|a| SnippetAnswerer::new(a, searcher, retained_maps.clone()));
+    // §16: verify units against real document text, not just titles.
+    let verifier = TextVerifier::new(searcher, retained_maps);
 
     let deps = Deps {
         lanes: &lanes,
         selector: &selector,
+        verifier: Some(&verifier),
         // The engine hands the answerer doc ids (§ hermetic); resolve them to
         // real title+snippet text from the hits the lanes just retained.
         answerer: wrapped.as_ref().map(|w| w as &dyn Answerer),
