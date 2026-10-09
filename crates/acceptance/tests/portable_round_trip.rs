@@ -7,8 +7,7 @@
 mod common;
 
 use common::*;
-use search_agent0::pipeline::ImportRecord;
-use search_agent0::Pipeline;
+use search_agent0::{ImportRecord, Pipeline};
 
 #[tokio::test]
 async fn export_then_import_round_trips_a_real_page() {
