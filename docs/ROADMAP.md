@@ -27,16 +27,20 @@ been demonstrated at scale (there is no crawl corpus of 10K–1M documents in th
 
 These are real, current limitations — none is a hidden TODO:
 
-1. **No real semantic embedding weights.** BGE-small is not bundled and `feature = "bge"`
-   (`crates/embed`) is off; the dense lane uses the deterministic `HashEmbedder`, which is
-   a lexical bag-of-words model, **not a semantic embedding**. `benchmarks/results.json`
-   prints this as `UNAVAILABLE` rather than fabricating a dense gain.
+1. **The semantic embedder is opt-in, not the default.** Real BGE-small-en-v1.5 weights now
+   work (`feature = "bge"` in `crates/embed`, via `fastembed`; weights fetched on first use
+   into `<workspace>/models/fastembed`). The **default** build still uses the deterministic
+   `HashEmbedder`, which is a lexical bag-of-words model, **not a semantic one** — so the
+   default `benchmarks/results.json` still reports a lexical dense lane, honestly labelled.
+   Rebuild with `--features bge -- --embedder bge` to measure the semantic lane; on the
+   paraphrase query set it moves nDCG@10 0.4238 → 0.5842 (see `benchmarks/README.md`).
 2. **No real SPLADE weights.** `SparseExpander` (`crates/retrieval/src/sparse.rs`) is a
    deterministic co-occurrence expander built from a committed fixture — a stand-in for a
    learned sparse model, not one.
 3. **No trained cross-encoder.** `LexicalCrossEncoder` (deterministic lexical overlap) is
-   the proxy. On the smoke set it *hurts* nDCG (0.985 → 0.941); that is an honest finding
-   about the proxy, not a tuned result. See `benchmarks/README.md`.
+   the proxy. On the lexical smoke set it *hurts* nDCG (0.985 → 0.941) while on the
+   paraphrase set it helps (0.424 → 0.619); both are honest findings about the proxy, not a
+   tuned result. See `benchmarks/README.md`.
 4. **Single-box only.** One `agent0 serve` process owns the data root and the API. There is
    no scheduler cluster, no distributed index. `deploy/` ships two units that must **not**
    both bind `127.0.0.1:8080` on one host.
