@@ -224,6 +224,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         refresh_evidence(
             &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
         );
+        trace.push(evidence_line(&records));
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     } else {
         state.stop_reason = Some(StopReason::BudgetExhausted);
@@ -353,6 +354,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         refresh_evidence(
             &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
         );
+        trace.push(evidence_line(&records));
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     }
 
@@ -438,6 +440,24 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     }
 
     SearchResponse { results, coverage, stop_reason, trace, answer }
+}
+
+/// One trace line naming the document that satisfied each unit.
+///
+/// Coverage alone says *that* a unit was supported, not *by what*, which makes a
+/// coverage the caller disagrees with — e.g. `coverage=1.0` over a navigational page that
+/// merely contains the unit's tokens while the answer honestly refuses — impossible to
+/// diagnose from the response. The doc ids are already the engine's currency, so the
+/// supporting document costs nothing to expose.
+fn evidence_line(records: &[EvidenceRecord]) -> String {
+    if records.is_empty() {
+        return "evidence: no unit supported".to_string();
+    }
+    let pairs: Vec<String> = records
+        .iter()
+        .map(|r| format!("{}={} ({:?})", r.unit_id, r.doc_id, r.status))
+        .collect();
+    format!("evidence: {} supported unit(s) [{}]", records.len(), pairs.join(", "))
 }
 
 /// Deadline-only early stop. `Budget::should_stop` is consulted, but its `BudgetExhausted`

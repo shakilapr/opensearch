@@ -589,6 +589,44 @@ fn unit_is_never_marked_supported_on_speculation() {
     assert!(resp.results.iter().all(|r| r.unit_support.is_empty()));
 }
 
+/// The trace must name the document that satisfied each unit, not merely that coverage is
+/// positive: a caller that disagrees with a coverage verdict (a page that happens to contain
+/// the unit's tokens, say) needs to know which document to look at.
+#[test]
+fn trace_names_the_document_that_satisfied_a_unit() {
+    let mem = MemoryLaneSearcher::with_docs(vec![MemoryDoc::new("d1", "Cooking pasta tonight")
+        .with_body("quantum entanglement explained")]);
+    let searcher = Recorder::new(mem);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&searcher];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let verifier = SupportsDoc { doc_id: "d1".to_string() };
+    let d = deps_with_verifier(&lanes, &selector, &aliases, &verifier);
+
+    let resp = run_search(request("quantum entanglement", 5, Mode::Fast), &d);
+
+    assert!(resp.coverage.mandatory_ok, "{:?}", resp.coverage);
+    let line = resp
+        .trace
+        .iter()
+        .find(|l| l.starts_with("evidence:"))
+        .unwrap_or_else(|| panic!("the trace must record the evidence: {:?}", resp.trace));
+    assert!(
+        line.contains("U1=d1"),
+        "the supporting document must be named, got: {line}"
+    );
+
+    // And with no support at all, the line says so instead of staying silent.
+    let verifier = NeverSupports;
+    let d = deps_with_verifier(&lanes, &selector, &aliases, &verifier);
+    let resp = run_search(request("quantum entanglement", 5, Mode::Fast), &d);
+    assert!(
+        resp.trace.iter().any(|l| l == "evidence: no unit supported"),
+        "an unsupported unit must be reported as such: {:?}",
+        resp.trace
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // §17 stop-reason reporting: deadline > limit-reached > sufficient-coverage > budget.
 // ---------------------------------------------------------------------------------------------
