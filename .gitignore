@@ -126,6 +126,7 @@ pnpm-debug.log*
 
 # Rust
 target/
+target-*/
 Cargo.lock
 
 # Python
