@@ -460,7 +460,7 @@ impl Indexer {
         // from the retrieved document: `body_boost` (the field the parser
         // searches) is not STORED, so the generator is built from a `body`-only
         // parse of the same query. No body parse -> no fragment -> head fallback.
-        let mut body_parser = QueryParser::for_index(index, vec![self.fields.body]);
+        let body_parser = QueryParser::for_index(index, vec![self.fields.body]);
         let body_query = body_parser.parse_query(&pruned).ok();
         let mut generator = match body_query {
             Some(q) => SnippetGenerator::create(&searcher, &q, self.fields.body)
