@@ -46,8 +46,11 @@ multi-week architecture work, gated by the plan on proven quality.
      a placeholder. Wiring is automatic: the binary loads the sidecar when it exists, beside the
      dense lane.
      *Remaining:* the lane cannot honour a source scope (it returns empty for a scoped search
-     instead of leaking), it contributes only when the query names a known entity, and its weight
-     in the fused ranking has not been tuned or measured against the eval set.
+     instead of leaking), and its weight in the fused ranking has not been tuned or measured
+     against the eval set. Seeding is deliberately conservative — a match must look like a name
+     (phrase, digit, acronym, or capitalised in the query) unless the query is short enough to be a
+     term lookup — because the graph holds single capitalised common nouns (`Phrase`, `Database`)
+     that would otherwise make the lane fire on any query.
   4. ~~UI provenance verified live.~~ **Done** — verified in a browser (see the exit gate above),
      with the CORS gap that blocked it closed (`SEARCH_CORS_ORIGIN`, tested in
      `crates/api/tests/cors.rs`).

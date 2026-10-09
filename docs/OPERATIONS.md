@@ -127,7 +127,19 @@ Two behaviours are deliberate and worth knowing before reading a trace:
 * **A query naming no known entity contributes nothing.** The lane is fused with lexical
   retrieval, not a replacement for it.
 
-Rebuild the sidecar after a corpus change (it is a snapshot, as `graph_version` implies):
+The engine trace ends with how many documents expansion reached for that query
+(`provenance: graph expansion reached N document(s)`), which separates "the graph had nothing" from
+"the lane is not wired". A result reports `graph_expansion: 1.0` when its lane names the graph lane
+**or** when the graph lane reached that document — fusion keeps one lane per document, so without
+the second test a page that both matched lexically and was reached by activation would report no
+expansion even though it was expanded, and the signal would read zero for every query.
+
+Seeding is intentionally conservative: a match must look like a *name* — a multi-word phrase, or
+carrying a digit, or acronym/mixed case (`vLLM`, `BERT`), or capitalised by the user in the query —
+unless the query is three tokens or fewer, which is treated as a term lookup. The graph contains
+single capitalised common nouns (`Phrase`, `Database`, `Transformer`) and seeding on those made the
+lane fire on unrelated queries. Rebuild the sidecar after a corpus change (it is a snapshot, as
+`graph_version` implies):
 
 ```sh
 SEARCH_DATA_DIR=/var/lib/search SEARCH_READ_ONLY=1 agent0 graph build   # safe beside a crawl
