@@ -28,6 +28,7 @@
 
 pub mod crawl;
 pub mod embedbuild;
+pub mod evalset;
 pub mod graphbuild;
 pub mod deep;
 pub mod pipeline;

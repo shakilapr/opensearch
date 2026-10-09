@@ -29,6 +29,8 @@ search-pdf = { path = "../pdf" }
 search-sources = { path = "../sources" }
 # Stage-1 entity/concept graph: extractor + WorkId resolution for `agent0 graph build`.
 search-graph = { path = "../graph" }
+# Stage-2 labelled query sets derived from the corpus (`agent0 eval build-set`).
+search-eval = { path = "../eval" }
 # Stage-1 §21 browser escalation (mock by default; real Chromium behind `chromium`).
 search-browser = { path = "../browser" }
 search-retrieval = { path = "../retrieval" }

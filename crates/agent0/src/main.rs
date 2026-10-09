@@ -159,6 +159,13 @@ async fn main() -> ExitCode {
         },
         Some("serve") => run_serve().await,
         Some("crawl") => search_agent0::crawl::run_crawl(&args).await,
+        Some("eval") => match args.get(2).map(String::as_str) {
+            Some("build-set") => search_agent0::evalset::run(&args).await,
+            _ => {
+                eprintln!("usage: agent0 eval build-set [--out FILE] [--sample N] [--min-title-words N] [--max-title-words N] [--min-body-chars N]");
+                ExitCode::from(2)
+            }
+        },
         Some("graph") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::graphbuild::run(&args).await,
             _ => {
