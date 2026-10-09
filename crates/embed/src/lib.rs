@@ -218,37 +218,198 @@ pub fn top_k(query: &Embedding, docs: &[(String, Embedding)], k: usize) -> Vec<(
 // BGE-small — real model behind a feature. NOT the default lane.
 // ---------------------------------------------------------------------------------------------
 
-/// Real BGE-small embedding lane.
+/// Real BGE-small embedding lane (`BAAI/bge-small-en-v1.5`, 384-d).
 ///
-/// **UNVERIFIED / PLACEHOLDER.** This build does *not* include the ~67 MB BGE-small weights or
-/// any tokenizer/model runtime, so this type is intentionally a stub: it exists only to mark the
-/// interface and to prove the default build never references model files. It is not compiled by
-/// default (behind `feature = "bge"`) and cannot be exercised in this environment.
+/// Compiled only under `feature = "bge"`, which is the *only* thing that pulls in ONNX Runtime
+/// and the model runtime. The default build therefore neither links nor downloads a model, and
+/// `cargo test --workspace` stays hermetic.
+///
+/// The weights are fetched on **first construction** (Hugging Face Hub → cache dir) and loaded
+/// from disk afterwards; see [`bge::default_cache_dir`]. Nothing here is bundled in the repo.
 #[cfg(feature = "bge")]
 pub mod bge {
     use super::{Embedder, Embedding};
+    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
     /// BGE-small-en produces 384-dimensional vectors.
     pub const BGE_SMALL_DIM: usize = 384;
 
-    /// Error constructing the real embedder.
+    /// The upstream model this module loads. Part of the embedding identity: different weights
+    /// produce different vectors, so it is reported alongside any result.
+    pub const BGE_SMALL_MODEL: &str = "BAAI/bge-small-en-v1.5";
+
+    /// The retrieval instruction BGE-small-en-v1.5 is trained to expect on the **query** side.
+    /// Upstream guidance is to prepend it to short queries and NOT to passages; it is applied by
+    /// [`BgeEmbedder::embed_query`] and never by [`Embedder::embed`].
+    pub const BGE_QUERY_INSTRUCTION: &str =
+        "Represent this sentence for searching relevant passages: ";
+
+    /// Error constructing or running the real embedder.
     #[derive(Debug, thiserror::Error)]
     pub enum BgeError {
-        #[error("BGE-small weights are not bundled; the real model path is unverified in this build")]
-        WeightsMissing,
+        /// The model could not be fetched or loaded (no network, no cache, bad cache dir).
+        #[error("failed to load {model}: {detail}")]
+        Load {
+            /// Model identifier that failed to load.
+            model: &'static str,
+            /// Underlying runtime error, as text (the runtime's error type is not `Error`).
+            detail: String,
+        },
+        /// The model loaded but inference failed.
+        #[error("inference failed: {0}")]
+        Infer(String),
+        /// The runtime produced a vector of unexpected width, so the frozen dimension is wrong.
+        #[error("model returned {got} dimensions, expected {expected}")]
+        Dim {
+            /// Width actually produced.
+            got: usize,
+            /// Width the crate's contract promises.
+            expected: usize,
+        },
     }
 
-    /// Placeholder for the real BGE-small embedder. [`BgeEmbedder::new`] always fails here
-    /// because no weights/runtime are shipped; the vector layout is stated but never produced.
+    /// Where the weights live when nothing overrides it: `<workspace root>/models/fastembed`,
+    /// i.e. the repo's gitignored `models/` tree that already holds server-only artifacts.
+    /// Override with `SEARCH_MODEL_CACHE`.
+    ///
+    /// The workspace root is *searched for* rather than assumed to be the working directory,
+    /// because `cargo test -p <crate>` runs with the CWD set to that crate's directory — a plain
+    /// relative path would give every crate its own 130 MB copy of the same model.
+    pub fn default_cache_dir() -> PathBuf {
+        if let Ok(p) = std::env::var("SEARCH_MODEL_CACHE") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        match workspace_root() {
+            Some(root) => root.join("models").join("fastembed"),
+            None => PathBuf::from("models/fastembed"),
+        }
+    }
+
+    /// Walk up from the current directory to the nearest `Cargo.toml` declaring `[workspace]`.
+    fn workspace_root() -> Option<PathBuf> {
+        let mut dir = std::env::current_dir().ok()?;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+                if text.contains("[workspace]") {
+                    return Some(dir);
+                }
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    /// Real BGE-small-en-v1.5 embedder.
+    ///
+    /// Holds one ONNX session behind a `Mutex` because the underlying `embed` takes `&mut self`
+    /// while the [`Embedder`] trait (frozen in `docs/STAGE2_SPEC.md`) is `&self` + `Send + Sync`.
+    /// Inference is CPU-bound; the lock serializes calls rather than corrupting them.
     pub struct BgeEmbedder {
+        model: Mutex<TextEmbedding>,
         dim: usize,
     }
 
     impl BgeEmbedder {
-        /// A real implementation would load the bundled BGE-small weights here. This stub
-        /// returns [`BgeError::WeightsMissing`] — it is a marker, not a working model.
+        /// Load BGE-small from [`default_cache_dir`], downloading it on first use.
         pub fn new() -> Result<Self, BgeError> {
-            Err(BgeError::WeightsMissing)
+            Self::with_cache_dir(default_cache_dir())
+        }
+
+        /// Load BGE-small with an explicit cache directory (used by tests and by callers that
+        /// want the weights somewhere specific), downloading on first use.
+        pub fn with_cache_dir(cache_dir: PathBuf) -> Result<Self, BgeError> {
+            Self::build(cache_dir, false)
+        }
+
+        /// As [`BgeEmbedder::with_cache_dir`], but shows download progress on stderr.
+        pub fn with_cache_dir_and_progress(cache_dir: PathBuf) -> Result<Self, BgeError> {
+            Self::build(cache_dir, true)
+        }
+
+        fn build(cache_dir: PathBuf, progress: bool) -> Result<Self, BgeError> {
+            let opts = TextInitOptions::new(EmbeddingModel::BGESmallENV15)
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(progress);
+            let model = TextEmbedding::try_new(opts).map_err(|e| BgeError::Load {
+                model: BGE_SMALL_MODEL,
+                detail: e.to_string(),
+            })?;
+            Ok(BgeEmbedder {
+                model: Mutex::new(model),
+                dim: BGE_SMALL_DIM,
+            })
+        }
+
+        /// The upstream model identifier behind this instance.
+        pub fn model_id(&self) -> &'static str {
+            BGE_SMALL_MODEL
+        }
+
+        /// Embed a **query**, prepending the instruction BGE-small-en-v1.5 was trained with.
+        /// This is the asymmetric half of the model; [`Embedder::embed`] is the passage half.
+        /// The [`Embedder`] trait cannot express the query/passage asymmetry (it is one method),
+        /// so callers that rank query→passage should call this for the query.
+        pub fn embed_query(&self, text: &str) -> Result<Embedding, BgeError> {
+            let prefixed = format!("{BGE_QUERY_INSTRUCTION}{text}");
+            self.embed_raw(&prefixed)
+        }
+
+        /// Embed several passages in one batched call (much faster than a loop over
+        /// [`Embedder::embed`] for corpus-scale input). Empty inputs still come back as zero
+        /// vectors, in the same order.
+        pub fn embed_batch<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Embedding>, BgeError> {
+            // Replace "empty" (no alphanumeric) inputs with a placeholder we never use: the
+            // model may reject or mis-handle an empty string, and the contract says zero vector.
+            let mut dims = Vec::with_capacity(texts.len());
+            let mut payload = Vec::with_capacity(texts.len());
+            for t in texts {
+                let s = t.as_ref();
+                dims.push(has_content(s));
+                payload.push(if has_content(s) { s } else { "." });
+            }
+            let mut guard = self.model.lock().map_err(|_| BgeError::Infer("model lock poisoned".into()))?;
+            let raw = guard
+                .embed(&payload, None)
+                .map_err(|e| BgeError::Infer(e.to_string()))?;
+            drop(guard);
+
+            if raw.len() != texts.len() {
+                return Err(BgeError::Infer(format!(
+                    "model returned {} vectors for {} inputs",
+                    raw.len(),
+                    texts.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(texts.len());
+            for (i, v) in raw.into_iter().enumerate() {
+                if !dims[i] {
+                    out.push(Embedding::zeros(self.dim));
+                    continue;
+                }
+                out.push(finish(v, self.dim)?);
+            }
+            Ok(out)
+        }
+
+        /// Single-text embedding with **no** instruction prefix (passage side).
+        fn embed_raw(&self, text: &str) -> Result<Embedding, BgeError> {
+            if !has_content(text) {
+                return Ok(Embedding::zeros(self.dim));
+            }
+            let mut guard = self.model.lock().map_err(|_| BgeError::Infer("model lock poisoned".into()))?;
+            let mut raw = guard
+                .embed(vec![text], None)
+                .map_err(|e| BgeError::Infer(e.to_string()))?;
+            drop(guard);
+            let v = raw
+                .pop()
+                .ok_or_else(|| BgeError::Infer("model returned no vector".into()))?;
+            finish(v, self.dim)
         }
     }
 
@@ -257,10 +418,164 @@ pub mod bge {
             self.dim
         }
 
-        fn embed(&self, _text: &str) -> Embedding {
-            // Unreachable in practice: `new()` never succeeds without weights. Returning the
-            // zero vector keeps the stub panic-free and dependency-free.
-            Embedding::zeros(self.dim)
+        /// Passage-side embedding (no query instruction). Empty/whitespace/punctuation-only
+        /// input yields the zero vector, matching [`super::HashEmbedder`]'s contract.
+        fn embed(&self, text: &str) -> Embedding {
+            // The trait is infallible; a runtime failure would otherwise silently look like
+            // "nothing matched". Zero is the documented degenerate answer, and `try_embed`
+            // exists for callers that need the error.
+            self.embed_raw(text).unwrap_or_else(|_| Embedding::zeros(self.dim))
+        }
+    }
+
+    impl BgeEmbedder {
+        /// Fallible [`Embedder::embed`] — use this when a silent zero vector would be a bug
+        /// rather than an acceptable answer.
+        pub fn try_embed(&self, text: &str) -> Result<Embedding, BgeError> {
+            self.embed_raw(text)
+        }
+    }
+
+    /// True if the text has at least one alphanumeric char (same rule as the hash tokenizer).
+    fn has_content(text: &str) -> bool {
+        text.chars().any(|c| c.is_alphanumeric())
+    }
+
+    /// Check the width and L2-normalize (the contract promises a unit vector; the runtime
+    /// already normalizes, this is a defensive, idempotent second pass).
+    fn finish(mut v: Vec<f32>, dim: usize) -> Result<Embedding, BgeError> {
+        if v.len() != dim {
+            return Err(BgeError::Dim {
+                got: v.len(),
+                expected: dim,
+            });
+        }
+        let sumsq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+        if sumsq > 0.0 {
+            let inv = (1.0 / sumsq.sqrt()) as f32;
+            for x in v.iter_mut() {
+                *x *= inv;
+            }
+        }
+        Ok(Embedding { dim, v })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::OnceLock;
+
+        /// One model for the whole test binary. `get_or_init` makes concurrent tests block on the
+        /// first construction instead of racing each other into the same Hugging Face download
+        /// (four threads calling `try_new` at once genuinely fails with "Failed to retrieve model
+        /// file 'onnx/model.onnx'"). The `Result` is cached too, so a failed load is reported
+        /// once rather than retried per test.
+        static MODEL: OnceLock<Result<BgeEmbedder, String>> = OnceLock::new();
+
+        fn load() -> &'static BgeEmbedder {
+            match MODEL.get_or_init(|| BgeEmbedder::new().map_err(|e| e.to_string())) {
+                Ok(m) => m,
+                Err(e) => panic!(
+                    "BGE-small could not be loaded: {e}\n\
+                     This test needs the model; the first run downloads it into the cache dir\n\
+                     (`models/fastembed`, or $SEARCH_MODEL_CACHE). Run:\n\
+                     \x20 cargo test -p search-embed --features bge"
+                ),
+            }
+        }
+
+        /// The whole point of the feature: on a genuine paraphrase (no content-word overlap) the
+        /// hashed bag-of-words has almost nothing to go on, while a real semantic model still
+        /// finds the right passage.
+        #[test]
+        fn paraphrase_beats_lexical_bag_of_words() {
+            let bge = load();
+            let hash = super::super::HashEmbedder::new(BGE_SMALL_DIM);
+
+            let query = "how do I stop my program freezing while it waits for the network";
+            let relevant = "Asynchronous runtimes keep a thread free while I/O is pending, so the \
+                            event loop is never blocked by a slow request.";
+            let unrelated = "Sourdough needs a warm room and twelve hours of patience.";
+
+            let q = bge.embed_query(query).expect("query embedding");
+            let rel = bge.embed(relevant);
+            let unrel = bge.embed(unrelated);
+
+            let rel_score = super::super::cosine(&q, &rel);
+            let unrel_score = super::super::cosine(&q, &unrel);
+            assert!(
+                rel_score > unrel_score,
+                "BGE should prefer the on-topic passage: {rel_score} vs {unrel_score}"
+            );
+            assert!(
+                rel_score > 0.5,
+                "BGE should be clearly confident here, got {rel_score}"
+            );
+
+            // The lexical lane: the only tokens these two strings share are stopwords
+            // ("while", "the"), so it has no signal — it sits in a low, noisy band and, on this
+            // pair, does not separate on-topic from off-topic the way BGE does.
+            let hq = hash.embed(query);
+            let h_rel = super::super::cosine(&hq, &hash.embed(relevant));
+            let h_unrel = super::super::cosine(&hq, &hash.embed(unrelated));
+            eprintln!(
+                "BGE: rel={rel_score:.4} unrel={unrel_score:.4} | hash: rel={h_rel:.4} unrel={h_unrel:.4}"
+            );
+            assert!(
+                h_rel < 0.5,
+                "stopword overlap only — the hash lane should stay low, got {h_rel}"
+            );
+            assert!(
+                rel_score > h_rel + 0.2,
+                "the semantic lane should be markedly more confident than the lexical one: \
+                 {rel_score} vs {h_rel}"
+            );
+        }
+
+        #[test]
+        fn dim_is_384_and_vectors_are_unit_length() {
+            let bge = load();
+            assert_eq!(bge.dim(), BGE_SMALL_DIM);
+            let e = bge.embed("a passage about indexing");
+            assert_eq!(e.dim, BGE_SMALL_DIM);
+            assert_eq!(e.v.len(), BGE_SMALL_DIM);
+            let norm: f32 = e.v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "L2 norm was {norm}");
+        }
+
+        #[test]
+        fn empty_and_punctuation_only_are_zero_vectors() {
+            let bge = load();
+            for text in ["", "   ", "\t\n", ",,, ... !!!"] {
+                let e = bge.embed(text);
+                assert_eq!(e.dim, BGE_SMALL_DIM);
+                assert_eq!(e.v, vec![0.0f32; BGE_SMALL_DIM], "text {text:?}");
+            }
+        }
+
+        #[test]
+        fn batch_matches_single_and_preserves_order() {
+            let bge = load();
+            let texts = ["alpha passage about cars", "", "beta passage about cooking"];
+            let batch = bge.embed_batch(&texts).expect("batch");
+            assert_eq!(batch.len(), 3);
+            assert_eq!(batch[1].v, vec![0.0f32; BGE_SMALL_DIM]);
+            for (i, t) in texts.iter().enumerate() {
+                if !t.is_empty() {
+                    assert_eq!(batch[i], bge.embed(t), "row {i} must match the single call");
+                }
+            }
+        }
+
+        #[test]
+        fn query_instruction_changes_the_vector_and_is_used_for_queries() {
+            let bge = load();
+            let text = "how do I make my crawler polite";
+            let passage = bge.embed(text);
+            let query = bge.embed_query(text).expect("query");
+            // The instruction is real input to the model, not decoration.
+            assert_ne!(passage.v, query.v, "the query instruction must change the vector");
+            assert_eq!(query.dim, BGE_SMALL_DIM);
         }
     }
 }

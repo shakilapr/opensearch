@@ -64,6 +64,14 @@ quick-xml = "0.36"
 flate2 = "1"
 mime = "0.3"
 tempfile = "3"
+# Real BGE-small embedding lane (feature `bge`). Default features are off so the image
+# pipeline is not pulled in; the two flags below are what the ONNX Runtime + HF download
+# path needs. The model weights are fetched at RUNTIME into the cache dir (see
+# `search_embed::bge::default_cache_dir`), never at build time and never committed.
+fastembed = { version = "7.1.1", default-features = false, features = [
+    "hf-hub-native-tls",
+    "ort-download-binaries-native-tls",
+] }
 
 [profile.release]
 opt-level = 3

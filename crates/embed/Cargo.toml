@@ -5,10 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Real BGE-small weights. Off by default: the default build must not need a model download.
-bge = []
+# Real BGE-small weights. Off by default: the default build must not need a model download
+# (and must not link ONNX Runtime). Enable with `--features bge`.
+bge = ["dep:fastembed"]
 
 [dependencies]
 search-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
+fastembed = { workspace = true, optional = true }
