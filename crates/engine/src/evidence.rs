@@ -156,8 +156,14 @@ pub fn evidence_coverage(units: &[QueryUnit], records: &[EvidenceRecord]) -> Cov
         .map(|u| u.id.clone())
         .collect();
 
+    // Rust sums an empty iterator of floats to *negative* zero, and `-0.0 / positive` is
+    // still `-0.0`. A query with no supporting record therefore reported coverage `-0.0`,
+    // which survives both the `total > 0.0` guard here and any `coverage >= 0.0` assertion,
+    // and reached clients as `-0.0` (observed live for "what is the capital of peru").
+    // Normalise so coverage is never negative and never NaN: it is documented as [0, 1].
+    let coverage = if total > 0.0 { got / total } else { 0.0 };
     Coverage {
-        coverage: if total > 0.0 { got / total } else { 0.0 },
+        coverage: if coverage > 0.0 { coverage } else { 0.0 },
         mandatory_ok: unsupported.is_empty(),
         unsupported,
         contradicted_units,

@@ -3,7 +3,10 @@
 //!
 //! Hermetic: no network, no clock, no I/O.
 
-use search_engine::evidence::{normalize_tokens, title_supports_unit};
+use search_engine::evidence::{
+    evidence_coverage, normalize_tokens, title_supports_unit, EvidenceRecord, Support,
+};
+use search_engine::units::{QueryUnit, UnitKind};
 use search_engine::EvidenceVerifier;
 
 #[test]
@@ -87,4 +90,46 @@ fn evidence_verifier_is_object_safe() {
 
     let borrowed: &dyn EvidenceVerifier = &No;
     assert!(!borrowed.supports("q", "d"));
+}
+
+/// A unit with no supporting record must report coverage `+0.0`, never `-0.0`.
+///
+/// Rust sums an empty float iterator to negative zero, and `-0.0 / positive` is still
+/// `-0.0`, so `coverage` used to leave the engine as `-0.0` and reach clients as `-0.0`
+/// (observed live for "what is the capital of peru"). `-0.0 >= 0.0` is *true*, so an
+/// order-of-comparison assertion cannot catch this: assert the bits, and assert what the
+/// client actually receives.
+#[test]
+fn unsupported_coverage_is_positive_zero_not_negative_zero() {
+    let units = vec![QueryUnit {
+        id: "U1".to_string(),
+        text: "what is the capital of peru".to_string(),
+        depends_on: Vec::new(),
+        mandatory: true,
+        weight: 1.0,
+        kind: UnitKind::Other,
+    }];
+
+    let c = evidence_coverage(&units, &[]);
+    assert_eq!(c.coverage.to_bits(), 0.0f32.to_bits(), "coverage was {c:?}");
+    assert!(!c.coverage.is_sign_negative());
+    assert_eq!(
+        serde_json::to_string(&c.coverage).unwrap(),
+        "0.0",
+        "the serialised value is what the client sees"
+    );
+    assert!(!c.mandatory_ok);
+    assert_eq!(c.unsupported, vec!["U1".to_string()]);
+
+    // A supported unit still reports full coverage.
+    let supported = vec![EvidenceRecord {
+        unit_id: "U1".to_string(),
+        doc_id: "d1".to_string(),
+        status: Support::Supported,
+        span: None,
+        doc_version: "v1".to_string(),
+    }];
+    let full = evidence_coverage(&units, &supported);
+    assert_eq!(full.coverage, 1.0);
+    assert!(full.mandatory_ok);
 }

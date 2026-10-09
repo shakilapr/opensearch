@@ -7,3 +7,8 @@ publish = false
 [dependencies]
 search-core = { path = "../core" }
 search-retrieval = { path = "../retrieval" }
+
+[dev-dependencies]
+# The coverage regression test asserts the *serialised* value, because `-0.0 >= 0.0` is true
+# and the defect reached clients precisely through JSON.
+serde_json.workspace = true

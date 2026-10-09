@@ -61,7 +61,15 @@ pub fn lexical_overlap_score(query: &str, doc: &str) -> f32 {
         0.0
     };
 
-    (coverage + 0.15 * proximity).clamp(0.0, 1.0)
+    let score = (coverage + 0.15 * proximity).clamp(0.0, 1.0);
+    // Defensive: `clamp` returns a negative zero unchanged (IEEE treats `-0.0 == 0.0`, so it is
+    // already in range). No input reaches this today — coverage and proximity are both
+    // non-negative here — but a score that serialises as `-0.0` must not be possible.
+    if score > 0.0 {
+        score
+    } else {
+        0.0
+    }
 }
 
 #[async_trait]

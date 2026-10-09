@@ -98,11 +98,16 @@ impl FeatureRanker {
     /// trailing features are ignored; longer weights beyond the 7 known features are ignored.
     pub fn score(&self, f: &Features) -> f32 {
         let v = f.to_vec();
-        self.weights
-            .iter()
-            .zip(v.iter())
-            .map(|(w, x)| w * x)
-            .sum()
+        let score: f32 = self.weights.iter().zip(v.iter()).map(|(w, x)| w * x).sum();
+        // A score can legitimately be negative (signed weights), so only a zero is
+        // normalised. Defensive: Rust sums an *empty* float iterator to `-0.0`, so an empty
+        // weights vector would report a `-0.0` relevance score. No shipped configuration is
+        // empty, but the value is serialised to clients.
+        if score == 0.0 {
+            0.0
+        } else {
+            score
+        }
     }
 }
 
@@ -126,6 +131,25 @@ pub fn rerank(cands: &[RerankInput], ranker: &FeatureRanker, limit: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero score must serialise as `0.0`, not `-0.0`: Rust sums an empty float iterator to
+    /// negative zero, so an empty weights vector reported a `-0.0` relevance score. A negative
+    /// score from signed weights must still be preserved.
+    #[test]
+    fn zero_scores_are_not_negative_zero() {
+        let empty = FeatureRanker { weights: Vec::new() };
+        let score = empty.score(&f(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0));
+        assert_eq!(score.to_bits(), 0.0f32.to_bits(), "score was {score}");
+        assert!(!score.is_sign_negative());
+
+        let signed = FeatureRanker {
+            weights: vec![-0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        assert!(
+            signed.score(&f(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)) < 0.0,
+            "a negative score from signed weights must survive normalisation"
+        );
+    }
 
     fn f(bm25: f32, dense: f32, sa: f32, fr: f32, em: f32, gh: f32, tm: f32) -> Features {
         Features {
