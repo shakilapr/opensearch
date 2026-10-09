@@ -71,7 +71,7 @@ use search_fetcher::robots::{self, RobotsPolicy, RobotsVerdict};
 use search_fetcher::ssrf;
 use search_fetcher::validators::{MemoryValidators, ValidatorStore, Validators};
 use search_frontier::queue::{FrontierEntry, Priority};
-use search_frontier::Frontier;
+use search_frontier::{Frontier, Lease};
 use search_indexer::{IndexDoc, Indexer, IndexerConfig};
 use search_ingest::{IngestCoordinator, IngestStage, Watermark};
 use search_metadata::{MetadataReader, MetadataWriter, Mutation};
@@ -237,6 +237,39 @@ pub struct Pipeline {
     pub(crate) trace: Option<Arc<PolicyTrace>>,
 }
 
+/// Inputs to [`Pipeline::commit_document`]: the post-fetch half of
+/// [`Pipeline::crawl_one`], factored out so a document can be indexed without a
+/// live fetch (see [`Pipeline::import_record`]).
+struct CommitDoc<'a> {
+    canonical: &'a str,
+    host: &'a str,
+    domain_id: &'a DomainId,
+    resource_id: &'a ResourceId,
+    body: &'a [u8],
+    doc: &'a search_parser::NormalizedDoc,
+    kind: &'a str,
+    parser_version: &'a str,
+    outcome: &'a FetchOutcome,
+    now: i64,
+    lease: Option<&'a Lease>,
+    /// Whether to record a live-host observation (`self.observe_source`). `true`
+    /// for a crawl; `false` for an imported record, which was never fetched from
+    /// a live host.
+    observe: bool,
+}
+
+/// A record that arrived out-of-band (a dataset pack / an import) rather than by
+/// fetching a live URL.
+#[derive(Debug, Clone)]
+pub struct ImportRecord {
+    pub url: String,
+    pub title: Option<String>,
+    pub text: String,
+    pub source: String,
+    pub published_at: Option<i64>,
+    pub extras: std::collections::BTreeMap<String, String>,
+}
+
 impl Pipeline {
     /// Open the pipeline in production mode: the SSRF guard blocks loopback.
     pub fn open(cfg: &Config) -> AppResult<Self> {
@@ -330,6 +363,15 @@ impl Pipeline {
             self.indexer.clone(),
             self.cfg.meta_db(),
         ))
+    }
+
+    /// Every live document in the index, for export into a portable pack.
+    ///
+    /// Thin accessor over [`Indexer::all_docs`]: the Tantivy schema STOREs
+    /// `url`/`title`/`body`/`source_id`/`published_at`, so no blob-store read is
+    /// needed. `doc_id`-sorted and tombstone-free, so an export is reproducible.
+    pub fn all_docs(&self) -> AppResult<Vec<IndexDoc>> {
+        self.indexer.all_docs()
     }
 
     /// Deterministic resource id for a URL (canonicalized first), matching the
@@ -845,36 +887,8 @@ impl Pipeline {
             });
         }
 
-        // (7) ContentId from the exact bytes + idempotency check.
-        let content_id = ContentId::from_bytes(&body);
-        let existing = self.latest_version(&resource_id)?;
-        if let Some((vno, Some(exist_cid))) = &existing {
-            if exist_cid == content_id.as_str() {
-                let op_key = OpKey::from_parts(&resource_id, 0, *vno);
-                self.record_stage(&op_key, resource_id.as_str(), IngestStage::Visible)?;
-                self.observe_source(&host, true, false)?;
-                self.persist_freshness(&resource_id, None, None, now, None)?;
-                if let Some(l) = &lease {
-                    let _ = self.frontier.complete(l, now);
-                }
-                let dv = DocVerId::from_parts(&resource_id, *vno).into_string();
-                let rid = resource_id.into_string();
-                tracing::info!(target: "agent0::crawl", url = %redact(&canonical), "content unchanged: no new document version");
-                return Ok(IngestOutcome::Unchanged {
-                    url: canonical,
-                    resource_id: rid,
-                    docver_id: dv,
-                    version_no: *vno,
-                    content_id: content_id.into_string(),
-                    generation: self.indexer.visible_generation(),
-                });
-            }
-        }
-        let version_no = existing.as_ref().map(|(v, _)| v + 1).unwrap_or(1);
-        let docver_id = DocVerId::from_parts(&resource_id, version_no);
-        let op_key = OpKey::from_parts(&resource_id, 0, version_no);
-
-        // Build the normalized doc according to the route.
+        // (7) build the normalized doc according to the route, then hand the
+        // fetched bytes + parsed document to the network-free commit half.
         let (doc, kind, parser_version) = match routing.route {
             Route::Pdf => {
                 let outcome_pdf = search_pdf::extract(&body, PdfLimits::default())
@@ -902,71 +916,128 @@ impl Pipeline {
             ),
         };
 
+        self.commit_document(CommitDoc {
+            canonical: &canonical,
+            host: &host,
+            domain_id: &domain_id,
+            resource_id: &resource_id,
+            body: &body,
+            doc: &doc,
+            kind,
+            parser_version,
+            outcome: &outcome,
+            now,
+            lease: lease.as_ref(),
+            observe: true,
+        })
+    }
+
+    /// The post-fetch half of [`Pipeline::crawl_one`]: given fetched bytes, a
+    /// body-derived `ContentId` and a parsed document, run stages
+    /// CONTENT->VERSION->BLOB_WRITTEN->METADATA_COMMITTED->freshness->
+    /// LEXICAL_INDEXED->GRAPH_INDEXED->publish->VISIBLE and return the outcome.
+    /// Performs no network I/O.
+    fn commit_document(&self, c: CommitDoc<'_>) -> AppResult<IngestOutcome> {
+        // ContentId from the exact bytes + idempotency check.
+        let content_id = ContentId::from_bytes(c.body);
+        let existing = self.latest_version(c.resource_id)?;
+        if let Some((vno, Some(exist_cid))) = &existing {
+            if exist_cid == content_id.as_str() {
+                let op_key = OpKey::from_parts(c.resource_id, 0, *vno);
+                self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::Visible)?;
+                if c.observe {
+                    self.observe_source(c.host, true, false)?;
+                }
+                self.persist_freshness(c.resource_id, None, None, c.now, None)?;
+                if let Some(l) = c.lease {
+                    let _ = self.frontier.complete(l, c.now);
+                }
+                let dv = DocVerId::from_parts(c.resource_id, *vno).into_string();
+                let rid = c.resource_id.clone().into_string();
+                tracing::info!(target: "agent0::crawl", url = %redact(c.canonical), "content unchanged: no new document version");
+                return Ok(IngestOutcome::Unchanged {
+                    url: c.canonical.to_string(),
+                    resource_id: rid,
+                    docver_id: dv,
+                    version_no: *vno,
+                    content_id: content_id.into_string(),
+                    generation: self.indexer.visible_generation(),
+                });
+            }
+        }
+        let version_no = existing.as_ref().map(|(v, _)| v + 1).unwrap_or(1);
+        let docver_id = DocVerId::from_parts(c.resource_id, version_no);
+        let op_key = OpKey::from_parts(c.resource_id, 0, version_no);
+
         // FETCHED + NORMALIZED
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::Fetched)?;
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::Normalized)?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::Fetched)?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::Normalized)?;
 
         // BLOB_WRITTEN
-        self.write_content_files(&content_id, &body, doc.text.as_bytes())?;
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::BlobWritten)?;
+        self.write_content_files(&content_id, c.body, c.doc.text.as_bytes())?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::BlobWritten)?;
 
         // METADATA_COMMITTED (resource kind, source id, parser version)
         self.commit_metadata(
-            &canonical,
-            &host,
-            &domain_id,
-            &resource_id,
+            c.canonical,
+            c.host,
+            c.domain_id,
+            c.resource_id,
             &docver_id,
             version_no,
             &content_id,
-            &outcome,
-            &doc,
-            kind,
-            &host,
-            parser_version,
-            now,
+            c.outcome,
+            c.doc,
+            c.kind,
+            c.host,
+            c.parser_version,
+            c.now,
         )?;
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::MetadataCommitted)?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::MetadataCommitted)?;
 
-        // Stage-1 freshness columns + per-domain source profile.
-        let feed_watermark = if self.is_feed_sourced(resource_id.as_str()) {
-            Some(doc.published_at.unwrap_or(now))
+        // Stage-1 freshness columns + per-domain source profile. `persist_freshness`
+        // stays unconditional: an imported record still needs the resource row's
+        // fetched/verified columns populated so it behaves like any other resource.
+        let feed_watermark = if self.is_feed_sourced(c.resource_id.as_str()) {
+            Some(c.doc.published_at.unwrap_or(c.now))
         } else {
             None
         };
         self.persist_freshness(
-            &resource_id,
-            doc.published_at,
-            doc.modified_at,
-            now,
+            c.resource_id,
+            c.doc.published_at,
+            c.doc.modified_at,
+            c.now,
             feed_watermark,
         )?;
-        self.observe_source(&host, true, true)?;
+        if c.observe {
+            self.observe_source(c.host, true, true)?;
+        }
 
         // LEXICAL_INDEXED (Tantivy overlay)
         let generation = self.indexer.visible_generation() + 1;
         let index_doc = build_index_doc(
-            &resource_id,
+            c.resource_id,
             &content_id,
             version_no,
-            &canonical,
-            &doc,
-            &host,
+            c.canonical,
+            c.doc,
+            c.host,
             generation,
-            now,
+            c.now,
         );
         self.indexer.index_overlay(index_doc)?;
         tracing::debug!(
             target: "agent0::index",
-            doc_id = resource_id.as_str(),
+            doc_id = c.resource_id.as_str(),
             version = version_no,
             generation,
             "indexed overlay document"
         );
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::LexicalIndexed)?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::LexicalIndexed)?;
 
         // GRAPH_INDEXED — recorded no-op: no graph projection wired yet.
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::GraphIndexed)?;
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::GraphIndexed)?;
 
         // Publish manifest + watermark, then VISIBLE.
         let manifest = self.indexer.publish_manifest()?;
@@ -984,28 +1055,88 @@ impl Pipeline {
                 generation: manifest.generation as i64,
                 doc_count: manifest.doc_count as i64,
                 base_segments: manifest.base_segments as i64,
-                created_at: now,
+                created_at: c.now,
             }])?;
         }
-        self.record_stage(&op_key, resource_id.as_str(), IngestStage::Visible)?;
-        if let Some(l) = &lease {
-            let _ = self.frontier.complete(l, now);
+        self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::Visible)?;
+        if let Some(l) = c.lease {
+            let _ = self.frontier.complete(l, c.now);
         }
 
         tracing::info!(
             target: "agent0::crawl",
-            url = %redact(&canonical),
+            url = %redact(c.canonical),
             version = version_no,
-            kind,
+            kind = c.kind,
             "ingested new document version"
         );
         Ok(IngestOutcome::Ingested {
-            url: canonical,
-            resource_id: resource_id.into_string(),
+            url: c.canonical.to_string(),
+            resource_id: c.resource_id.clone().into_string(),
             docver_id: docver_id.into_string(),
             version_no,
             content_id: content_id.into_string(),
             generation: manifest.generation,
+        })
+    }
+
+    /// Index an already-fetched record with NO network I/O: no SSRF guard, no
+    /// robots fetch, no frontier lease. Idempotent by content: importing the
+    /// same text twice yields [`IngestOutcome::Unchanged`] the second time.
+    pub fn import_record(&self, rec: &ImportRecord) -> AppResult<IngestOutcome> {
+        if rec.text.trim().is_empty() {
+            return Err(AppError::Invalid(
+                "empty record text cannot be indexed".to_string(),
+            ));
+        }
+        let canonical = canonicalize(&rec.url)
+            .map_err(|e| AppError::Invalid(format!("invalid url {:?}: {e}", rec.url)))?;
+        let parsed = Url::parse(&canonical)
+            .map_err(|e| AppError::Invalid(format!("invalid canonical url {canonical:?}: {e}")))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| AppError::Invalid(format!("url {canonical:?} has no host")))?
+            .to_string();
+        let domain_id = DomainId::from_host(&host);
+        let resource_id = ResourceId::from_canonical_url(&canonical);
+
+        let body = rec.text.as_bytes();
+        let doc = NormalizedDoc {
+            url: canonical.clone(),
+            title: rec.title.clone(),
+            text: rec.text.clone(),
+            headings: Vec::new(),
+            entities: Vec::new(),
+            language: None,
+            description: None,
+            published_at: rec.published_at,
+            modified_at: None,
+            outlinks: Vec::new(),
+            doc_type: "record".to_string(),
+            text_len: rec.text.len(),
+        };
+        let outcome = FetchOutcome {
+            final_url: canonical.clone(),
+            status: 200,
+            etag: None,
+            last_modified: None,
+            body: Some(body.to_vec()),
+            content_type: Some("text/plain; charset=utf-8".to_string()),
+        };
+        let now = search_core::time::now_unix_s();
+        self.commit_document(CommitDoc {
+            canonical: &canonical,
+            host: &host,
+            domain_id: &domain_id,
+            resource_id: &resource_id,
+            body,
+            doc: &doc,
+            kind: "record",
+            parser_version: "import-v1",
+            outcome: &outcome,
+            now,
+            lease: None,
+            observe: false,
         })
     }
 

@@ -32,6 +32,10 @@ search-scheduler = { path = "../scheduler" }
 search-nav = { path = "../nav" }
 # Stage-8 PolicyTrace (real JSONL trace emitter/reader).
 search-trace = { path = "../trace" }
+# Portable knowledge model: export the index to a pack (dataset) and organize
+# scraped text with the cheap model (organize).
+search-dataset = { path = "../dataset" }
+search-organize = { path = "../organize" }
 # `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
 # (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
 search-api = { path = "../api", features = ["real-indexer"] }
