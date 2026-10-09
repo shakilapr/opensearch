@@ -30,6 +30,14 @@ curl -fsS http://127.0.0.1:8080/health
 `/health` returns `{"status":"ok","generation":N,"index_manifest_id":"...","uptime_seconds":S,"version":"0.1.0"}`.
 `generation == 0` means nothing is published yet (see *Unpublished index* below).
 
+> **The bind port must be free.** `agent0 serve` exits with
+> `configuration error: failed to bind 127.0.0.1:8080: Address already in use` if anything else
+> holds the port (on a dev box that is often `code-server`, which also defaults to 8080). Check
+> with `ss -ltn | grep 8080` and override with `SEARCH_BIND=127.0.0.1:<free-port>` if needed —
+> a failed bind is a startup error, not a silent fallback, and `/health` will then answer from
+> whatever else owns the port (which is why a stray `401 Unauthorized` on `/health` means you are
+> talking to a different service entirely).
+
 Install/upgrade steps are in `deploy/README.md`. `agent0` reads its config from the
 environment (`crates/core::Config::from_env`):
 
@@ -38,7 +46,7 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_DATA_DIR` | `/var/lib/search` | runtime state root |
 | `SEARCH_BIND` | `127.0.0.1:8080` | HTTP API bind |
 | `SEARCH_USER_AGENT` | `AgentNativeSearchBot/0.1 (+https://github.com/agent-native-search)` | crawl UA |
-| `RUST_LOG` | `info` | tracing filter (see *Logs* — currently no effect) |
+| `RUST_LOG` | `info` | tracing filter (see *Logs*) |
 
 ## The refresh tick
 
@@ -105,14 +113,15 @@ SQLite db + blobs alone is recoverable.
 
 ## Logs and traces
 
-* **`RUST_LOG` currently has no effect.** Every crate is instrumented with `tracing`, but
-  the binaries do not yet install a subscriber, so `tracing` events are dropped. This is
-  a known gap — treat journald output as empty for now. (`deploy/*.service` already sets
-  `RUST_LOG=info` so it will "just work" once a subscriber is installed.)
+* **`RUST_LOG` is honoured.** A `tracing` subscriber is installed by
+  `search_api::init_tracing()` (called from the `agent0` binary entrypoint and from
+  `search_api::serve`), with an `env-filter` on `RUST_LOG`, default `info`. `deploy/*.service`
+  sets `RUST_LOG=info`, so journald output is populated. URL userinfo is redacted before
+  logging; document bodies are never logged.
 * **Structured traces** (per-query `Phase`/`action`/`cost_ms` events) are produced by
-  `crates/trace` (`PolicyTrace` + `JsonlTraceSink`). A `JsonlTraceSink` writes to a path
-  chosen by the caller and read back with `read_trace`; it is **not wired into `agent0`
-  yet**, so no trace file is written by the daemon today. See `STAGE8_SPEC.md`.
+  `crates/trace` (`PolicyTrace` + `JsonlTraceSink`) and **are wired into `agent0`**: set
+  `SEARCH_TRACE_PATH=/var/log/search/trace.jsonl` (or call `Pipeline::set_trace_jsonl(path)`)
+  and deep searches append trace events that `read_trace` reads back. See `STAGE8_SPEC.md`.
 * **Health telemetry** is the `/health` endpoint above (published `generation`,
   `index_manifest_id`, uptime).
 

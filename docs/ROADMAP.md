@@ -17,8 +17,8 @@ been demonstrated at scale (there is no crawl corpus of 10K–1M documents in th
 | **4** Agent navigation | `nav` | present: `SearchState`, action frontier, beam, policy tiers, provider adapters (fake-client tested) | **landed** |
 | **5** Scale | `dedup`, `tiers`, `patterns`, migration `0004` | present | **landed** |
 | **6** Dataset builder | `dataset` + `datasets/fixtures/` | present: 4 adapters, `write_pack`/`validate_pack`, `PACK_SCHEMA=1` | **landed** |
-| **7** Service surfaces | `mcp` + `deploy/` + `docs/MCP.md` | present; deploy units + nginx; MCP `search` tool live | **partial** — `deep_search`/`fetch_doc` not wired (below) |
-| **8** Eval & hardening | `trace`, `cache`, sources priors, `acceptance` | `trace`/`cache`/priors present; **`acceptance` crate is empty (no tests)** | **partial** |
+| **7** Service surfaces | `mcp` + `deploy/` + `docs/MCP.md` | present; deploy units + nginx; all three MCP tools (`search`/`deep_search`/`fetch_doc`) backed by `HttpBackend` | **landed** |
+| **8** Eval & hardening | `trace`, `cache`, sources priors, `acceptance` | all present; **12 hermetic acceptance tests** green; trace wired into `agent0` | **landed** |
 | **9** Advanced retrieval | `ann`, `distill`, retrieval sparse | present: int8/IVF/HNSW-lite, `SparseExpander`, `LinearPolicy` (all deterministic, fixture-trained) | **landed** |
 | **10** Distribution & ops | docs + scripts | `dist/` build/publish/backup scripts + the four docs here | **landed** |
 | **10+** Distributed crawl & community | — | not started | **planned** |
@@ -49,16 +49,18 @@ These are real, current limitations — none is a hidden TODO:
 7. **`Indexer::manifest()` returns `None` before the first publish.** An unpublished index
    has no read-side state; searches then carry `degradations=["index_unpublished"]`
    (`crates/api/src/query.rs`). See `OPERATIONS.md`.
-8. **MCP `deep_search` and `fetch_doc` are declared but not backed.** Only `search` is
-   wired end-to-end; the other two return an honest `isError` until the HTTP API exposes
-   `/search_deep` and `/read` (`crates/mcp/src/main.rs`). `docs/MCP.md` lists all three
-   tools; this note is the current truth about their backends.
-9. **The Stage-8 `acceptance` crate has no tests.** `crates/acceptance` exists with the
-   spec'd dev-dependencies but contains only `src/lib.rs`; the 12 workspace-level
-   acceptance tests in `STAGE8_SPEC.md` are **not implemented**. Per-crate integration
-   tests (agent0, api, fetcher, metadata, …) do exist.
-10. **No tracing subscriber is installed.** Crates are instrumented with `tracing`, but the
-    binaries never initialise a subscriber, so `RUST_LOG` produces no output today.
+8. **MCP is a loopback HTTP client — it needs a running API.** `search`, `deep_search` and
+   `fetch_doc` are all backed by `HttpBackend` (`crates/mcp/src/http.rs`), which talks to
+   `/search`, `/search_deep` and `/read` on `SEARCH_API_BASE` (→ `SEARCH_BIND` → the
+   `127.0.0.1:8080` default). With no API reachable, every tool returns an honest
+   `isError`; there is no embedded in-process backend.
+9. **Live-web validation is thin.** The suite is hermetic by design, so the first
+   end-to-end run against real hosts was done manually (TLS, robots, redirects unknown to
+   the fixtures). Re-run `agent0 ingest https://<host>/ && agent0 search "…"` against a
+   handful of real sites before trusting a new deployment; no CI job does it.
+10. **`RUST_LOG` filtering is coarse.** The subscriber is installed
+   (`search_api::init_tracing`) but nothing emits per-request access logs, so HTTP request
+   traces are not in journald — only pipeline `tracing` events.
 11. **Packs are produced/consumed by library calls, not a CLI or registry.** There is no
     `search-dataset` binary and no remote pack registry (see `DISTRIBUTION.md`).
 
