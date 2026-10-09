@@ -173,14 +173,49 @@ fn tokenize(text: &str) -> Vec<Token> {
 fn is_mentionish(token: &str) -> bool {
     let mut chars = token.chars();
     let Some(first) = chars.next() else { return false };
-    if !first.is_alphanumeric() {
+    if !first.is_alphabetic() {
+        // Number-led tokens are units, versions and hex literals far more often than names
+        // ("10MB", "0x00", "128k", "16GB" — all observed as the top "entities" of a real
+        // build). Requiring a leading letter keeps `GPT-4`, `B2B` and `R2R` and drops those.
         return false;
     }
     let uppercase = token.chars().filter(|c| c.is_uppercase()).count();
     let lowercase_after_first = token.chars().skip(1).any(|c| c.is_lowercase());
     first.is_uppercase()                    // Rust, Kubernetes, Anthropic
         || uppercase >= 2                   // vLLM, iOS, API, GPT
-        || (lowercase_after_first && token.chars().any(|c| c.is_ascii_digit())) // b2b? GPT-4
+        || (lowercase_after_first && token.chars().any(|c| c.is_ascii_digit())) // token2vec
+}
+
+/// Words that are document *structure*, not entities.
+///
+/// A page's navigation and headings repeat on every page of a site, so they clear any
+/// recurrence threshold and then dominate the graph ("Engine", "Release", "Image", "Storage"
+/// produced the highest-weight edges of a real build). They only apply to single-word mentions:
+/// a multi-word phrase ("Release Notes" aside) or an acronym is kept, because that is where the
+/// signal actually is.
+const STRUCTURAL_WORDS: &[&str] = &[
+    "engine", "release", "releases", "image", "images", "storage", "level", "queue", "pub",
+    "notes", "overview", "guide", "reference", "index", "docs", "documentation", "home", "page",
+    "pages", "search", "results", "input", "output", "data", "client", "server", "tools", "tool",
+    "usage", "example", "examples", "tutorial", "tutorials", "changelog", "license", "about",
+    "blog", "news", "events", "pricing", "support", "help", "login", "signup", "privacy",
+    "terms", "cookies", "menu", "skip", "content", "main", "sidebar", "footer", "header",
+    "title", "section", "chapter", "table", "figure", "next", "previous", "back", "top", "more",
+    "read", "share", "comments", "subscribe", "newsletter", "download", "downloads", "install",
+    "installation", "getting", "started", "quickstart", "configuration", "config", "settings",
+    "options", "parameters", "arguments", "flags", "commands", "command", "syntax", "return",
+    "returns", "value", "values", "type", "types", "name", "names", "id", "ids", "key", "keys",
+    "true", "false", "null", "none", "error", "errors", "warning", "warnings", "note",
+    "important", "tip", "summary", "description", "details", "introduction", "conclusion",
+    "appendix", "contents", "collections", "collection", "default", "defaults", "general",
+    "advanced", "basic", "custom", "common", "latest", "new", "old", "file", "files", "folder",
+    "path", "paths", "size", "length", "count", "number", "string", "format", "version",
+    "versions", "update", "updates", "change", "changes", "log", "logs", "code", "language",
+    "project", "projects", "team", "team.", "user", "users", "account", "accounts", "session",
+];
+
+fn is_structural_word(key: &str) -> bool {
+    !key.contains(' ') && STRUCTURAL_WORDS.contains(&key)
 }
 
 fn is_stopword(text: &str) -> bool {
@@ -253,6 +288,10 @@ pub fn extract_mentions(text: &str, min_count: usize, limit: usize) -> Vec<Menti
     // Count canonical occurrences over the whole document (rule 2): a kept mention is one whose
     // key appears at least `min_count` times, which is what removes sentence-initial noise.
     let doc_lower: Vec<String> = words.iter().map(|(_, t, _)| canonical_key(&t.text)).collect();
+    // Built once per document: rebuilding it per candidate made the pass quadratic and a
+    // 11 800-document build took longer than seven minutes.
+    let joined = doc_lower.join(" ");
+    let joined_bytes = joined.as_bytes();
 
     let mut by_key: HashMap<String, Mention> = HashMap::new();
     for (start, end) in spans {
@@ -266,13 +305,34 @@ pub fn extract_mentions(text: &str, min_count: usize, limit: usize) -> Vec<Menti
         if key_words.is_empty() {
             continue;
         }
-        // Count occurrences as *adjacent word windows*, not as a substring search: a substring
-        // search over " numpy numpy " is non-overlapping and would count the pair once, and it
-        // would also match inside a longer token.
-        let count = doc_lower
-            .windows(key_words.len())
-            .filter(|w| w.iter().map(String::as_str).eq(key_words.iter().copied()))
-            .count();
+        if is_structural_word(&key) {
+            continue;
+        }
+        // Count occurrences over the space-joined canonical text with explicit word boundaries,
+        // advancing by one character per attempt so a repeated word is counted every time
+        // (" numpy numpy " is two occurrences, not one) and a multi-token key still matches a
+        // single token whose canonical form contains the separator (`GPT-4` → "gpt 4").
+        let count = {
+            let bytes = joined_bytes;
+            let mut count = 0usize;
+            let mut from = 0usize;
+            while from <= joined.len() {
+                let Some(rel) = joined[from..].find(&key) else { break };
+                let pos = from + rel;
+                let end = pos + key.len();
+                let before_ok = pos == 0 || bytes[pos - 1] == b' ';
+                let after_ok = end == joined.len() || bytes[end] == b' ';
+                if before_ok && after_ok {
+                    count += 1;
+                }
+                // Advance by one *character*, not one byte: the corpus contains multibyte text,
+                // and slicing at a mid-character byte index panics ("start byte index 617 is not
+                // a char boundary; it is inside 'р'") — hit live on a Cyrillic page.
+                let step = joined[pos..].chars().next().map(char::len_utf8).unwrap_or(1);
+                from = pos + step;
+            }
+            count
+        };
         if count < min_count {
             continue;
         }
@@ -416,6 +476,32 @@ mod tests {
         assert_eq!(vllm.name, "vLLM", "the first form is the display name");
         assert!(vllm.forms.contains(&"VLLM".to_string()), "{:?}", vllm.forms);
         assert_eq!(mentions.iter().filter(|m| m.key == "vllm").count(), 1, "one node per key");
+    }
+
+    #[test]
+    fn numeric_tokens_and_structural_words_are_not_entities() {
+        // All of these were top "entities" of a real build: doc units (`10MB`, `0x00`), and a
+        // site's own navigation words repeated on every page (`Engine`, `Release`, `Image`).
+        let body = "10MB and 0x00 and 16GB are sizes. Engine and Release and Image appear \
+                    twice. Engine and Release and Image again. GPT-4 is a model. GPT-4 is used.";
+        let keys: Vec<String> =
+            extract_mentions(body, 2, 32).iter().map(|m| m.key.clone()).collect();
+        for bad in ["10mb", "0x00", "16gb", "engine", "release", "image"] {
+            assert!(!keys.contains(&bad.to_string()), "{bad} must not be an entity: {keys:?}");
+        }
+        assert!(keys.contains(&"gpt 4".to_string()), "a letter-led token with a digit stays: {keys:?}");
+    }
+
+    #[test]
+    fn multibyte_text_does_not_panic_the_occurrence_counter() {
+        // A live build panicked here ("start byte index 617 is not a char boundary; it is inside
+        // 'р'") because the counter advanced by one *byte*. Cyrillic, CJK and accented text must
+        // all be safe.
+        let body = "Антропология и Anthropic. Антропология снова. Anthropic является компанией. \
+                    Anthropic снова. 日本語のテスト。日本語のテスト。";
+        let keys: Vec<String> =
+            extract_mentions(body, 2, 32).iter().map(|m| m.key.clone()).collect();
+        assert!(keys.contains(&"anthropic".to_string()), "{keys:?}");
     }
 
     #[test]

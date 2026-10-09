@@ -43,6 +43,9 @@ pub struct Options {
     max_mentions: usize,
     window: usize,
     batch: usize,
+    /// Drop the existing graph before writing, so a rebuild with new rules does not leave the
+    /// rows the old rules produced (they are upserts, not replacements).
+    reset: bool,
 }
 
 impl Options {
@@ -56,6 +59,7 @@ impl Options {
             max_mentions: flag_usize(args, "--max-mentions").unwrap_or(40),
             window: flag_usize(args, "--window").unwrap_or(DEFAULT_COOC_WINDOW),
             batch: flag_usize(args, "--batch").unwrap_or(500),
+            reset: args.iter().any(|a| a == "--reset"),
         }
     }
 }
@@ -94,9 +98,13 @@ fn aggregate(docs: &[IndexDoc], opts: &Options) -> Built {
         let text = format!("{}\n{}\n{}", doc.title, doc.headings, doc.body);
         let mentions = extract_mentions(&text, opts.min_count, opts.max_mentions);
 
-        // Work identifiers are detected independently of mentions: a paper's landing page may
-        // have almost no recurring capitalised name, and its DOI still belongs in the store.
-        if let Some((kind, id)) = search_graph::detect_identifier(&text) {
+        // Work identifiers are detected independently of mentions, but only from the page's own
+        // identity: a blog post that *cites* a paper is not that paper. Requiring the identifier
+        // to appear in the URL or the title is the cheap, checkable rule that keeps the `work`
+        // table meaningful — an earlier build attributed `arxiv:0803.2392` to the Wikipedia page
+        // "Sparse dictionary learning" because its references section mentioned it.
+        let identity = format!("{} {}", doc.url, doc.title);
+        if let Some((kind, id)) = search_graph::detect_identifier(&identity) {
             let title = if doc.title.trim().is_empty() { None } else { Some(doc.title.clone()) };
             out.works.insert(id.clone(), (kind_tag(kind).to_string(), id, title));
         }
@@ -125,11 +133,6 @@ fn aggregate(docs: &[IndexDoc], opts: &Options) -> Built {
             if keys.contains(a.as_str()) && keys.contains(b.as_str()) {
                 out.edges.entry((a, b)).or_default().insert(doc.doc_id.clone());
             }
-        }
-
-        if let Some((kind, id)) = search_graph::detect_identifier(&text) {
-            let title = if doc.title.trim().is_empty() { None } else { Some(doc.title.clone()) };
-            out.works.insert(id.clone(), (kind_tag(kind).to_string(), id, title));
         }
     }
 
@@ -169,6 +172,21 @@ pub async fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if opts.reset {
+        // Children first: the schema has foreign keys from the alias and edge tables.
+        for stmt in [
+            "DELETE FROM entity_alias",
+            "DELETE FROM graph_edge",
+            "DELETE FROM entity",
+            "DELETE FROM work",
+        ] {
+            if let Err(e) = writer.conn().execute(stmt, []) {
+                eprintln!("failed to clear the graph ({stmt}): {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     let mut pending: Vec<Mutation> = Vec::new();
     let mut written_entities = 0usize;
@@ -235,7 +253,7 @@ pub async fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    println!("graph build: {} document(s) scanned", scanned);
+    println!("graph build: {} document(s) scanned{}", scanned, if opts.reset { " (graph reset first)" } else { "" });
     println!(
         "  entities: {written_entities} (aliases {written_aliases}); dropped as too rare: kept threshold --min-docs {}",
         opts.min_docs
@@ -325,14 +343,25 @@ mod tests {
         );
     }
 
+    fn doc_with_url(id: &str, url: &str, title: &str, body: &str) -> IndexDoc {
+        IndexDoc::new(id, format!("res_{id}"), url, title, body)
+    }
+
     #[test]
-    fn a_detected_identifier_becomes_a_work() {
+    fn a_page_that_is_a_work_registers_one() {
+        // The identifier is in the page's own URL or title: this is the paper's landing page.
         let docs = vec![
-            doc("d1", "Paged Attention", "See arXiv:2301.00001 for details. arXiv:2301.00001."),
-            doc(
+            doc_with_url(
+                "d1",
+                "https://arxiv.org/abs/2301.00001",
+                "Paged Attention",
+                "Paged Attention is described here. Paged Attention.",
+            ),
+            doc_with_url(
                 "d2",
-                "Retrieval",
-                "Published at https://doi.org/10.1234/abcd. Paged Attention cited it too.",
+                "https://example.com/paper",
+                "doi:10.1234/abcd — Retrieval",
+                "Retrieval notes. Retrieval notes again.",
             ),
         ];
         let built = aggregate(&docs, &opts(1));
@@ -340,5 +369,23 @@ mod tests {
         assert!(built.works.contains_key("doi:10.1234/abcd"), "{:?}", built.works.keys());
         assert_eq!(built.works["arxiv:2301.00001"].0, "arxiv");
         assert_eq!(built.works["arxiv:2301.00001"].2.as_deref(), Some("Paged Attention"));
+    }
+
+    #[test]
+    fn a_page_that_only_cites_a_work_does_not_register_it() {
+        // The identifier appears only in the *body*: this page references a paper, it is not it.
+        let docs = vec![doc_with_url(
+            "d1",
+            "https://en.wikipedia.org/wiki/Sparse_dictionary_learning",
+            "Sparse dictionary learning - Wikipedia",
+            "See arXiv:0803.2392 for the original work. Sparse dictionary learning is a topic. \
+             Sparse dictionary learning again.",
+        )];
+        let built = aggregate(&docs, &opts(1));
+        assert!(
+            built.works.is_empty(),
+            "a citing page must not register the cited work: {:?}",
+            built.works
+        );
     }
 }
