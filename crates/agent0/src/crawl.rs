@@ -42,6 +42,20 @@
 //! whole seed set. Every discovered URL enters the same queue (`frontier.json`)
 //! after dedup against the log and the queue.
 //!
+//! ## Link following
+//!
+//! Many roots (arxiv `/list/...`, news home pages, blog indexes) publish no
+//! sitemap and no feed, so discovery alone contributes almost nothing. After the
+//! sitemap work, [`discover_seed`] therefore also fetches the **seed page's**
+//! HTML and enqueues the document-shaped links found on it
+//! ([`article_links`]), same-origin only. This is **one level deep** and only
+//! for pages that were given as seeds or resumed from the frontier — a page that
+//! is itself reached by following a link is fetched and indexed by the normal
+//! drain but its own links are never expanded (a second level is a separate,
+//! budgeted decision). Cap: [`MAX_LINKS_PER_PAGE`] links per seed page; the
+//! global `--max-urls`/`--max-docs` bounds still apply. Opt out with
+//! `--no-follow-links`.
+//!
 //! ## The raw-body seam
 //!
 //! `Pipeline::crawl_one` drives robots/SSRF/normalize/dedup/index but does not
@@ -96,6 +110,16 @@ const MAX_CHILD_SITEMAPS: usize = 16;
 const MAX_FEEDS: usize = 8;
 const MAX_DISCOVERED: usize = 512;
 
+/// Maximum number of document links followed from one seed page. A hard ceiling
+/// so a link farm cannot spend the whole attempt budget from a single page; the
+/// global `max_urls` bound still applies on top.
+pub const MAX_LINKS_PER_PAGE: usize = 200;
+
+/// Upper bound on the HTML bytes [`article_links`] scans. A 5 MB page is
+/// truncated here so a pathological body cannot make the linear scan expensive;
+/// real pages put their navigation in the first bytes well within this.
+const MAX_LINK_SCAN_BYTES: usize = 5_000_000;
+
 /// Tunables for one crawl run.
 #[derive(Debug, Clone)]
 pub struct CrawlOptions {
@@ -109,6 +133,9 @@ pub struct CrawlOptions {
     pub max_urls: usize,
     /// Maximum in-flight fetches across different origins.
     pub concurrency: usize,
+    /// Follow same-origin document links found on a seed page (one level deep).
+    /// Defaults to `true`; disabled with `--no-follow-links`.
+    pub follow_links: bool,
     /// Test-only: exempt loopback targets from the SSRF guard.
     pub allow_loopback: bool,
     /// Minimum interval between two requests to the same origin.
@@ -125,6 +152,7 @@ impl CrawlOptions {
             max_docs,
             max_urls: max_docs.saturating_mul(10),
             concurrency: DEFAULT_CONCURRENCY,
+            follow_links: true,
             allow_loopback: false,
             origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
         }
@@ -156,7 +184,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         _ => {
             eprintln!(
                 "usage: agent0 crawl <seedsfile> [--max-docs N] [--concurrency C] \
-                 [--out DIR] [--max-urls N]"
+                 [--out DIR] [--max-urls N] [--no-follow-links]"
             );
             return ExitCode::from(2);
         }
@@ -166,6 +194,8 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
     let concurrency = flag_usize(args, "--concurrency").unwrap_or(DEFAULT_CONCURRENCY).max(1);
     let out = flag_str(args, "--out").unwrap_or_else(|| DEFAULT_OUT.to_string());
     let max_urls = flag_usize(args, "--max-urls").unwrap_or_else(|| max_docs.saturating_mul(10));
+    // Link following is on by default; `--no-follow-links` turns it off.
+    let follow_links = !args.iter().any(|a| a == "--no-follow-links");
     let interval_ms = std::env::var("SEARCH_CRAWL_ORIGIN_INTERVAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -177,6 +207,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         max_docs,
         max_urls,
         concurrency,
+        follow_links,
         allow_loopback: false,
         origin_interval: Duration::from_millis(interval_ms),
     };
@@ -333,6 +364,9 @@ struct Drainer {
     last: HashMap<String, Instant>,
     rr: usize,
     in_flight: usize,
+    /// Attempts charged per origin; a host at `origin_cap()` is retired so no
+    /// single sitemap can consume the whole budget (see `dispatch`).
+    origin_attempts: HashMap<String, usize>,
     attempts: usize,
     ingested: usize,
     /// Every URL enqueued-but-not-yet-logged (queued + in-flight); persisted to
@@ -366,6 +400,7 @@ impl Drainer {
             last: HashMap::new(),
             rr: 0,
             in_flight: 0,
+            origin_attempts: HashMap::new(),
             attempts: 0,
             ingested: 0,
             remaining: BTreeSet::new(),
@@ -419,6 +454,12 @@ impl Drainer {
         } else {
             q.push_back(url);
         }
+    }
+
+    /// Per-origin attempt cap: one tenth of the document goal, never below 200.
+    /// Keeps the corpus broad (many sources) instead of deep in one host.
+    fn origin_cap(&self) -> usize {
+        std::cmp::max(200, self.opts.max_docs / 10)
     }
 
     fn bound_reached(&self) -> bool {
@@ -515,6 +556,18 @@ impl Drainer {
                     Some(q) if !q.is_empty() => {}
                     _ => continue,
                 }
+                // Fairness: a single host (a giant sitemap) must not absorb the
+                // whole attempt budget. Once an origin reaches its cap its
+                // queue is dropped, so the remaining sources get the budget —
+                // the Stage-1 corpus wants many sources, not one deep host.
+                if self.origin_attempts.get(o).copied().unwrap_or(0) >= self.origin_cap() {
+                    if let Some(q) = self.queues.get_mut(o) {
+                        for u in q.drain(..) {
+                            self.remaining.remove(&u);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(t) = self.last.get(o) {
                     if now.saturating_duration_since(*t) < interval {
                         continue;
@@ -529,6 +582,7 @@ impl Drainer {
             let url = self.queues.get_mut(&o).unwrap().pop_front().unwrap();
             self.busy.insert(o.clone());
             self.last.insert(o.clone(), now);
+            *self.origin_attempts.entry(o.clone()).or_insert(0) += 1;
             self.in_flight += 1;
             self.attempts += 1;
             spawned += 1;
@@ -714,6 +768,29 @@ async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain
         }
     }
 
+    // (2b) Follow document links published on the seed page itself.
+    //
+    // One level only: `discover_seed` runs for seeds (and frontier entries),
+    // never for pages reached by following a link, so a followed page is fetched
+    // and indexed by the normal drain but its own links are never expanded.
+    //
+    // `Pipeline::discover` already fetched this page for feed discovery but does
+    // not surface the body (pipeline.rs is out of scope), so the seed HTML is
+    // fetched once more here with the module's discovery `Fetcher`.
+    if drain.opts.follow_links {
+        if let Some(bytes) = fetch_body(fetcher, seed).await {
+            let html = String::from_utf8_lossy(&bytes).to_string();
+            let seed_site = site_key(seed);
+            for link in article_links(seed, &html, MAX_LINKS_PER_PAGE) {
+                // Same-origin only, with `www.`/scheme normalisation (see
+                // `site_key`).
+                if site_key(&link) == seed_site {
+                    drain.enqueue(link);
+                }
+            }
+        }
+    }
+
     // (3) Feeds the pipeline persisted for this seed's domain, re-parsed.
     for feed_url in metadata_urls(pipeline, "SELECT url FROM feed LIMIT ?1", MAX_FEEDS as i64) {
         if let Some(bytes) = fetch_body(fetcher, &feed_url).await {
@@ -787,6 +864,184 @@ async fn fetch_body(fetcher: &Fetcher, url: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Outlink extraction (link following)
+// ---------------------------------------------------------------------------
+
+/// Extract document-shaped outlinks from an HTML page.
+///
+/// Signature: `pub fn article_links(base: &str, html: &str, cap: usize) -> Vec<String>`.
+///
+/// Every `href=` occurrence is found by a hand-written scan (both `"` and `'`
+/// quoting, attribute name matched case-insensitively, `data-href`/`xhref`
+/// ignored), its value is resolved against `base` with [`resolve_against`], and
+/// the result is kept only when ALL hold:
+///   * the resolved URL is absolute `http`/`https` (`mailto:`, `javascript:` or
+///     a leftover relative value is dropped);
+///   * any `#fragment` is stripped;
+///   * [`is_low_value`] is `false` (no profiles, utility pages, static assets);
+///   * [`url_rank`] `> 0` (document-shaped: `/docs/`, `/blog/`, dated slugs…).
+/// Kept links are deduped preserving first-seen order and truncated to `cap`.
+///
+/// This function is **origin-agnostic** — same-origin enforcement happens at the
+/// call site ([`discover_seed`]).
+///
+/// Safety on malformed input: a single left-to-right pass over at most
+/// [`MAX_LINK_SCAN_BYTES`] bytes (a 5 MB body is truncated there, so the scan is
+/// O(n) and cannot blow up); every index is bounds-checked, so truncated tags,
+/// stray quotes and unterminated comments/`<script>` never panic. `href` inside
+/// an HTML comment or a `<script>` body is ignored. HTML entities in an href
+/// (`&amp;`) are NOT decoded (no dependency is available); such a URL usually
+/// still parses.
+pub fn article_links(base: &str, html: &str, cap: usize) -> Vec<String> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let bytes = html.as_bytes();
+    let end = bytes.len().min(MAX_LINK_SCAN_BYTES);
+    let src = &bytes[..end];
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut i = 0usize;
+    while i < src.len() {
+        if out.len() >= cap {
+            break;
+        }
+        // Ignore everything inside a comment or a script body.
+        if starts_with_ci(src, i, b"<!--") {
+            i = skip_until(src, i + 4, b"-->");
+            continue;
+        }
+        if starts_with_ci(src, i, b"<script") {
+            i = skip_until(src, i + 7, b"</script");
+            continue;
+        }
+        // A whole attribute name: the preceding byte must not be part of one.
+        if starts_with_ci(src, i, b"href") && (i == 0 || !is_name_byte(src[i - 1])) {
+            if let Some((raw, next)) = read_href(src, i + 4) {
+                i = next;
+                push_link(&mut out, &mut seen, base, &raw, cap);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse `href`'s value starting just after the attribute name. Returns the raw
+/// (undecoded) value and the index just past it. Bounds-checked throughout.
+fn read_href(src: &[u8], mut j: usize) -> Option<(String, usize)> {
+    let n = src.len();
+    while j < n && matches!(src[j], b' ' | b'\t' | b'\n' | b'\r') {
+        j += 1;
+    }
+    if j >= n || src[j] != b'=' {
+        return None;
+    }
+    j += 1;
+    while j < n && matches!(src[j], b' ' | b'\t' | b'\n' | b'\r') {
+        j += 1;
+    }
+    if j >= n {
+        return None;
+    }
+    let quote = src[j];
+    if quote == b'"' || quote == b'\'' {
+        let start = j + 1;
+        let mut k = start;
+        while k < n && src[k] != quote {
+            k += 1;
+        }
+        let value = String::from_utf8_lossy(&src[start..k]).into_owned();
+        let next = if k < n { k + 1 } else { k };
+        Some((value, next))
+    } else {
+        let start = j;
+        let mut k = start;
+        while k < n && !matches!(src[k], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'<') {
+            k += 1;
+        }
+        Some((String::from_utf8_lossy(&src[start..k]).into_owned(), k))
+    }
+}
+
+/// Resolve, filter and dedupe one raw href; push it when it survives.
+fn push_link(
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    base: &str,
+    raw: &str,
+    cap: usize,
+) {
+    if out.len() >= cap {
+        return;
+    }
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let resolved = resolve_against(base, raw);
+    let Ok(mut u) = Url::parse(&resolved) else {
+        return;
+    };
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return;
+    }
+    u.set_fragment(None);
+    let candidate = u.to_string();
+    if is_low_value(&candidate) || url_rank(&candidate) <= 0 {
+        return;
+    }
+    if seen.insert(candidate.clone()) {
+        out.push(candidate);
+    }
+}
+
+/// `true` when `hay[at..]` starts with `needle` compared ASCII-case-insensitively.
+fn starts_with_ci(hay: &[u8], at: usize, needle: &[u8]) -> bool {
+    if at + needle.len() > hay.len() {
+        return false;
+    }
+    hay[at..at + needle.len()]
+        .iter()
+        .zip(needle)
+        .all(|(h, n)| h.to_ascii_lowercase() == *n)
+}
+
+/// Index just past the first occurrence of `needle` at or after `from`, or the
+/// end of `hay` when it is absent.
+fn skip_until(hay: &[u8], from: usize, needle: &[u8]) -> usize {
+    let mut i = from;
+    while i < hay.len() {
+        if starts_with_ci(hay, i, needle) {
+            return i + needle.len();
+        }
+        i += 1;
+    }
+    hay.len()
+}
+
+/// A byte that can be part of an attribute name (`-`/`:`/`_` or alphanumeric).
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b':' | b'_')
+}
+
+/// Normalised site key for the same-origin check: the lowercased host with a
+/// leading `www.` removed, plus an explicit port when one is present (the `url`
+/// crate already strips default `:80`/`:443`). The scheme is deliberately NOT
+/// part of the key, so `http://host/` and `https://host/` — and `www.host` vs
+/// `host` — count as the same origin when following links.
+fn site_key(url: &str) -> Option<String> {
+    let u = Url::parse(url).ok()?;
+    let host = u.host_str()?.to_ascii_lowercase();
+    let bare = host.strip_prefix("www.").unwrap_or(&host);
+    match u.port() {
+        Some(p) => Some(format!("{bare}:{p}")),
+        None => Some(bare.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -856,7 +1111,11 @@ const LOW_VALUE_SEGMENTS: &[&str] = &[
     "/cart", "/checkout", "/password", "/settings", "/preferences", "/notifications",
     "/search", "/help", "/faq", "/support", "/legal/", "/privacy", "/terms", "/cookies",
     "/sitemap", "/robots.txt", "/feed/", "/rss/", "/atom/", "/tag/", "/tags/", "/label/",
-    "/print/", "/amp/", "/amp/", "/cdn-cgi/",
+    "/print/", "/amp/", "/amp/", "/cdn-cgi/", "/topic/", "/topics/", "/browse/",
+    // Generated index pages: a docs.rs "list of all items in this crate" or a
+    // release index is a machine listing with almost no prose — it indexes as a
+    // document but supports no question.
+    "/all.html", "/releases/", "/versions/",
 ];
 
 /// File suffixes that are never an indexable document in this crawler.
@@ -1105,5 +1364,26 @@ mod tests {
         assert_eq!(ext_for(Some("application/pdf")), "pdf");
         assert_eq!(ext_for(Some("text/html")), "html");
         assert_eq!(ext_for(None), "bin");
+    }
+
+    #[test]
+    fn site_key_normalises_www_and_scheme_but_keeps_port() {
+        // `https://www.` and `http://` forms of the same host are one site.
+        assert_eq!(
+            site_key("https://www.example.com/docs/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            site_key("http://example.com/docs/x").as_deref(),
+            Some("example.com")
+        );
+        // A distinct host or an explicit port is a different site.
+        assert_eq!(site_key("https://other.com/x").as_deref(), Some("other.com"));
+        assert_eq!(
+            site_key("https://example.com:8443/x").as_deref(),
+            Some("example.com:8443")
+        );
+        // Unparseable input has no site key.
+        assert!(site_key("not a url").is_none());
     }
 }
