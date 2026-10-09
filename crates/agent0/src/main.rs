@@ -223,38 +223,11 @@ async fn run_export(args: &[String]) -> ExitCode {
     };
 
     // The index is the source of truth: its STOREd fields carry url/title/body.
-    let mut pages: Vec<search_organize::RawPage> = Vec::new();
-    let mut skipped = 0usize;
-    for d in docs {
-        if pages.len() >= limit {
-            break;
-        }
-        if d.url.trim().is_empty() || d.body.trim().is_empty() {
-            skipped += 1;
-            continue;
-        }
-        pages.push(search_organize::RawPage {
-            url: d.url.clone(),
-            source: "web".to_string(),
-            title: (!d.title.trim().is_empty()).then(|| d.title.clone()),
-            text: d.body.clone(),
-            published_at: d.published_at,
-        });
-    }
+    let (pages, skipped) = search_agent0::portable::pages_from_docs(&docs, limit);
 
     let mut failed_pages = 0usize;
     let (records, mode): (Vec<search_dataset::Record>, &str) = if raw {
-        let recs = pages
-            .iter()
-            .map(|p| {
-                let mut r = search_dataset::Record::new(search_organize::id_from_url(&p.url), "web");
-                r.url = Some(p.url.clone());
-                r.title = p.title.clone();
-                r.text = p.text.clone();
-                r.published_at = p.published_at;
-                r
-            })
-            .collect();
+        let recs = pages.iter().map(search_agent0::portable::raw_record).collect();
         (recs, "raw")
     } else {
         let llm_cfg = match search_organize::LlmConfig::from_env() {

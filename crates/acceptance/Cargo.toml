@@ -11,6 +11,7 @@ serde_json.workspace = true
 search-agent0 = { path = "../agent0" }
 search-api = { path = "../api" }
 search-core = { path = "../core" }
+search-dataset = { path = "../dataset" }
 search-mcp = { path = "../mcp" }
 search-scheduler = { path = "../scheduler" }
 axum.workspace = true

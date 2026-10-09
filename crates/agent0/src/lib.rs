@@ -28,6 +28,7 @@
 
 pub mod deep;
 pub mod pipeline;
+pub mod portable;
 
 pub use deep::{
     run_deep_search, DeepHit, DeepResult, DeepSearchReport, DocText, NoopEmitter, Phase,
