@@ -1,0 +1,26 @@
+[package]
+name = "search-answer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "search_answer"
+path = "src/lib.rs"
+
+[dependencies]
+# The injection point: search-engine defines `Answerer` / `EvidenceRecord`.
+search-engine = { path = "../engine" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
+tokio = { version = "1", features = ["full"] }
