@@ -17,6 +17,8 @@ search-core = { path = "../core" }
 search-metadata = { path = "../metadata" }
 search-ingest = { path = "../ingest" }
 search-indexer = { path = "../indexer" }
+# Dense lane: BGE embeddings + the vector sidecar (`agent0 embed build`).
+search-embed = { path = "../embed" }
 search-frontier = { path = "../frontier" }
 search-fetcher = { path = "../fetcher" }
 search-parser = { path = "../parser" }
@@ -60,3 +62,9 @@ regex.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
+
+[features]
+# Real BGE-small-en-v1.5 weights for the dense lane. On by default per the Stage-2 decision;
+# `default-features = false` keeps a build hermetic (no ONNX Runtime, no model download).
+default = ["bge"]
+bge = ["search-embed/bge"]

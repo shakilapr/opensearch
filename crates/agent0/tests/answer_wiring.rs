@@ -82,13 +82,13 @@ fn no_key_disables_answerer_and_search_is_unchanged() {
     }
 }
 
-/// `serve_with(cfg, searcher, deep, answerer)` compiles with the frozen signature, and the
+/// `serve_with(cfg, searcher, deep, answerer, extra_lanes)` compiles, and the
 /// `answerer = None` path is unchanged: it builds state and returns the bind error.
 #[tokio::test]
 async fn serve_with_none_answerer_uses_the_unchanged_path() {
     let cfg = bad_bind_config();
     let searcher: Arc<dyn Searcher + Send + Sync> = Arc::new(StubSearcher);
-    let err = search_api::serve_with(&cfg, searcher, None, None).await;
+    let err = search_api::serve_with(&cfg, searcher, None, None, Vec::new()).await;
     assert!(err.is_err(), "an unparseable bind address must fail");
 
     // The builder function is reachable with the exact answerer type.
@@ -104,7 +104,7 @@ async fn serve_with_accepts_an_answerer() {
     let cfg = bad_bind_config();
     let searcher: Arc<dyn Searcher + Send + Sync> = Arc::new(StubSearcher);
     let answerer: Arc<dyn search_engine::Answerer + Send + Sync> = Arc::new(FakeAnswerer);
-    let err = search_api::serve_with(&cfg, searcher, None, Some(answerer.clone())).await;
+    let err = search_api::serve_with(&cfg, searcher, None, Some(answerer.clone()), Vec::new()).await;
     assert!(err.is_err(), "an unparseable bind address must fail");
 
     // The state carries the answerer through.

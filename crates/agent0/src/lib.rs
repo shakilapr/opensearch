@@ -27,6 +27,7 @@
 //! `docs/STAGE4_SPEC.md`).
 
 pub mod crawl;
+pub mod embedbuild;
 pub mod graphbuild;
 pub mod deep;
 pub mod pipeline;

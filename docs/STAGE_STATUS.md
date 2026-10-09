@@ -45,15 +45,18 @@ multi-week architecture work, gated by the plan on proven quality.
   1. **Labelled benchmark at scale — data/decision.** The plan asks for 500–2000 queries across
      classes with LLM-judge + manual labels; `benchmarks/` holds 50 over a 30-document fixture.
      Generating labels costs model calls and a decision to spend them.
-  2. **The dense lane does not exist in the serving path — code.** This is stronger than "opt-in":
-     the Tantivy schema has no vector field, `crates/retrieval` has no dense module, and the only
-     consumer of `search-embed` is `crates/bench`. A `/search` request therefore cannot use
-     embeddings at all, and the BGE numbers (paraphrase nDCG@10 0.4238 → 0.5842) are a
-     *benchmark-harness* result, not a serving result. Making BGE the default (the decision taken)
-     means building the lane: persist per-document vectors, embed the corpus, expose a
-     `LaneSearcher`, and fuse it. The schema is frozen (hash-asserted), so vectors belong in a
-     sidecar keyed by `doc_id` — which also means the backfill only needs *read* access and can run
-     beside a crawl.
+  2. **Dense lane — DONE (corpus backfill is data, and it is complete).** Built end to end:
+     `crates/embed::VectorStore` (a `doc_id` → vector sidecar carrying `source_id`, so a scoped
+     lane call can honour it, with a byte-stable on-disk format), `crates/retrieval::DenseLane`
+     (a `LaneSearcher` over it, brute-force cosine, refusing a store whose dimension does not
+     match its embedder), `agent0 embed build` (backfill, opens the index **read-only** so it runs
+     beside a crawl), and API wiring (`AppState::with_extra_lanes`; the engine fuses any injected
+     lane by rank, naming it in `lane_ranks`). BGE is the default build (`default = ["bge"]`).
+     Live: `dense lane enabled docs=12486`, and every result for "what is retrieval augmented
+     generation" carries `{"bm25": n, "dense": m, "source_first": k}` with dense ordering
+     genuinely different from BM25. Remaining refinement: brute force does not scale past ~100K
+     documents (`crates/ann` exists for that), and the fixture benchmark has not been re-run to
+     state a serving-quality delta.
   3. **Real sparse weights and a trained cross-encoder — decision taken: ship the documented
      proxies.** They stay proxies, labelled as such in `docs/ROADMAP.md` gaps 5–6.
   4. **Ablations measured on the real corpus — code.** Ablations exist, but only on the fixture.

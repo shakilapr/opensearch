@@ -128,6 +128,7 @@ pub fn lane_name(lane: Lane) -> &'static str {
     match lane {
         Lane::Bm25 => "bm25",
         Lane::SourceFirst => "source_first",
+        Lane::Dense => "dense",
     }
 }
 
@@ -544,11 +545,19 @@ impl EvidenceVerifier for TextVerifier<'_> {
 /// up in that map. As a defensive fallback for any id the lanes did not retain,
 /// one `Searcher::search` re-fetch is issued (never per-result). Rows that still
 /// cannot be hydrated are dropped rather than fabricated.
+/// Extra lanes injected by the caller (e.g. the dense lane over a vector store).
+///
+/// The engine fuses whatever lanes it is given by rank, so adding one is a wiring decision, not
+/// an engine change: the lane carries its own [`search_retrieval::Lane`] id and therefore its own
+/// name in `lane_ranks`.
+pub type ExtraLanes = [Arc<dyn search_retrieval::LaneSearcher + Send + Sync>];
+
 pub fn run_engine_search(
     searcher: &dyn Searcher,
     req: EngineSearchRequest,
     now_ms: i64,
     answerer: Option<&dyn Answerer>,
+    extra_lanes: &ExtraLanes,
 ) -> AppResult<EngineSearchResponse> {
     let started = Instant::now();
 
@@ -574,7 +583,10 @@ pub fn run_engine_search(
     let lane_source = SearcherLane::new(searcher, Lane::SourceFirst);
     let retained_bm25 = lane_bm25.retained();
     let retained_source = lane_source.retained();
-    let lanes: [&dyn LaneSearcher; 2] = [&lane_bm25, &lane_source];
+    // The two index-backed lanes always run; any injected lane (today: the dense lane over the
+    // vector store) is fused alongside them and named in `lane_ranks` by its own lane id.
+    let mut lanes: Vec<&dyn LaneSearcher> = vec![&lane_bm25, &lane_source];
+    lanes.extend(extra_lanes.iter().map(|l| &**l as &dyn LaneSearcher));
 
     let aliases = AliasPriors::empty();
     let selector = RuleSelector::new();

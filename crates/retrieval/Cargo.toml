@@ -12,6 +12,7 @@ real-indexer = ["dep:search-indexer"]
 
 [dependencies]
 search-core = { path = "../core" }
+search-embed = { path = "../embed" }
 search-indexer = { path = "../indexer", optional = true }
 search-graph = { path = "../graph" }
 thiserror.workspace = true
@@ -19,3 +20,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true

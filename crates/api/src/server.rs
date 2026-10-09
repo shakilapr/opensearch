@@ -36,6 +36,9 @@ pub struct Inner {
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     /// Optional §22.1 answer generator; `None` keeps the engine lexical-only.
     answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
+    /// Extra retrieval lanes fused into every engine query (today: the dense lane). Built by
+    /// the binary, which owns the feature and environment decisions.
+    extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
     started: Instant,
 }
 
@@ -46,6 +49,7 @@ impl AppState {
                 searcher,
                 deep: None,
                 answerer: None,
+                extra_lanes: Vec::new(),
                 started: Instant::now(),
             }),
         }
@@ -61,6 +65,7 @@ impl AppState {
                 searcher,
                 deep: Some(deep),
                 answerer: None,
+                extra_lanes: Vec::new(),
                 started: Instant::now(),
             }),
         }
@@ -74,14 +79,31 @@ impl AppState {
     ) -> Self {
         let searcher = self.inner.searcher.clone();
         let deep = self.inner.deep.clone();
+        let extra_lanes = self.inner.extra_lanes.clone();
         let started = self.inner.started;
         Self {
             inner: Arc::new(Inner {
                 searcher,
                 deep,
                 answerer: Some(answerer),
+                extra_lanes,
                 started,
             }),
+        }
+    }
+
+    /// Attach extra retrieval lanes (e.g. the dense lane over a vector store). They are fused
+    /// into every engine query; each lane names itself in `lane_ranks`.
+    pub fn with_extra_lanes(
+        self,
+        extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
+    ) -> Self {
+        let searcher = self.inner.searcher.clone();
+        let deep = self.inner.deep.clone();
+        let answerer = self.inner.answerer.clone();
+        let started = self.inner.started;
+        Self {
+            inner: Arc::new(Inner { searcher, deep, answerer, extra_lanes, started }),
         }
     }
 
@@ -210,11 +232,12 @@ async fn search(
         // §6–§18 engine path. The clock is read HERE, at the HTTP boundary, and
         // passed into the engine as unix seconds.
         let answerer = state.inner.answerer.clone();
+        let extra_lanes = state.inner.extra_lanes.clone();
         let now_ms = now_unix_s();
         let resp = tokio::task::spawn_blocking(move || {
             let answerer_ref: Option<&dyn search_engine::Answerer> =
                 answerer.as_deref().map(|a| a as &dyn search_engine::Answerer);
-            run_engine_search(searcher.as_ref(), req, now_ms, answerer_ref)
+            run_engine_search(searcher.as_ref(), req, now_ms, answerer_ref, &extra_lanes)
         })
         .await
         .map_err(|e| ApiError::internal(format!("search task panicked: {e}")))?
@@ -330,7 +353,7 @@ pub async fn serve(
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
 ) -> AppResult<()> {
-    serve_with(cfg, searcher, deep, None).await
+    serve_with(cfg, searcher, deep, None, Vec::new()).await
 }
 
 /// Bind and serve until the process is stopped, with an optional §22.1 answer
@@ -339,11 +362,13 @@ pub async fn serve(
 /// `deep` optionally enables `/search_deep` and `/read` (else `503`);
 /// `answerer` optionally enables the `answer` field on `POST /search` when
 /// `engine: true` (else the engine is lexical-only).
+/// Serve, optionally with extra retrieval lanes (see [`AppState::with_extra_lanes`]).
 pub async fn serve_with(
     cfg: &Config,
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
+    extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
 ) -> AppResult<()> {
     // Ensure a subscriber exists even when the caller (e.g. an embedding binary)
     // forgot to initialise one. Idempotent.
@@ -355,6 +380,12 @@ pub async fn serve_with(
     let state = match answerer {
         Some(a) => state.with_answerer(a),
         None => state,
+    };
+    let state = if extra_lanes.is_empty() {
+        state
+    } else {
+        tracing::info!(lanes = extra_lanes.len(), "serving with injected retrieval lanes");
+        state.with_extra_lanes(extra_lanes)
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind)

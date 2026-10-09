@@ -12,6 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dense;
+
+pub use dense::DenseLane;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +38,8 @@ pub enum Lane {
     #[default]
     Bm25,
     SourceFirst,
+    /// Semantic lane over a document-vector store (plan §9.3).
+    Dense,
 }
 
 /// A scored retrieval candidate carrying enough provenance for the UI's

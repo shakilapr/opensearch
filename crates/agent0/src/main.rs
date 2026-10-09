@@ -52,6 +52,58 @@ fn open_for_serve(cfg: &search_core::config::Config) -> search_core::error::AppR
     }
 }
 
+/// Build the dense lane over the vector sidecar, when one exists.
+///
+/// The binary owns this choice: it knows the data root, the `SEARCH_MODEL_CACHE` location and
+/// whether this build has the `bge` feature. An absent sidecar is a normal state (the corpus has
+/// not been backfilled) and yields no lane; a *mismatched* one is logged and skipped rather than
+/// allowed to inject noise into every query.
+fn build_dense_lane(
+    cfg: &search_core::config::Config,
+) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
+    let path = cfg.data_dir.join("vectors.bin");
+    if !path.exists() {
+        tracing::info!(
+            path = %path.display(),
+            "no vector store: the dense lane is off (build one with `agent0 embed build`)"
+        );
+        return Vec::new();
+    }
+    let embedder: std::sync::Arc<dyn search_embed::Embedder> = {
+        #[cfg(feature = "bge")]
+        {
+            let cache = std::env::var("SEARCH_MODEL_CACHE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| cfg.data_dir.join("fastembed"));
+            match search_embed::bge::BgeEmbedder::with_cache_dir(cache) {
+                Ok(e) => std::sync::Arc::new(e),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "BGE weights unavailable: serving without the dense lane"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        #[cfg(not(feature = "bge"))]
+        {
+            std::sync::Arc::new(search_embed::HashEmbedder::new(256))
+        }
+    };
+    match search_retrieval::DenseLane::from_path(&path, embedder) {
+        Ok(Some(lane)) => {
+            tracing::info!(path = %path.display(), docs = lane.len(), "dense lane enabled");
+            vec![std::sync::Arc::new(lane)]
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "vector store unusable: serving without the dense lane");
+            Vec::new()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Honour RUST_LOG (default `info`); without this the deploy unit's RUST_LOG
@@ -79,6 +131,15 @@ async fn main() -> ExitCode {
             Some("build") => search_agent0::graphbuild::run(&args).await,
             _ => {
                 eprintln!("usage: agent0 graph build [--limit N] [--min-count C] [--min-docs D] [--window W]");
+                ExitCode::from(2)
+            }
+        },
+        Some("embed") => match args.get(2).map(String::as_str) {
+            Some("build") => search_agent0::embedbuild::run(&args).await,
+            _ => {
+                eprintln!(
+                    "usage: agent0 embed build [--out PATH] [--limit N] [--max-chars N] [--embedder bge|hash]"
+                );
                 ExitCode::from(2)
             }
         },
@@ -233,7 +294,8 @@ async fn run_serve() -> ExitCode {
         tracing::info!("{}", search_answer::disabled_reason().message());
     }
 
-    if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer).await {
+    let extra_lanes = build_dense_lane(&cfg);
+    if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, extra_lanes).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);
     }

@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod store;
+
+pub use store::{StoreError, VectorStore};
+
 use serde::{Deserialize, Serialize};
 
 /// A dense embedding vector. By contract `v` is L2-normalized (`||v|| == 1`) unless the
