@@ -47,6 +47,31 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_BIND` | `127.0.0.1:8080` | HTTP API bind |
 | `SEARCH_USER_AGENT` | `AgentNativeSearchBot/0.1 (+https://github.com/agent-native-search)` | crawl UA |
 | `RUST_LOG` | `info` | tracing filter (see *Logs*) |
+| `SEARCH_MODEL_CACHE` | `<workspace>/models/fastembed` | where the real embedding weights live (see *Real embedding model*) |
+
+## Real embedding model (BGE-small)
+
+The dense lane can run a real semantic model instead of the built-in lexical
+`HashEmbedder`. It is **off by default** — the default build links no ONNX Runtime and
+downloads nothing — and enabled per build with the `bge` feature:
+
+```sh
+cargo build --release --features bge -p search-bench
+cargo test  -p search-embed --features bge      # 15 tests; first run fetches the model
+```
+
+* Model: `BAAI/bge-small-en-v1.5`, 384-d, CLS-pooled, L2-normalized, via `fastembed`
+  on CPU.
+* Weights are fetched on **first use** into `<workspace root>/models/fastembed`
+  (~128 MB, gitignored — the same `models/` tree used for other server-only artifacts).
+  Override the location with `SEARCH_MODEL_CACHE`.
+* Two failure modes worth knowing: several processes constructing the model at once
+  race on the Hugging Face download (`Failed to retrieve model file 'onnx/model.onnx'`)
+  — load it once and share it; and the cache path is resolved by walking up to the
+  workspace root, because `cargo test` runs with the CWD set to the crate directory.
+* Queries should go through `BgeEmbedder::embed_query` (it applies the instruction the
+  model was trained for); passages through `Embedder::embed`. The frozen `Embedder`
+  trait has a single method and cannot express that asymmetry.
 
 ## The refresh tick
 
