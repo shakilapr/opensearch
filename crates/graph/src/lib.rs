@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+pub mod activate;
 pub mod extract;
 pub mod work;
 
@@ -200,6 +201,14 @@ impl Graph {
             .filter(|id| seen.insert((*id).clone()))
             .filter_map(|id| self.entities.get(id))
             .collect()
+    }
+
+    /// Edges incident to `entity_id`, in insertion order.
+    ///
+    /// Every edge is indexed under both endpoints (`add_edge`), so this returns it whether the id
+    /// is the edge's `from` or its `to` — the neighbourhood walk behind graph activation.
+    pub fn edges_of(&self, entity_id: &str) -> impl Iterator<Item = &Edge> {
+        self.adjacency.get(entity_id).into_iter().flatten().map(move |&idx| &self.edges[idx])
     }
 
     /// Breadth-first expansion from `entity_id` up to `max_hops` edges away.
