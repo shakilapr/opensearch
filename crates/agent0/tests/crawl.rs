@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -372,4 +372,133 @@ async fn fixture_records_requests() {
     // The seed is fetched during discovery and again during the drain.
     assert!(fx.count("/a") >= 1);
     assert!(fx.count("/robots.txt") >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Discovery hygiene (raw-dataset coverage)
+// ---------------------------------------------------------------------------
+
+/// A seed page that serves a strong `ETag` must still be ingested: the
+/// discovery pre-fetch must not store validators in the resource store, or the
+/// very next conditional fetch returns 304 and reports the seed `Unchanged`
+/// (so it is silently missing from the corpus).
+#[tokio::test]
+async fn seed_with_etag_is_ingested_not_unchanged() {
+    const ETAG: &str = "\"v1\"";
+    let fx = Fx::default();
+    let net_fx = fx.clone();
+    let router = Router::new()
+        .route(
+            "/robots.txt",
+            get(move || {
+                let fx = net_fx.clone();
+                async move {
+                    fx.record("/robots.txt");
+                    ([(header::CONTENT_TYPE, "text/plain")], ROBOTS_OPEN).into_response()
+                }
+            }),
+        )
+        .route(
+            "/abs/paper",
+            get({
+                let fx = fx.clone();
+                move |headers: HeaderMap| {
+                    let fx = fx.clone();
+                    async move {
+                        fx.record("/abs/paper");
+                        let inm = headers
+                            .get(header::IF_NONE_MATCH)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if inm == ETAG {
+                            return (
+                                StatusCode::NOT_MODIFIED,
+                                [(header::ETAG, ETAG), (header::CONTENT_TYPE, "text/html")],
+                            )
+                                .into_response();
+                        }
+                        (
+                            StatusCode::OK,
+                            [
+                                (header::ETAG, ETAG),
+                                (header::CONTENT_TYPE, "text/html"),
+                            ],
+                            P1,
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base = format!("http://{addr}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "etag.txt", &[format!("{base}/abs/paper")]);
+
+    let summary = crawl(options(seeds, out), &cfg).await.unwrap();
+    assert_eq!(
+        summary.ingested, 1,
+        "the etag-bearing seed must ingest exactly once, got {summary:?}"
+    );
+    assert_eq!(summary.unchanged, 0, "no phantom 'unchanged' for a seed");
+    assert!(
+        fx.count("/abs/paper") >= 2,
+        "discovery + drain both fetch it (conditional GET still sent to the server)"
+    );
+}
+
+/// Profiles, utility endpoints and static assets are rejected before they cost
+/// an attempt; document-shaped URLs are kept.
+#[test]
+fn low_value_urls_are_rejected_and_documents_kept() {
+    use search_agent0::crawl::is_low_value;
+
+    for bad in [
+        "https://www.semanticscholar.org/author/Hu-Chuan-Lu/153176123",
+        "https://example.com/users/42",
+        "https://example.com/login?next=/x",
+        "https://example.com/assets/app.js",
+        "https://example.com/img/hero.png",
+        "https://example.com/sitemap.xml",
+        "https://example.com/search?q=rust",
+        "https://example.com/static/main.css",
+        "not a url",
+    ] {
+        assert!(is_low_value(bad), "{bad} must be rejected");
+    }
+
+    for good in [
+        "https://arxiv.org/abs/2005.11401",
+        "https://www.rust-lang.org/learn/get-started",
+        "https://huggingface.co/docs/transformers/index",
+        "https://blog.rust-lang.org/2024/01/post.html",
+        "https://en.wikipedia.org/wiki/Retrieval-augmented_generation",
+        "https://example.com/paper.pdf",
+    ] {
+        assert!(!is_low_value(good), "{good} must be kept");
+    }
+}
+
+/// Ranking puts papers/docs ahead of generic pages, deterministically.
+#[test]
+fn content_urls_rank_ahead_of_generic_pages() {
+    use search_agent0::crawl::url_rank;
+
+    assert!(url_rank("https://arxiv.org/abs/2005.11401") > url_rank("https://arxiv.org/"));
+    assert!(url_rank("https://huggingface.co/docs/transformers/index") > 0);
+    assert!(url_rank("https://example.com/") < 1);
+    assert!(url_rank("https://example.com/a-b-c-d.html") > 0);
+    // Deterministic: same input, same rank.
+    assert_eq!(
+        url_rank("https://example.com/docs/a-b-c"),
+        url_rank("https://example.com/docs/a-b-c")
+    );
 }

@@ -269,7 +269,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
             continue;
         }
         discover_seed(&pipeline, &fetcher, seed, &mut drain).await;
-        drain.enqueue(seed.clone());
+        drain.enqueue_seed(seed.clone());
         drain.persist();
         drain.run().await;
         if drain.bound_reached() {
@@ -381,6 +381,11 @@ impl Drainer {
         if !url.starts_with("http") {
             return;
         }
+        // A profile/utility/asset URL can never be indexed: rejecting it here
+        // keeps the attempt budget for documents (see `is_low_value`).
+        if is_low_value(&url) {
+            return;
+        }
         if self.seen.contains(&url) || !self.remaining.insert(url.clone()) {
             return;
         }
@@ -388,7 +393,32 @@ impl Drainer {
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
         }
-        self.queues.entry(o).or_default().push_back(url);
+        let q = self.queues.entry(o).or_default();
+        // Ranked documents drain before generic pages within an origin.
+        if url_rank(&url) > 0 {
+            q.push_front(url);
+        } else {
+            q.push_back(url);
+        }
+    }
+
+    /// Enqueue an operator-provided seed. Seeds bypass the low-value gate: the
+    /// user asked for this URL explicitly.
+    fn enqueue_seed(&mut self, url: String) {
+        if !url.starts_with("http") || self.seen.contains(&url) || !self.remaining.insert(url.clone())
+        {
+            return;
+        }
+        let o = origin_of(&url);
+        if !self.queues.contains_key(&o) {
+            self.order.push(o.clone());
+        }
+        let q = self.queues.entry(o).or_default();
+        if url_rank(&url) > 0 {
+            q.push_front(url);
+        } else {
+            q.push_back(url);
+        }
     }
 
     fn bound_reached(&self) -> bool {
@@ -599,7 +629,7 @@ async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: Stri
             };
 
             if let Some(cid) = content_id {
-                if let Some(raw) = read_pipeline_blob(&cfg, &cid) {
+                if let Some(raw) = read_pipeline_bytes(&cfg, &cid) {
                     let sha = sha256_hex(&raw);
                     let ct = sniff_media_type(&per.final_url, &raw);
                     per.bytes = raw.len() as u64;
@@ -637,12 +667,20 @@ fn outcome_url(o: &IngestOutcome) -> Option<String> {
 ///
 /// Seam: `crawl_one` -> `write_content_files` writes the fetched body to
 /// `cfg.blob_path(<content-hash>)`; the content id is `cnt_<hex>`.
-fn read_pipeline_blob(cfg: &Config, content_id: &str) -> Option<Vec<u8>> {
+///
+/// Falls back to the normalized text when the blob is gone: a document that is
+/// still in the index (an `Unchanged` re-fetch, or an earlier run that only
+/// kept text) must still be represented in the raw dataset, otherwise the
+/// dataset silently under-covers the index.
+pub fn read_pipeline_bytes(cfg: &Config, content_id: &str) -> Option<Vec<u8>> {
     let hex = content_id.strip_prefix("cnt_").unwrap_or(content_id);
     if hex.len() < 2 {
         return None;
     }
-    std::fs::read(cfg.blob_path(hex)).ok()
+    if let Ok(raw) = std::fs::read(cfg.blob_path(hex)) {
+        return Some(raw);
+    }
+    std::fs::read(cfg.text_path(hex)).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +843,74 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Path segments that never carry an indexable document: account/utility pages
+/// and static assets. Big hosts advertise these in their sitemaps (a
+/// semanticscholar sitemap is thousands of `/author/<name>/<id>` profile URLs),
+/// so without a gate the attempt budget is spent on pages that can never be
+/// indexed — a 10k-document run then yields a handful of documents.
+const LOW_VALUE_SEGMENTS: &[&str] = &[
+    "/author/", "/authors/", "/profile", "/user/", "/users/", "/people/", "/members/",
+    "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/account",
+    "/cart", "/checkout", "/password", "/settings", "/preferences", "/notifications",
+    "/search", "/help", "/faq", "/support", "/legal/", "/privacy", "/terms", "/cookies",
+    "/sitemap", "/robots.txt", "/feed/", "/rss/", "/atom/", "/tag/", "/tags/", "/label/",
+    "/print/", "/amp/", "/amp/", "/cdn-cgi/",
+];
+
+/// File suffixes that are never an indexable document in this crawler.
+const LOW_VALUE_SUFFIXES: &[&str] = &[
+    ".css", ".js", ".mjs", ".json", ".xml", ".txt", ".csv", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".eot", ".zip", ".gz",
+    ".tar", ".rar", ".7z", ".mp4", ".webm", ".mp3", ".wav", ".exe", ".dmg", ".apk",
+];
+
+/// Path prefixes that ARE documents: research papers, docs, blog posts, wikis.
+/// Used only to order the queue (ranked first), never to exclude.
+const CONTENT_SEGMENTS: &[&str] = &[
+    "/abs/", "/pdf/", "/paper/", "/papers/", "/doi/", "/docs/", "/doc/", "/documentation",
+    "/blog/", "/posts/", "/post/", "/news/", "/article", "/wiki/", "/learn/", "/guide",
+    "/tutorial", "/reference/", "/manual", "/handbook", "/notes/", "/research/",
+    "/publication", "/report",
+];
+
+/// `true` when a URL cannot be a document (a profile, a utility endpoint or a
+/// static asset) and must not consume an attempt.
+pub fn is_low_value(url: &str) -> bool {
+    let path = match Url::parse(url) {
+        Ok(u) => u.path().to_ascii_lowercase(),
+        Err(_) => return true,
+    };
+    if LOW_VALUE_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+        return true;
+    }
+    LOW_VALUE_SEGMENTS.iter().any(|s| path.contains(s))
+}
+
+/// Content-shape rank: documented content first, everything else after it.
+/// Deterministic and content-free (no body is fetched to compute it).
+pub fn url_rank(url: &str) -> i32 {
+    let path = match Url::parse(url) {
+        Ok(u) => u.path().to_ascii_lowercase(),
+        Err(_) => return -1,
+    };
+    let mut rank = 0;
+    if CONTENT_SEGMENTS.iter().any(|s| path.contains(s)) {
+        rank += 2;
+    }
+    // A dated or wordy slug path is usually a real article.
+    if path.rsplit('/').next().map(|s| s.matches('-').count()).unwrap_or(0) >= 2 {
+        rank += 1;
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") {
+        rank += 1;
+    }
+    // A bare query string (no path) is a search/filter view, not a document.
+    if path.trim_matches('/').is_empty() {
+        rank -= 1;
+    }
+    rank
 }
 
 /// Origin (`scheme://host[:port]`) of a URL, else the raw string for an

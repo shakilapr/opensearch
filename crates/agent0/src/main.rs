@@ -185,7 +185,17 @@ async fn run_serve() -> ExitCode {
     // Deep search / document read are served from the same pipeline instance.
     let deep: std::sync::Arc<dyn search_api::DeepSearcher + Send + Sync> =
         std::sync::Arc::new(search_agent0::PipelineDeepSearcher::new(pipeline.clone()));
-    if let Err(e) = search_api::serve(&cfg, searcher, Some(deep)).await {
+
+    // §22.1 answer generation is opt-in and env-driven. `None` (no key, or the feature
+    // disabled) keeps the engine lexical-only; the search path is then unchanged.
+    let answerer: Option<std::sync::Arc<dyn search_engine::Answerer + Send + Sync>> =
+        search_answer::from_env()
+            .map(|a| std::sync::Arc::new(a) as std::sync::Arc<dyn search_engine::Answerer + Send + Sync>);
+    if answerer.is_none() {
+        tracing::info!("{}", search_answer::disabled_reason().message());
+    }
+
+    if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);
     }

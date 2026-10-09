@@ -220,6 +220,10 @@ pub struct Pipeline {
     owner: String,
     /// Stage-1 conditional-refresh validators, keyed by canonical URL.
     validators: MemoryValidators,
+    /// Validators for *discovery* fetches only (robots/sitemaps/feeds/the seed
+    /// page). Kept separate so a discovery fetch can never make the resource
+    /// fetch report `304`/`Unchanged` for a version that was never ingested.
+    discovery_validators: MemoryValidators,
     /// Test-only: exempt loopback targets from the SSRF guard so a hermetic
     /// local server can be crawled. Production (`open`) leaves this `false`.
     allow_loopback: bool,
@@ -338,6 +342,7 @@ impl Pipeline {
             indexer,
             owner: format!("agent0-{}", std::process::id()),
             validators: MemoryValidators::new(),
+            discovery_validators: MemoryValidators::new(),
             allow_loopback,
             scheduler: ActivationScheduler::new(scheduler_cfg, BudgetLedger::new(budget_capacity)),
             dispatch_budget: BudgetLedger::new(budget_capacity),
@@ -1179,10 +1184,27 @@ impl Pipeline {
     /// Conditional fetch: send stored `If-None-Match` / `If-Modified-Since`
     /// validators when known; store fresh validators on 2xx/304. A `304` is
     /// returned as status `304` with no body.
+    ///
+    /// Uses the **resource** validator store, so it is the only path that may
+    /// decide "unchanged" for a resource version.
     async fn do_fetch_conditional(&self, url: &str) -> AppResult<FetchOutcome> {
+        self.do_fetch_conditional_with(&self.validators, url).await
+    }
+
+    /// As [`Pipeline::do_fetch_conditional`] but against an explicit store.
+    ///
+    /// Discovery fetches (robots/sitemaps/feeds/**the seed page itself**) must
+    /// use their own store: storing a seed's `ETag` in the resource store makes
+    /// the very next `crawl_one` see `304` and report the seed as `Unchanged`,
+    /// so the seed is never ingested (silently absent from the corpus).
+    async fn do_fetch_conditional_with(
+        &self,
+        store: &MemoryValidators,
+        url: &str,
+    ) -> AppResult<FetchOutcome> {
         let key = canonicalize(url).unwrap_or_else(|_| url.to_string());
         if self.allow_loopback && is_loopback_url(url) {
-            let prior = self.validators.get(&key);
+            let prior = store.get(&key);
             let (etag, lm) = prior
                 .as_ref()
                 .map(|v| (v.etag.clone(), v.last_modified.clone()))
@@ -1190,10 +1212,10 @@ impl Pipeline {
             let o = self
                 .fetch_local_cond(url, etag.as_deref(), lm.as_deref())
                 .await?;
-            store_validators(&self.validators, &key, &o);
+            store_validators(store, &key, &o);
             return Ok(o);
         }
-        let fetched = self.fetcher.fetch_conditional(&self.validators, url).await?;
+        let fetched = self.fetcher.fetch_conditional(store, url).await?;
         Ok(match fetched {
             Fetched::Unchanged {
                 final_url,
@@ -1321,8 +1343,13 @@ impl Pipeline {
     }
 
     /// Fetch a body for discovery; `None` for a non-2xx (or 304) status.
+    ///
+    /// Uses the discovery validator store (never the resource store) so a
+    /// discovery fetch cannot suppress the resource fetch of the same URL.
     async fn get_body(&self, url: &str) -> AppResult<Option<FetchOutcome>> {
-        let o = self.do_fetch_conditional(url).await?;
+        let o = self
+            .do_fetch_conditional_with(&self.discovery_validators, url)
+            .await?;
         if (200..300).contains(&o.status) && o.body.is_some() {
             Ok(Some(o))
         } else {

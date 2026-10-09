@@ -39,6 +39,10 @@ search-organize = { path = "../organize" }
 # `real-indexer` wires the API's Searcher trait to the real Tantivy indexer
 # (src/indexer_adapter.rs). agent0 owns the whole pipeline, so it enables it.
 search-api = { path = "../api", features = ["real-indexer"] }
+# §22.1 answer generation: `search-answer` implements search-engine's Answerer from
+# the environment; `serve` passes it (or None) through to the API.
+search-engine = { path = "../engine" }
+search-answer = { path = "../answer" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
