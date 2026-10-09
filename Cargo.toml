@@ -33,6 +33,7 @@ members = [
     "crates/acceptance",
     "crates/api",
     "crates/agent0",
+    "crates/organize",
 ]
 
 [workspace.package]
