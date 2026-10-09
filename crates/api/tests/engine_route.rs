@@ -335,9 +335,11 @@ async fn answerer_receives_resolved_passage_text_not_doc_ids() {
 }
 
 #[tokio::test]
-async fn answerer_prefers_stored_document_text_over_the_fragment() {
-    // A searcher that can serve stored bodies must be preferred: the fragment is
-    // only a fallback. Proves the answer prompt carries real page content.
+async fn answerer_excerpts_the_stored_body_around_the_query_terms() {
+    // With no retained fragment the passage must come from the page body, and
+    // must be excerpted around the query terms rather than taken from the head
+    // (the head of a scraped page is navigation — a live answerer read it as
+    // "table of contents").
     struct BodySearcher(StubSearcher);
     impl Searcher for BodySearcher {
         fn search(
@@ -346,10 +348,20 @@ async fn answerer_prefers_stored_document_text_over_the_fragment() {
             limit: usize,
             filters: Option<&SearchFilters>,
         ) -> AppResult<Vec<IndexHit>> {
-            self.0.search(q, limit, filters)
+            let mut hits = self.0.search(q, limit, filters)?;
+            // Strip the fragments so resolution has to fall back to the body.
+            for h in hits.iter_mut() {
+                h.snippet = String::new();
+            }
+            Ok(hits)
         }
         fn doc_text(&self, _doc_id: &str) -> AppResult<Option<String>> {
-            Ok(Some("full stored body: transformers replaced recurrence in 2017".into()))
+            let body = format!(
+                "{}{}",
+                "nav home about contact ".repeat(40),
+                "Transformers replaced recurrence in 2017 and now dominate NLP."
+            );
+            Ok(Some(body))
         }
     }
 
@@ -362,14 +374,18 @@ async fn answerer_prefers_stored_document_text_over_the_fragment() {
         addr,
         "POST",
         "/search",
-        Some(r#"{"query":"rust","engine":true,"mode":"fast","limit":2}"#),
+        Some(r#"{"query":"transformers nlp","engine":true,"mode":"fast","limit":2}"#),
     )
     .await;
     assert_eq!(s, 200, "{b}");
     let answer = b["answer"].as_str().unwrap_or_default();
     assert!(
-        answer.contains("full stored body"),
-        "stored body was not used as the passage: {answer}"
+        answer.contains("Transformers replaced recurrence"),
+        "body excerpt missing from the passage: {answer}"
+    );
+    assert!(
+        !answer.starts_with("nav home about"),
+        "the passage is the page head, not an excerpt around the query terms: {answer}"
     );
 }
 

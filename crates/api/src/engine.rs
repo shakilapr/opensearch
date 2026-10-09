@@ -242,12 +242,12 @@ impl<S: Searcher + ?Sized> LaneSearcher for SearcherLane<'_, S> {
 /// ground anything (a live run answered "the evidence contains no content—only
 /// passage identifiers").
 ///
-/// Resolution order per id:
-/// 1. the document's **stored body** via [`Searcher::doc_text`], truncated to
-///    [`MAX_PASSAGE_CHARS`] — the real content, so the answer is grounded in
-///    what the page says rather than in its header;
-/// 2. the lane-retained hit's `title. snippet` (a query-relevant fragment), when
-///    the index cannot serve the body;
+/// Resolution per id, best first:
+/// 1. the lane-retained hit's **query-relevant fragment** (`snippet`), prefixed
+///    with the title — the index built it around the query terms, so it is the
+///    page's answer-bearing text rather than its navigation block;
+/// 2. an **excerpt of the stored body** centred on the first query-term match
+///    (falling back to the head when no term is found) — the real content;
 /// 3. the id itself, so a missing passage is visible as a missing passage and
 ///    never invented.
 pub struct SnippetAnswerer<'a, A: Answerer + ?Sized> {
@@ -256,9 +256,12 @@ pub struct SnippetAnswerer<'a, A: Answerer + ?Sized> {
     retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
 }
 
-/// Characters kept from one document's stored body for the answer prompt
-/// (`search-answer` truncates again to its own per-passage cap).
+/// Characters kept from one document for the answer prompt (`search-answer`
+/// truncates again to its own per-passage cap).
 const MAX_PASSAGE_CHARS: usize = 1500;
+
+/// Characters of leading context kept before the first query-term match.
+const PASSAGE_LEAD_CHARS: usize = 200;
 
 impl<'a, A: Answerer + ?Sized> SnippetAnswerer<'a, A> {
     /// Wrap `inner`, resolving passages against the index and the lanes' hits.
@@ -275,33 +278,81 @@ impl<'a, A: Answerer + ?Sized> SnippetAnswerer<'a, A> {
     }
 
     /// The passage text for one doc id (see the type docs for the order).
-    fn passage(&self, doc_id: &str) -> String {
+    fn passage(&self, doc_id: &str, terms: &[String]) -> String {
+        let (title, snippet) = self.retained_hit(doc_id);
+        let mut text = String::new();
+        if !title.trim().is_empty() {
+            text.push_str(title.trim());
+            text.push_str(". ");
+        }
+        if !snippet.trim().is_empty() {
+            text.push_str(snippet.trim());
+        }
+        // Add the page's own text around the query terms when it still fits: a
+        // 300-character fragment can be a link list on a documentation site,
+        // and the answerer needs something it can actually quote.
         if let Ok(Some(body)) = self.searcher.doc_text(doc_id) {
             let trimmed = body.trim();
             if !trimmed.is_empty() {
-                if trimmed.chars().count() <= MAX_PASSAGE_CHARS {
-                    return trimmed.to_string();
+                let used = text.chars().count();
+                if used < MAX_PASSAGE_CHARS {
+                    let excerpt = excerpt_around(trimmed, terms, MAX_PASSAGE_CHARS - used);
+                    if !excerpt.is_empty() && !text.contains(&excerpt) {
+                        if !text.is_empty() {
+                            text.push_str(" … ");
+                        }
+                        text.push_str(&excerpt);
+                    }
                 }
-                return trimmed.chars().take(MAX_PASSAGE_CHARS).collect();
             }
         }
+        if text.trim().is_empty() {
+            // Nothing was retained and the index has no body: show the id, so a
+            // missing passage stays visible instead of being invented.
+            text.push_str(doc_id);
+        }
+        text
+    }
+
+    /// The retained title and query-relevant fragment for a doc id, when a lane
+    /// kept the hit.
+    fn retained_hit(&self, doc_id: &str) -> (String, String) {
         for map in &self.retained {
             let Ok(guard) = map.lock() else { continue };
             let Some(hit) = guard.get(doc_id) else { continue };
-            let mut text = String::with_capacity(hit.title.len() + hit.snippet.len() + 2);
-            if !hit.title.trim().is_empty() {
-                text.push_str(hit.title.trim());
-                text.push_str(". ");
-            }
-            if !hit.snippet.trim().is_empty() {
-                text.push_str(hit.snippet.trim());
-            }
-            if !text.trim().is_empty() {
-                return text;
-            }
+            return (hit.title.clone(), hit.snippet.clone());
         }
-        doc_id.to_string()
+        (String::new(), String::new())
     }
+}
+
+/// A bounded excerpt of `body` centred on the first `terms` occurrence.
+///
+/// The head of a scraped page is navigation, so the excerpt starts
+/// [`PASSAGE_LEAD_CHARS`] before the first match and runs to
+/// `max_chars`. With no match at all the head is used (better than nothing, and
+/// honest about what it is).
+fn excerpt_around(body: &str, terms: &[String], max_chars: usize) -> String {
+    let hit = first_term_char_index(body, terms);
+    let start = match hit {
+        Some(i) => i.saturating_sub(PASSAGE_LEAD_CHARS),
+        None => 0,
+    };
+    let mut out = String::new();
+    for c in body.chars().skip(start).take(max_chars) {
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
+/// Character index of the first occurrence of any term (lowercased,
+/// alphanumeric-trimmed) in `body`.
+fn first_term_char_index(body: &str, terms: &[String]) -> Option<usize> {
+    let lower = body.to_lowercase();
+    terms
+        .iter()
+        .filter_map(|t| lower.find(t.as_str()).map(|byte| lower[..byte].chars().count()))
+        .min()
 }
 
 impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
@@ -311,7 +362,8 @@ impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
         evidence: &[search_engine::evidence::EvidenceRecord],
         passages: &[String],
     ) -> Result<String, String> {
-        let resolved: Vec<String> = passages.iter().map(|id| self.passage(id)).collect();
+        let terms = search_core::text::content_tokens(query);
+        let resolved: Vec<String> = passages.iter().map(|id| self.passage(id, &terms)).collect();
         self.inner.answer(query, evidence, &resolved)
     }
 }
@@ -334,12 +386,17 @@ impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
 pub struct TextVerifier<'a> {
     searcher: &'a dyn Searcher,
     retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>,
+    cache: DocCache,
 }
 
 impl<'a> TextVerifier<'a> {
     /// A verifier reading `searcher`, with the lanes' retained hits as fallback.
     pub fn new(searcher: &'a dyn Searcher, retained: Vec<Arc<Mutex<HashMap<String, IndexHit>>>>) -> Self {
-        Self { searcher, retained }
+        Self {
+            searcher,
+            retained,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The best text this layer can obtain for a document id.
@@ -359,48 +416,110 @@ impl<'a> TextVerifier<'a> {
     }
 }
 
-/// Function words that carry no content: a unit like "what is retrieval
-/// augmented generation" must not fail verification because the page never
-/// writes "what" or "is" (this is exactly what made coverage read 0 against 115
-/// matching documents). Only the *unit* side is filtered — a stopword appearing
-/// in the document is harmless.
-const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do", "does", "for", "from",
-    "how", "in", "into", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there",
-    "these", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "will",
-    "with",
-];
+/// Maximum document tokens considered by the proximity check. Support for a
+/// unit is a *local* property: a term pair 40 KB apart in a scraped page is a
+/// coincidence, not evidence, so the scan is bounded and locality is required.
+const VERIFY_SCAN_TOKENS: usize = 8_000;
 
-/// Lowercase alphanumeric tokens (the same normalisation the engine applies to
-/// titles, so a hyphenated "Retrieval-Augmented" matches "retrieval augmented").
-fn tokens(s: &str) -> Vec<String> {
-    s.to_lowercase()
+/// Largest token distance that still counts as "the unit is stated here".
+const PROXIMITY_WINDOW: usize = 80;
+
+/// Documents whose tokenised body has already been computed, so a unit×candidate
+/// sweep tokenises each document once.
+type DocCache = Mutex<HashMap<String, Arc<Vec<String>>>>;
+
+/// Cached tokenisation of a document's best available text.
+fn doc_tokens(cache: &DocCache, text: &str, doc_id: &str) -> Arc<Vec<String>> {
+    if let Ok(guard) = cache.lock() {
+        if let Some(v) = guard.get(doc_id) {
+            return Arc::clone(v);
+        }
+    }
+    let mut v: Vec<String> = Vec::new();
+    for tok in text
+        .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .collect()
+    {
+        v.push(tok.to_string());
+        if v.len() >= VERIFY_SCAN_TOKENS {
+            break;
+        }
+    }
+    let arc = Arc::new(v);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() < 128 {
+            guard.insert(doc_id.to_string(), Arc::clone(&arc));
+        }
+    }
+    arc
 }
 
-/// Content tokens of a query unit: [`tokens`] minus [`STOPWORDS`]. Falls back to
-/// the unfiltered tokens when a unit is nothing but stopwords, so a purely
-/// functional query still gets verified instead of auto-failing.
-fn content_tokens(s: &str) -> Vec<String> {
-    let all = tokens(s);
-    let kept: Vec<String> = all
-        .iter()
-        .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        all
-    } else {
-        kept
+/// True when every `terms` entry occurs inside one window of
+/// [`PROXIMITY_WINDOW`] tokens. Equivalent to "the page states this unit",
+/// whereas mere presence anywhere in a 100 KB page means almost nothing.
+///
+/// Positions are capped per term so the sweep stays bounded on pathological
+/// documents (a page repeating one word thousands of times).
+fn window_contains_all(doc: &[String], terms: &[String]) -> bool {
+    const MAX_POS: usize = 2_000;
+    if terms.len() == 1 {
+        return doc.iter().any(|t| t == &terms[0]);
     }
+    // positions per term, in document order
+    let mut positions: Vec<Vec<usize>> = vec![Vec::new(); terms.len()];
+    let mut seen = 0usize;
+    for (i, tok) in doc.iter().enumerate() {
+        for (ti, term) in terms.iter().enumerate() {
+            if tok == term {
+                if positions[ti].len() < MAX_POS {
+                    positions[ti].push(i);
+                    seen += 1;
+                }
+            }
+        }
+        if seen >= MAX_POS * terms.len() {
+            break;
+        }
+    }
+    if positions.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    // Merge into one ascending event stream and slide a window over it.
+    let mut events: Vec<(usize, usize)> = Vec::new();
+    for (ti, pos) in positions.iter().enumerate() {
+        for p in pos {
+            events.push((*p, ti));
+        }
+    }
+    events.sort_unstable();
+    let mut counts = vec![0usize; terms.len()];
+    let mut have = 0usize;
+    let mut left = 0usize;
+    for right in 0..events.len() {
+        let (pos_right, ti) = events[right];
+        counts[ti] += 1;
+        if counts[ti] == 1 {
+            have += 1;
+        }
+        while have == terms.len() {
+            let (pos_left, tl) = events[left];
+            if pos_right - pos_left <= PROXIMITY_WINDOW {
+                return true;
+            }
+            counts[tl] -= 1;
+            if counts[tl] == 0 {
+                have -= 1;
+            }
+            left += 1;
+        }
+    }
+    false
 }
 
 impl EvidenceVerifier for TextVerifier<'_> {
     fn supports(&self, unit_text: &str, doc_id: &str) -> bool {
-        let unit = content_tokens(unit_text);
+        let unit = search_core::text::content_tokens(unit_text);
         if unit.is_empty() {
             return false;
         }
@@ -408,8 +527,8 @@ impl EvidenceVerifier for TextVerifier<'_> {
         if text.trim().is_empty() {
             return false;
         }
-        let doc = tokens(&text);
-        unit.iter().all(|t| doc.contains(t))
+        let doc = doc_tokens(&self.cache, &text, doc_id);
+        window_contains_all(&doc, &unit)
     }
 }
 
@@ -610,4 +729,74 @@ fn snapshot_id(
     mix(ranking_policy_version.as_bytes());
     mix(query_plan_version.as_bytes());
     format!("{acc:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(s: &str) -> Vec<String> {
+        s.split_whitespace().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn proximity_accepts_a_locally_stated_unit() {
+        let doc = toks("retrieval augmented generation grounds the model");
+        assert!(window_contains_all(&doc, &toks("retrieval augmented generation")));
+    }
+
+    #[test]
+    fn proximity_rejects_terms_scattered_across_a_long_page() {
+        // All three terms are present, but never together: that is a
+        // coincidence on a scraped page, not support.
+        let mut parts = vec!["retrieval".to_string()];
+        parts.extend(std::iter::repeat("filler".to_string()).take(200));
+        parts.push("augmented".to_string());
+        parts.extend(std::iter::repeat("filler".to_string()).take(200));
+        parts.push("generation".to_string());
+        assert!(!window_contains_all(&parts, &toks("retrieval augmented generation")));
+    }
+
+    #[test]
+    fn proximity_requires_every_term() {
+        let doc = toks("retrieval augmented");
+        assert!(!window_contains_all(&doc, &toks("retrieval augmented generation")));
+    }
+
+    #[test]
+    fn single_term_units_are_presence_checks() {
+        let mut parts = vec!["transformer".to_string()];
+        parts.extend(std::iter::repeat("filler".to_string()).take(500));
+        assert!(window_contains_all(&parts, &toks("transformer")));
+    }
+
+    #[test]
+    fn excerpt_starts_near_the_match_not_at_the_page_head() {
+        let mut body = "nav home about contact ".repeat(40);
+        body.push_str(" Paged Attention stores the KV cache in fixed-size blocks. ");
+        let terms = search_core::text::content_tokens("paged attention");
+        let out = excerpt_around(&body, &terms, MAX_PASSAGE_CHARS);
+        assert!(out.contains("Paged Attention stores"), "{out}");
+        assert!(out.chars().count() <= MAX_PASSAGE_CHARS, "bounded excerpt");
+        // It must not begin at the navigation block.
+        assert!(!out.starts_with("nav home about"), "{out}");
+    }
+
+    #[test]
+    fn excerpt_falls_back_to_the_head_when_no_term_occurs() {
+        let body = "alpha beta gamma ".repeat(200);
+        let out = excerpt_around(&body, &["zzz".to_string()], 100);
+        assert!(out.starts_with("alpha beta gamma"), "{out}");
+        assert_eq!(out.chars().count(), 100);
+    }
+
+    #[test]
+    fn document_tokenisation_is_bounded_and_cached() {
+        let cache = Mutex::new(HashMap::new());
+        let long = "word ".repeat(VERIFY_SCAN_TOKENS + 5_000);
+        let a = doc_tokens(&cache, &long, "d1");
+        assert_eq!(a.len(), VERIFY_SCAN_TOKENS);
+        let b = doc_tokens(&cache, &long, "d1");
+        assert!(Arc::ptr_eq(&a, &b), "second call must reuse the cached tokens");
+    }
 }
