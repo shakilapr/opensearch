@@ -6,6 +6,7 @@
 //! be flooded; saturated capacity sheds with `429`.
 
 use crate::deep::{DeepSearchRequest, DeepSearchResponse, DeepSearcher, DocResponse};
+use crate::engine::{run_engine_search, EngineSearchRequest};
 use crate::query::{self, Searcher, DEFAULT_LIMIT};
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
@@ -15,7 +16,7 @@ use axum::{
     BoxError, Json, Router,
 };
 use search_core::config::Config;
-use search_core::{AppError, AppResult, SearchRequest, SearchResponse};
+use search_core::{AppError, AppResult};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,6 +34,8 @@ pub struct Inner {
     pub searcher: Arc<dyn Searcher + Send + Sync>,
     /// Optional deep-search / document-read capability (`/search_deep`, `/read`).
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
+    /// Optional §22.1 answer generator; `None` keeps the engine lexical-only.
+    answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
     started: Instant,
 }
 
@@ -42,6 +45,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 searcher,
                 deep: None,
+                answerer: None,
                 started: Instant::now(),
             }),
         }
@@ -56,7 +60,27 @@ impl AppState {
             inner: Arc::new(Inner {
                 searcher,
                 deep: Some(deep),
+                answerer: None,
                 started: Instant::now(),
+            }),
+        }
+    }
+
+    /// Attach the optional §22.1 answer generator used by the engine path.
+    /// Preserves the existing searcher/deep wiring.
+    pub fn with_answerer(
+        self,
+        answerer: Arc<dyn search_engine::Answerer + Send + Sync>,
+    ) -> Self {
+        let searcher = self.inner.searcher.clone();
+        let deep = self.inner.deep.clone();
+        let started = self.inner.started;
+        Self {
+            inner: Arc::new(Inner {
+                searcher,
+                deep,
+                answerer: Some(answerer),
+                started,
             }),
         }
     }
@@ -68,6 +92,11 @@ impl AppState {
     /// The deep-search backend, when one was configured.
     pub fn deep(&self) -> Option<&(dyn DeepSearcher + Send + Sync)> {
         self.inner.deep.as_deref()
+    }
+
+    /// The answer generator, when one was configured.
+    pub fn answerer(&self) -> Option<&(dyn search_engine::Answerer + Send + Sync)> {
+        self.inner.answerer.as_deref()
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -168,15 +197,43 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn search(
     State(state): State<AppState>,
-    req: Result<Json<SearchRequest>, JsonRejection>,
-) -> Result<Json<SearchResponse>, ApiError> {
+    req: Result<Json<EngineSearchRequest>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let Json(req) = req.map_err(ApiError::from_rejection)?;
 
     // Search is CPU/IO bound; keep it off the async runtime's worker threads.
     let searcher = state.inner.searcher.clone();
-    let query_len = req.query.len();
-    let limit = req.limit;
-    let resp = tokio::task::spawn_blocking(move || query::execute(searcher.as_ref(), &req))
+    let query_len = req.base.query.len();
+    let limit = req.base.limit;
+
+    if req.engine {
+        // §6–§18 engine path. The clock is read HERE, at the HTTP boundary, and
+        // passed into the engine as unix seconds.
+        let answerer = state.inner.answerer.clone();
+        let now_ms = now_unix_s();
+        let resp = tokio::task::spawn_blocking(move || {
+            let answerer_ref: Option<&dyn search_engine::Answerer> =
+                answerer.as_deref().map(|a| a as &dyn search_engine::Answerer);
+            run_engine_search(searcher.as_ref(), req, now_ms, answerer_ref)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("search task panicked: {e}")))?
+        .map_err(ApiError::from_app)?;
+
+        tracing::debug!(
+            query_len,
+            limit,
+            hits = resp.results.len(),
+            stop_reason = %resp.stop_reason,
+            "POST /search (engine) served"
+        );
+        let value =
+            serde_json::to_value(&resp).map_err(|e| ApiError::internal(e.to_string()))?;
+        return Ok(Json(value));
+    }
+
+    // Legacy path: bit-for-bit unchanged when `engine` is absent/false.
+    let resp = tokio::task::spawn_blocking(move || query::execute(searcher.as_ref(), &req.base))
         .await
         .map_err(|e| ApiError::internal(format!("search task panicked: {e}")))?
         .map_err(ApiError::from_app)?;
@@ -187,7 +244,17 @@ async fn search(
         hits = resp.results.len(),
         "POST /search served"
     );
-    Ok(Json(resp))
+    let value = serde_json::to_value(&resp).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(value))
+}
+
+/// Current wall-clock time in unix seconds. Read only at the HTTP boundary; the
+/// engine core never touches a clock.
+fn now_unix_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// `POST /search_deep` — navigation-driven search returning hits + trace.
@@ -263,12 +330,31 @@ pub async fn serve(
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
 ) -> AppResult<()> {
+    serve_with(cfg, searcher, deep, None).await
+}
+
+/// Bind and serve until the process is stopped, with an optional §22.1 answer
+/// generator for the engine path.
+///
+/// `deep` optionally enables `/search_deep` and `/read` (else `503`);
+/// `answerer` optionally enables the `answer` field on `POST /search` when
+/// `engine: true` (else the engine is lexical-only).
+pub async fn serve_with(
+    cfg: &Config,
+    searcher: Arc<dyn Searcher + Send + Sync>,
+    deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
+    answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
+) -> AppResult<()> {
     // Ensure a subscriber exists even when the caller (e.g. an embedding binary)
     // forgot to initialise one. Idempotent.
     crate::init_tracing();
     let state = match deep {
         Some(d) => AppState::with_deep(searcher, d),
         None => AppState::new(searcher),
+    };
+    let state = match answerer {
+        Some(a) => state.with_answerer(a),
+        None => state,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind)

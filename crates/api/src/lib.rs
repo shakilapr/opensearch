@@ -7,6 +7,7 @@
 //! independently.
 
 pub mod deep;
+pub mod engine;
 pub mod query;
 pub mod server;
 
@@ -16,8 +17,12 @@ pub mod indexer_adapter;
 pub use deep::{
     DeepHit, DeepSearchRequest, DeepSearchResponse, DeepSearcher, DocResponse,
 };
+pub use engine::{
+    lane_name, run_engine_search, stop_reason_name, EngineCoverage, EngineMode, EngineResult,
+    EngineSearchRequest, EngineSearchResponse, SearcherLane,
+};
 pub use query::{analyze, build_signals, execute, IndexHit, Searcher, DEFAULT_LIMIT, MAX_LIMIT};
-pub use server::{router, serve, AppState, ApiError, DEFAULT_MAX_CONCURRENCY};
+pub use server::{router, serve, serve_with, AppState, ApiError, DEFAULT_MAX_CONCURRENCY};
 
 #[cfg(feature = "real-indexer")]
 pub use indexer_adapter::IndexerSearcher;

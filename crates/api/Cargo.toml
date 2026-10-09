@@ -16,6 +16,8 @@ real-indexer = ["dep:search-indexer"]
 
 [dependencies]
 search-core = { path = "../core" }
+search-engine = { path = "../engine" }
+search-retrieval = { path = "../retrieval" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
