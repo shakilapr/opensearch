@@ -1030,3 +1030,59 @@ async fn a_page_that_disappears_is_marked_deleted_and_keeps_its_history() {
         "the fetched bytes must remain on disk after a deletion: history is kept"
     );
 }
+
+#[tokio::test]
+async fn compressed_raw_blobs_inflate_to_the_fetched_bytes() {
+    // `--compress` exists because raw pages average ~237 KB: a million of them is ~237 GB raw, and
+    // that is the difference between a large corpus fitting on this disk and not. The sha256 in the
+    // file name stays the hash of the *uncompressed* bytes, so the crawl log and dedup are
+    // unchanged — only the stored form shrinks.
+    let (base, _fx) = spawn_recording_fixture(
+        vec![("/doc".to_string(), "text/html".to_string(), P1.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/doc");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.compress = true;
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 1, "{summary:?}");
+
+    let bones = blob_files(&out);
+    assert_eq!(bones.len(), 1, "{bones:?}");
+    assert!(bones[0].ends_with(".gz"), "the blob must be stored gzipped: {bones:?}");
+    assert!(
+        bones[0].contains(SHA_P1),
+        "the file name must keep the sha256 of the UNCOMPRESSED bytes: {bones:?}"
+    );
+
+    // And it must inflate to exactly what was fetched.
+    let raw = std::fs::read(out.join("blobs").join(&bones[0])).expect("read blob");
+    let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+    let mut html = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut html).expect("inflate");
+    assert_eq!(html, P1, "the gzipped blob must inflate to the fetched page");
+}
+
+#[tokio::test]
+async fn blobs_stay_uncompressed_without_the_flag() {
+    let (base, _fx) = spawn_recording_fixture(
+        vec![("/doc".to_string(), "text/html".to_string(), P1.to_string())],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/doc");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+    crawl(options(seeds, out.clone()), &cfg).await.unwrap();
+    let bones = blob_files(&out);
+    assert!(bones.iter().all(|b| !b.ends_with(".gz")), "default stays raw: {bones:?}");
+}

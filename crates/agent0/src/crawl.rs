@@ -147,6 +147,10 @@ pub struct CrawlOptions {
     /// rather than depth in a few sets a smaller value so the document budget
     /// spreads across more hosts.
     pub origin_cap: Option<usize>,
+    /// Gzip each spilled raw blob. Off by default so an existing raw corpus keeps its shape; on for
+    /// a large crawl, where uncompressed raw does not fit: pages average ~237 KB, so a million of
+    /// them is ~237 GB raw and roughly a seventh of that gzipped.
+    pub compress: bool,
     /// §21 escalation driver. `None` in production unless `SEARCH_BROWSER` asks for one;
     /// tests attach a `MockBrowser` here to exercise the path hermetically.
     pub browser: Option<Arc<dyn BrowserFetcher>>,
@@ -166,6 +170,7 @@ impl std::fmt::Debug for CrawlOptions {
             .field("allow_loopback", &self.allow_loopback)
             .field("origin_interval", &self.origin_interval)
             .field("origin_cap", &self.origin_cap)
+            .field("compress", &self.compress)
             .field("browser", &self.browser.is_some())
             .finish()
     }
@@ -185,6 +190,7 @@ impl CrawlOptions {
             allow_loopback: false,
             origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
             origin_cap: None,
+            compress: false,
             browser: None,
         }
     }
@@ -275,6 +281,11 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_ORIGIN_INTERVAL_MS);
+    let compress = args.iter().any(|a| a == "--compress")
+        || matches!(
+            std::env::var("SEARCH_CRAWL_COMPRESS").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        );
 
     let opts = CrawlOptions {
         seeds_file: PathBuf::from(seeds),
@@ -286,6 +297,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         allow_loopback: false,
         origin_interval: Duration::from_millis(interval_ms),
         origin_cap,
+        compress,
         browser: browser_from_env().await,
     };
 
@@ -724,16 +736,35 @@ impl Drainer {
             _ => {}
         }
 
-        // Raw spill: dedupe by sha256.
+        // Raw spill: dedupe by sha256. With `--compress` the blob is gzipped: raw pages average
+        // ~237 KB, so a million of them is ~237 GB uncompressed — which is the difference between a
+        // large corpus fitting on this disk and not. The sha256 in the name stays the hash of the
+        // *uncompressed* bytes, so dedup and the crawl log mean the same thing either way.
         if let (Some(raw), Some(sha)) = (&per.raw, &per.sha256) {
             let ext = ext_for(per.content_type.as_deref());
-            let path = self.blobs_dir.join(format!("{sha}.{ext}"));
+            let name = if self.opts.compress {
+                format!("{sha}.{ext}.gz")
+            } else {
+                format!("{sha}.{ext}")
+            };
+            let path = self.blobs_dir.join(&name);
             if !path.exists() {
-                if let Err(e) = write_atomic(&path, raw) {
+                let payload: Vec<u8> = if self.opts.compress {
+                    match gzip_bytes(raw) {
+                        Ok(gz) => gz,
+                        Err(e) => {
+                            eprintln!("failed to gzip blob {sha}: {e}; storing it uncompressed");
+                            raw.clone()
+                        }
+                    }
+                } else {
+                    raw.clone()
+                };
+                if let Err(e) = write_atomic(&path, &payload) {
                     eprintln!("failed to write blob {sha}: {e}");
                 } else {
                     self.counters.blobs += 1;
-                    self.counters.bytes += raw.len() as u64;
+                    self.counters.bytes += payload.len() as u64;
                 }
             }
         }
@@ -1357,6 +1388,16 @@ fn media_type(route: &Route) -> &'static str {
 }
 
 /// Blob file extension for a content type (`.bin` when unknown).
+/// Gzip `bytes` for the raw spill (`--compress`).
+fn gzip_bytes(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes)?;
+    encoder.finish()
+}
+
 fn ext_for(content_type: Option<&str>) -> &'static str {
     match content_type.unwrap_or("") {
         "application/pdf" => "pdf",

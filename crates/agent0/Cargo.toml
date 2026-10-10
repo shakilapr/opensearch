@@ -62,6 +62,8 @@ url.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
+# Gzip for the raw spill (`agent0 crawl --compress`): raw pages average ~237 KB uncompressed.
+flate2.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
