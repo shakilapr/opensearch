@@ -98,11 +98,22 @@ multi-week architecture work, gated by the plan on proven quality.
   verify_join/widen`), visited/action-key set, cycle detection; best-first traversal + beam;
   evidence joins with join keys and time order; policy hierarchy `Rules → Algorithm →
   CallerAgent → Provider` (`crates/nav/src/policy.rs`); bounded/deadline/coverage-driven stopping.
+  **Query deconstruction by a live model — built and wired.** `search_engine::QueryPlanner` is an
+  injection seam (like `Answerer`/`EvidenceVerifier`); `crates/planner` implements it over the
+  cached kitani client (the slow reasoning model by default, cached, opt-in) and turns a
+  conversational query into expansion probes — canonical entity names, phrase-with-slop probes —
+  which the engine now actually *searches*: the §8 query variants `build_plan` always produced
+  were previously computed and discarded, and are now launched in round 1 and fused per family
+  under the §10 cap. Each probe is still rejected by `variant_preserves_constraints` if it drops a
+  constraint. See `docs/PLANNER.md`. *Remaining:* no live measurement of planner-on vs planner-off
+  quality (needs a key and the eval harness).
 - **Left:**
-  1. **Real provider transports — code.** `ProviderPolicy` talks to a `ModelClient` trait with
-     hermetic fakes; there is no HTTP transport for OpenAI/Claude/DeepSeek/GLM, so a real agent
-     call cannot happen. Needs transports + a key-path policy (the answer crate's pattern:
-     env-only, never logged) + tests with a recorded fake.
+  1. **Real provider transports for the *action frontier* — code.** `ProviderPolicy` talks to a
+     `ModelClient` trait with hermetic fakes; there is no HTTP transport for
+     OpenAI/Claude/DeepSeek/GLM, so the *navigation* loop (which action to take next) cannot be
+     driven by a live model. Needs transports + a key-path policy (the answer crate's pattern:
+     env-only, never logged) + tests with a recorded fake. *Distinct from query deconstruction,
+     which now has a live path — see the Done list.*
   2. **Agent policy on the live corpus — data.** No measurement of ambiguous/multi-hop queries
      improving versus one-shot retrieval at 11K documents.
 

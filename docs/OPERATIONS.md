@@ -50,6 +50,7 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_MODEL_CACHE` | `<workspace>/models/fastembed` | where the real embedding weights live (see *Real embedding model*) |
 | `SEARCH_READ_ONLY` | `auto` | `auto` takes the index writer and falls back to a **read-only** open when it is locked (a crawl is running); `1` always read-only, `0` always the writer |
 | `SEARCH_CORS_ORIGIN` | unset | comma-separated origins allowed to call the API from a browser (see *Browser clients and CORS*) |
+| `SEARCH_PLANNER_ENABLED` | unset | opt-in §6/§8 LLM query planning (`search-planner`); needs `KITANI_API_KEY`. See `PLANNER.md` |
 
 ## Browser clients and CORS
 
@@ -62,6 +63,7 @@ To develop the UI against a running API, name the origin explicitly:
 ```sh
 SEARCH_BIND=127.0.0.1:8090 SEARCH_DATA_DIR=/var/lib/search \
 SEARCH_ANSWER_ENABLED=1 SEARCH_CORS_ORIGIN=http://127.0.0.1:5173 \
+SEARCH_PLANNER_ENABLED=1 \
   agent0 serve
 (cd ui && VITE_API_BASE=http://127.0.0.1:8090 npm run dev)   # Vite on :5173
 ```
