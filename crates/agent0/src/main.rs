@@ -342,11 +342,32 @@ async fn run_serve() -> ExitCode {
     let planner: Option<std::sync::Arc<dyn search_engine::QueryPlanner + Send + Sync>> =
         match search_planner::from_env() {
             Some(p) => {
-                tracing::info!(model = p.model(), "query planning enabled");
-                Some(
-                    std::sync::Arc::new(p)
-                        as std::sync::Arc<dyn search_engine::QueryPlanner + Send + Sync>,
-                )
+                // The model call is taken OFF the request path: a cache hit is an in-process map
+                // lookup, a miss returns immediately (the original query is searched, exactly as
+                // with no planner) while the plan is computed in parallel, and a repeat is served
+                // with the model's probe. A synchronous model call here measured 83 s cold.
+                let wait = search_agent0::planner_cache::SpeculativePlanner::wait_from_env();
+                let model = p.model().to_string();
+                match search_agent0::planner_cache::SpeculativePlanner::new(
+                    std::sync::Arc::new(p),
+                    wait,
+                ) {
+                    Some(speculative) => {
+                        tracing::info!(
+                            model = %model,
+                            wait_us = wait.as_micros() as u64,
+                            "query planning enabled off the request path (in-process cache; miss returns immediately)"
+                        );
+                        Some(
+                            std::sync::Arc::new(speculative)
+                                as std::sync::Arc<dyn search_engine::QueryPlanner + Send + Sync>,
+                        )
+                    }
+                    None => {
+                        tracing::warn!("could not start the planner runtime; searching verbatim");
+                        None
+                    }
+                }
             }
             None => {
                 tracing::info!("{}", search_planner::disabled_reason().message());

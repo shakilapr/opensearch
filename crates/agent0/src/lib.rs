@@ -32,6 +32,7 @@ pub mod evalset;
 pub mod graphbuild;
 pub mod deep;
 pub mod pipeline;
+pub mod planner_cache;
 pub mod portable;
 
 pub use deep::{
