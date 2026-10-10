@@ -36,6 +36,7 @@ members = [
     "crates/organize",
     "crates/engine",
     "crates/answer",
+    "crates/planner",
 ]
 
 [workspace.package]

@@ -1,0 +1,22 @@
+[package]
+name = "search-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "search_planner"
+path = "src/lib.rs"
+
+[dependencies]
+# The injection point: search-engine defines `QueryPlanner` / `PlannedQueries`.
+search-engine = { path = "../engine" }
+# The cached, single-flight, env-configured LLM client — reused rather than re-implemented.
+search-organize = { path = "../organize" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
