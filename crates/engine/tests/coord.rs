@@ -3,10 +3,12 @@
 //! No network, no clock reads, no sleeps. Every backend is an in-memory
 //! [`MemoryLaneSearcher`] (or a deterministic wrapper around one).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use search_engine::analyze::AliasPriors;
+use search_engine::analyze::{AliasPriors, QueryAnalysis};
+use search_engine::{PlannedQueries, QueryPlanner};
 use search_engine::coord::{
     run_search, Action, Answerer, Deps, EngineState, RuleSelector, SearchRequest, Selector,
 };
@@ -52,7 +54,7 @@ fn deps<'a>(
     answerer: Option<&'a dyn Answerer>,
     aliases: &'a AliasPriors,
 ) -> Deps<'a> {
-    Deps { lanes, selector, answerer, aliases, stats: stats(), now: 0, verifier: None }
+    Deps { lanes, selector, answerer, aliases, stats: stats(), now: 0, verifier: None, planner: None }
 }
 
 /// The same as [`deps`] but with an injected §16 content verifier.
@@ -70,6 +72,7 @@ fn deps_with_verifier<'a>(
         stats: stats(),
         now: 0,
         verifier: Some(verifier),
+        planner: None,
     }
 }
 
@@ -686,4 +689,175 @@ fn stop_reason_is_deadline_when_deadline_already_elapsed_for_every_mode() {
             resp.trace
         );
     }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// §8/§10 — the injected query planner: expansions are searched, and capped per family
+// ---------------------------------------------------------------------------------------------
+
+/// A planner that returns a fixed set of expansions (and one note), recording that it ran.
+struct ScriptedPlanner {
+    expansions: Vec<String>,
+    calls: AtomicUsize,
+}
+
+impl ScriptedPlanner {
+    fn new(expansions: &[&str]) -> Self {
+        Self {
+            expansions: expansions.iter().map(|s| s.to_string()).collect(),
+            calls: AtomicUsize::new(0),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl QueryPlanner for ScriptedPlanner {
+    fn plan(&self, _query: &str, _analysis: &QueryAnalysis) -> PlannedQueries {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        PlannedQueries { expansions: self.expansions.clone(), notes: vec!["scripted".to_string()] }
+    }
+}
+
+/// A lane whose result set is scripted per query string, so a test controls exactly what the
+/// original query and each expansion return.
+struct Scripted {
+    by_query: HashMap<String, Vec<String>>,
+    seen: Mutex<Vec<String>>,
+}
+
+impl Scripted {
+    fn new(pairs: &[(&str, &[&str])]) -> Self {
+        let mut by_query = HashMap::new();
+        for (q, docs) in pairs {
+            by_query.insert((*q).to_string(), docs.iter().map(|d| d.to_string()).collect());
+        }
+        Self { by_query, seen: Mutex::new(Vec::new()) }
+    }
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl LaneSearcher for Scripted {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        _source: Option<&str>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        if let Ok(mut g) = self.seen.lock() {
+            g.push(query.to_string());
+        }
+        let docs = self.by_query.get(query).cloned().unwrap_or_default();
+        let mut out: Vec<Candidate> = docs
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let mut c = Candidate::new(d, 1.0 - i as f32 * 0.01);
+                c.title = Some(format!("doc {i}"));
+                c
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
+fn deps_with_planner<'a>(
+    lanes: &'a [&'a dyn LaneSearcher],
+    selector: &'a dyn Selector,
+    aliases: &'a AliasPriors,
+    planner: &'a dyn QueryPlanner,
+) -> Deps<'a> {
+    Deps {
+        lanes,
+        selector,
+        answerer: None,
+        aliases,
+        stats: stats(),
+        now: 0,
+        verifier: None,
+        planner: Some(planner),
+    }
+}
+
+#[test]
+fn planner_expansions_are_searched_as_variants() {
+    // The gap this closes: `build_plan` produced expansion variants that the loop never
+    // searched, so an LLM's query deconstruction had no effect on retrieval. Now every planned
+    // variant is launched in round 1, alongside the original.
+    let lane = Scripted::new(&[("alpha", &["o1"]), ("beta gamma", &["e1"]), ("delta", &["e2"])]);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&lane];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let planner = ScriptedPlanner::new(&["beta gamma", "delta"]);
+    let d = deps_with_planner(&lanes, &selector, &aliases, &planner);
+
+    let resp = run_search(request("alpha", 10, Mode::Fast), &d);
+
+    assert_eq!(planner.calls(), 1, "the planner runs exactly once per request");
+    let seen = lane.seen();
+    assert!(seen.contains(&"alpha".to_string()), "the original is still searched: {seen:?}");
+    assert!(seen.contains(&"beta gamma".to_string()), "expansion 1 must be searched: {seen:?}");
+    assert!(seen.contains(&"delta".to_string()), "expansion 2 must be searched: {seen:?}");
+    assert!(
+        resp.trace.iter().any(|l| l.contains("planner: 2 expansion probe(s)")),
+        "the trace must record what the planner produced: {:?}",
+        resp.trace
+    );
+    let ids: Vec<&str> = resp.results.iter().map(|r| r.doc_id.as_str()).collect();
+    assert!(
+        ids.contains(&"e1") && ids.contains(&"e2"),
+        "documents reachable only through an expansion must be retrievable: {ids:?}"
+    );
+}
+
+#[test]
+fn a_rewrite_family_cannot_outvote_the_original() {
+    // §10: "prevent numerous near-identical query rewrites from outvoting the original query."
+    // The original returns one document; the expansion returns twenty. Without the family cap
+    // the flood would bury the original; with it, the original's document still ranks first.
+    let flood: Vec<String> = (0..20).map(|i| format!("d{i:02}")).collect();
+    let flood_refs: Vec<&str> = flood.iter().map(|s| s.as_str()).collect();
+    let orig = ["o1"];
+    let lane = Scripted::new(&[("alpha", &orig[..]), ("beta", &flood_refs[..])]);
+    let lanes: Vec<&dyn LaneSearcher> = vec![&lane];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let planner = ScriptedPlanner::new(&["beta"]);
+    let d = deps_with_planner(&lanes, &selector, &aliases, &planner);
+
+    let resp = run_search(request("alpha", 10, Mode::Fast), &d);
+
+    assert!(!resp.results.is_empty());
+    assert_eq!(
+        resp.results[0].doc_id, "o1",
+        "the original's document must not be buried by a rewrite family: {:?}",
+        resp.results.iter().map(|r| (&r.doc_id, r.score)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_planner_that_returns_nothing_changes_nothing() {
+    // The identity case: an injected planner with no expansions (or one that failed and returned
+    // empty) must leave the search identical to having no planner at all — only the original is
+    // searched, and the fusion takes the single-family path.
+    let lane = Recorder::new(corpus());
+    let lanes: Vec<&dyn LaneSearcher> = vec![&lane];
+    let selector = RuleSelector::new();
+    let aliases = AliasPriors::empty();
+    let planner = ScriptedPlanner::new(&[]);
+    let d = deps_with_planner(&lanes, &selector, &aliases, &planner);
+
+    let resp = run_search(request("rust async", 5, Mode::Fast), &d);
+
+    let seen = lane.queries();
+    assert!(
+        seen.iter().all(|q| q == "rust async"),
+        "an empty plan must search only the original, saw {seen:?}"
+    );
+    assert!(!resp.results.is_empty(), "and still return the original's results");
 }

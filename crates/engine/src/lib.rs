@@ -13,6 +13,7 @@ pub mod diversify;
 pub mod evidence;
 pub mod fuse;
 pub mod plan;
+pub mod planner;
 pub mod units;
 
 pub use analyze::{
@@ -33,6 +34,7 @@ pub use plan::{
     build_plan, variant_preserves_constraints, IndexStats, Mode, Plan, QueryVariant, StageDeadlines,
     VariantOrigin,
 };
+pub use planner::{PlannedQueries, QueryPlanner};
 pub use units::{decompose, joins, JoinKey, QueryUnit, UnitKind};
 
 /// Lane identity is the retrieval crate's lane enum (§9).

@@ -641,6 +641,7 @@ pub fn run_engine_search(
         aliases: &aliases,
         stats,
         now: now_ms,
+        planner: None,
     };
 
     let engine_resp = search_engine::run_search(core_req, &deps);

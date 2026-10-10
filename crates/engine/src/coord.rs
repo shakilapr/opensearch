@@ -15,8 +15,9 @@ use crate::analyze::{analyze_query, AliasPriors};
 use crate::budget::{Budget, StopReason};
 use crate::diversify::{diversify, DiversityConfig, Scored};
 use crate::evidence::{evidence_coverage, EvidenceRecord, EvidenceVerifier, Support};
-use crate::fuse::{fuse, run_cascade, CascadeInput, FusionPolicy, LaneHits};
+use crate::fuse::{fuse, fuse_families, run_cascade, CascadeInput, FusionPolicy, LaneHits};
 use crate::plan::{build_plan, IndexStats, Mode, Plan};
+use crate::planner::QueryPlanner;
 use crate::units::QueryUnit;
 use crate::LaneId;
 
@@ -73,6 +74,11 @@ pub struct Deps<'a> {
     /// `None` and keep the previous title-only behaviour. The verifier never sees a clock or
     /// the network from inside this crate — it is purely injected.
     pub verifier: Option<&'a dyn EvidenceVerifier>,
+    /// §6/§8 — optional model-backed query planner. When `Some`, the loop asks it for expansion
+    /// probes and searches them as §8 query variants (each capped and fused under the §10
+    /// variant-family rule). When `None` — the default for every existing caller — the loop
+    /// searches only the original query and behaves exactly as before.
+    pub planner: Option<&'a dyn QueryPlanner>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,12 +182,34 @@ impl Selector for RuleSelector {
 /// The §18 loop. Never blocks past the deadline; a request with no neural lane still returns
 /// its best eligible lexical results.
 pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
-    let analysis = analyze_query(&req.query, deps.now, req.tz_offset_min);
+    let mut analysis = analyze_query(&req.query, deps.now, req.tz_offset_min);
+    let mut trace: Vec<String> = Vec::new();
+
+    // §6/§8 — expansion probes come from the injected planner, never from splitting the query.
+    // The analyzer's `concepts` are the query's own content words, which are not expansions:
+    // re-searching them as separate probes adds nothing the original lane did not already
+    // return and dilutes precision. So with no planner they are cleared rather than launched;
+    // with one, its expansions replace them and §8 caps and constraint-checks them.
+    match deps.planner {
+        Some(p) => {
+            let planned = p.plan(&req.query, &analysis);
+            for note in &planned.notes {
+                trace.push(format!("planner: {note}"));
+            }
+            trace.push(format!(
+                "planner: {} expansion probe(s) {:?}",
+                planned.expansions.len(),
+                planned.expansions
+            ));
+            analysis.concepts = planned.expansions;
+        }
+        None => analysis.concepts.clear(),
+    }
+
     let plan = build_plan(&analysis, &deps.stats, req.mode);
     let mut budget = Budget::for_mode(req.mode, req.deadline_ms);
     budget.start(0);
 
-    let mut trace: Vec<String> = Vec::new();
     trace.push(format!(
         "plan: mode={:?} lanes={:?} top_k={} variants={} rerank={} refresh={}",
         req.mode, plan.lanes, plan.per_lane_top_k, plan.query_variants.len(),
@@ -191,7 +219,8 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     let mut state = EngineState::new();
 
     // Cross-round accumulators.
-    let mut raw_hits: Vec<LaneHits> = Vec::new();
+    // Family-tagged lane hits: family 0 is the original query, family >= 1 a rewrite family.
+    let mut raw_hits: Vec<(u8, LaneHits)> = Vec::new();
     let mut titles: BTreeMap<String, String> = BTreeMap::new();
     let mut searcher_lanes: Vec<Vec<LaneId>> = vec![Vec::new(); deps.lanes.len()];
     let mut seen_sources: Vec<String> = Vec::new();
@@ -206,18 +235,27 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     if budget.charge_round() {
         state.completed_rounds = 1;
         trace.push(format!(
-            "round 1: launch {} searcher(s) over the original query {:?}",
-            deps.lanes.len(), req.query
+            "round 1: launch {} searcher(s) over {} probe(s)",
+            deps.lanes.len(), plan.query_variants.len()
         ));
+        // §8: "Search the original query in its own lane" — the original is the first variant,
+        // family 0 — then each capped, constraint-preserving expansion, tagged with its family so
+        // §10's family cap keeps a cluster of rewrites from outvoting the original.
         let mut launched = 0usize;
-        for idx in 0..deps.lanes.len() {
-            let searcher = deps.lanes[idx];
-            match call_searcher(
-                idx, searcher, &req.query, plan.per_lane_top_k, None,
-                &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
-            ) {
-                Ok(n) => launched += n,
-                Err(e) => trace.push(format!("lane failed: {e}")),
+        for variant in &plan.query_variants {
+            if variant.text.trim().is_empty() {
+                continue;
+            }
+            for idx in 0..deps.lanes.len() {
+                let searcher = deps.lanes[idx];
+                match call_searcher(
+                    idx, searcher, &variant.text, plan.per_lane_top_k, None,
+                    &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
+                    variant.family,
+                ) {
+                    Ok(n) => launched += n,
+                    Err(e) => trace.push(format!("lane failed: {e}")),
+                }
             }
         }
         state.candidates = launched;
@@ -309,7 +347,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
                         idx, searcher, &req.query, limit, None,
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
+                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -327,7 +365,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
                         idx, searcher, &text, plan.per_lane_top_k, None,
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
+                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -341,7 +379,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
                         idx, searcher, &req.query, plan.per_lane_top_k, Some(source_id.as_str()),
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
+                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -350,7 +388,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             Action::Abstain => {}
         }
 
-        state.candidates = raw_hits.iter().map(|h| h.ranked.len()).sum();
+        state.candidates = raw_hits.iter().map(|(_, h)| h.ranked.len()).sum();
         refresh_evidence(
             &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
         );
@@ -364,7 +402,18 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
 
     // ---- Finalize: fuse, cascade, diversify, emit rows (§18 tail). ----
     let collapsed = collapse_lane_hits(&raw_hits);
-    let fused = fuse(&collapsed, &FusionPolicy::default());
+    // §10: fuse within each variant family, then cap every rewrite family's combined weight
+    // against the original's, so a handful of expansions cannot outvote the query the user
+    // actually typed. With a single family (no planner, or no surviving expansion) this is the
+    // plain `fuse` — byte-identical to the pre-planner behaviour.
+    let fused = if collapsed.len() <= 1 {
+        let lanes = collapsed.first().map(|(_, l)| l.as_slice()).unwrap_or(&[]);
+        fuse(lanes, &FusionPolicy::default())
+    } else {
+        let families: Vec<(u8, &[LaneHits])> =
+            collapsed.iter().map(|(f, l)| (*f, l.as_slice())).collect();
+        fuse_families(&families, &FusionPolicy::default())
+    };
     let cap = plan.rerank_count.max(req.limit);
     let cascaded = run_cascade(CascadeInput {
         fused,
@@ -530,18 +579,30 @@ fn admissible_next_actions(
     v
 }
 
-/// Collapse raw per-call lane hits into one [`LaneHits`] per lane, keeping each document's best
-/// (lowest) rank. Deterministic: lanes in first-appearance order, docs by rank then id.
-fn collapse_lane_hits(raw: &[LaneHits]) -> Vec<LaneHits> {
-    let mut order: Vec<LaneId> = Vec::new();
-    let mut maps: Vec<HashMap<String, usize>> = Vec::new();
-    for lh in raw {
-        let pos = match order.iter().position(|l| *l == lh.lane) {
+/// Collapse raw per-call lane hits into one [`LaneHits`] per (family, lane), keeping each
+/// document's best (lowest) rank. Deterministic: families in first-appearance order (family 0,
+/// the original query, is always first because it is launched first), lanes within a family in
+/// first-appearance order, docs by rank then id.
+fn collapse_lane_hits(raw: &[(u8, LaneHits)]) -> Vec<(u8, Vec<LaneHits>)> {
+    let mut fam_order: Vec<u8> = Vec::new();
+    // Per family: the lane order seen, and one doc->rank map per lane.
+    let mut fam_maps: Vec<(Vec<LaneId>, Vec<HashMap<String, usize>>)> = Vec::new();
+    for (family, lh) in raw {
+        let fpos = match fam_order.iter().position(|f| f == family) {
             Some(p) => p,
             None => {
-                order.push(lh.lane);
+                fam_order.push(*family);
+                fam_maps.push((Vec::new(), Vec::new()));
+                fam_order.len() - 1
+            }
+        };
+        let (lane_order, maps) = &mut fam_maps[fpos];
+        let pos = match lane_order.iter().position(|l| *l == lh.lane) {
+            Some(p) => p,
+            None => {
+                lane_order.push(lh.lane);
                 maps.push(HashMap::new());
-                order.len() - 1
+                lane_order.len() - 1
             }
         };
         let map = &mut maps[pos];
@@ -553,28 +614,42 @@ fn collapse_lane_hits(raw: &[LaneHits]) -> Vec<LaneHits> {
             }
         }
     }
-    let mut out: Vec<LaneHits> = Vec::new();
-    for (lane, map) in order.iter().zip(maps.iter()) {
-        let mut v: Vec<(usize, String)> = map.iter().map(|(d, r)| (*r, d.clone())).collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        out.push(LaneHits { lane: *lane, ranked: v.into_iter().map(|(_, d)| d).collect() });
+    let mut out: Vec<(u8, Vec<LaneHits>)> = Vec::new();
+    for (fpos, family) in fam_order.iter().enumerate() {
+        let (lane_order, maps) = &fam_maps[fpos];
+        let mut lanes: Vec<LaneHits> = Vec::new();
+        for (lane, map) in lane_order.iter().zip(maps.iter()) {
+            let mut v: Vec<(usize, String)> = map.iter().map(|(d, r)| (*r, d.clone())).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            lanes.push(LaneHits { lane: *lane, ranked: v.into_iter().map(|(_, d)| d).collect() });
+        }
+        out.push((*family, lanes));
     }
     out
 }
 
-/// Provenance: doc_id -> { lane -> best rank }.
-fn build_lane_ranks(collapsed: &[LaneHits]) -> HashMap<String, HashMap<LaneId, usize>> {
+/// Provenance: doc_id -> { lane -> best rank }, across every variant family. A document found by
+/// both the original query and an expansion keeps the better of the two ranks for its lane.
+fn build_lane_ranks(collapsed: &[(u8, Vec<LaneHits>)]) -> HashMap<String, HashMap<LaneId, usize>> {
     let mut out: HashMap<String, HashMap<LaneId, usize>> = HashMap::new();
-    for lh in collapsed {
-        for (i, doc) in lh.ranked.iter().enumerate() {
-            out.entry(doc.clone()).or_default().insert(lh.lane, i + 1);
+    for (_, lanes) in collapsed {
+        for lh in lanes {
+            for (i, doc) in lh.ranked.iter().enumerate() {
+                let rank = i + 1;
+                let entry = out.entry(doc.clone()).or_default();
+                let cur = entry.entry(lh.lane).or_insert(rank);
+                if rank < *cur {
+                    *cur = rank;
+                }
+            }
         }
     }
     out
 }
 
 /// Drive one searcher and fold its candidates into the accumulators. Groups a single call's
-/// candidates by their lane tag, preserving the searcher's own ranking within each lane.
+/// candidates by their lane tag, preserving the searcher's own ranking within each lane. `family`
+/// is the §8/§10 variant family the call belongs to (0 = the original query).
 #[allow(clippy::too_many_arguments)]
 fn call_searcher(
     idx: usize,
@@ -582,10 +657,11 @@ fn call_searcher(
     query: &str,
     limit: usize,
     source: Option<&str>,
-    raw_hits: &mut Vec<LaneHits>,
+    raw_hits: &mut Vec<(u8, LaneHits)>,
     titles: &mut BTreeMap<String, String>,
     searcher_lanes: &mut Vec<Vec<LaneId>>,
     seen_sources: &mut Vec<String>,
+    family: u8,
 ) -> Result<usize, String> {
     let cands = searcher.search(query, limit, source).map_err(|e| e.to_string())?;
     let mut lane_order: Vec<LaneId> = Vec::new();
@@ -617,7 +693,7 @@ fn call_searcher(
     let mut count = 0usize;
     for (lane, docs) in lane_order.into_iter().zip(groups.into_iter()) {
         count += docs.len();
-        raw_hits.push(LaneHits { lane, ranked: docs });
+        raw_hits.push((family, LaneHits { lane, ranked: docs }));
     }
     Ok(count)
 }
