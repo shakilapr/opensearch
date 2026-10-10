@@ -486,11 +486,25 @@ impl Indexer {
     ) -> AppResult<()> {
         let searcher = reader.searcher();
         // BM25 with the boosted duplicate fields (spec §6).
+        // Every field the index actually holds is searched, including the *structured* ones.
+        // `headings` (which carries the organizing model's summary and topics) and `entities` (its
+        // key entities) were in the schema but absent from this list, so the whole point of paying a
+        // model to structure a page — that its entities and topics become findable — had no effect
+        // on retrieval. The boosts say what the engine believes: a page whose entities or topics
+        // name the query is more on-topic than one that merely mentions the word in prose.
         let mut parser = QueryParser::for_index(
             index,
-            vec![self.fields.title_boost, self.fields.body_boost, self.fields.url],
+            vec![
+                self.fields.title_boost,
+                self.fields.headings,
+                self.fields.entities,
+                self.fields.body_boost,
+                self.fields.url,
+            ],
         );
         parser.set_field_boost(self.fields.title_boost, 3.0);
+        parser.set_field_boost(self.fields.entities, 3.0);
+        parser.set_field_boost(self.fields.headings, 2.0);
         parser.set_field_boost(self.fields.body_boost, 1.0);
         // Parse the pruned query: the index tokenizer keeps stop-words and
         // single letters, over which an OR query degenerates into noise.
@@ -864,6 +878,38 @@ mod tests {
     fn doc(id: &str, title: &str, body: &str) -> IndexDoc {
         IndexDoc::new(id, format!("res_{id}"), format!("https://example.com/{id}"), title, body)
             .with_version(1)
+    }
+
+    #[test]
+    fn structured_fields_are_searchable_and_phrase_slop_is_honoured() {
+        // Two capabilities the query pipeline depends on:
+        //  1. `entities` and `headings` (where the organizing model's key entities, summary and
+        //     topics land) are searched. They were in the schema but absent from the parser's field
+        //     list, so a page the model tagged could not be found by that tag unless the prose
+        //     happened to repeat it — the structuring had no retrieval effect at all.
+        //  2. phrase proximity works. Tantivy's parser already honours `"a b"~N`, which is exactly
+        //     the syntax an LLM query planner emits, so the parser needs no change for it.
+        let (_t, idx) = tmp();
+        let mut d = doc("d1", "A page about storage", "the prose never names the topic at all");
+        d.entities = vec!["zetaquokka".to_string(), "paged attention".to_string()];
+        d.headings = "memory complexity of attention".to_string();
+        idx.index_batch(vec![d]).unwrap();
+
+        assert_eq!(idx.search("zetaquokka", 10).unwrap().len(), 1, "entities must be searchable");
+        assert_eq!(
+            idx.search("memory complexity", 10).unwrap().len(),
+            1,
+            "headings must be searchable"
+        );
+        // Phrase with slop: adjacent, so it matches.
+        assert_eq!(idx.search("\"memory complexity\"~3", 10).unwrap().len(), 1, "slop phrase matches");
+        // Same words, closer slop than the gap between them: no match.
+        assert!(
+            idx.search("\"memory storage\"~1", 10).unwrap().is_empty(),
+            "slop must not match across a gap"
+        );
+        // Control: a term in no field must not match.
+        assert!(idx.search("unrelatedquokka", 10).unwrap().is_empty());
     }
 
     #[test]
