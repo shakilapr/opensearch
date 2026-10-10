@@ -21,6 +21,12 @@ pub struct Options {
     set: PathBuf,
     limit: usize,
     out: Option<PathBuf>,
+    /// Which injected lanes to run: `all` (default), `none`, `dense`, `graph`. This is the
+    /// experiment matrix the plan needs — an uncached request's cost must be attributed to a lane
+    /// before any lane is optimised or routed away from.
+    lanes: String,
+    /// Opt into the §6–§18 engine (false = the frozen legacy lexical path).
+    engine: bool,
 }
 
 impl Options {
@@ -29,6 +35,8 @@ impl Options {
             set: PathBuf::from("benchmarks/queries.corpus.jsonl"),
             limit: 10,
             out: None,
+            lanes: "all".to_string(),
+            engine: true,
         };
         let mut i = 0;
         while i < args.len() {
@@ -50,6 +58,16 @@ impl Options {
                         opts.out = Some(PathBuf::from(v));
                     }
                     i += 2;
+                }
+                "--lanes" => {
+                    if let Some(v) = args.get(i + 1) {
+                        opts.lanes = v.to_ascii_lowercase();
+                    }
+                    i += 2;
+                }
+                "--no-engine" => {
+                    opts.engine = false;
+                    i += 1;
                 }
                 _ => i += 1,
             }
@@ -89,9 +107,18 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
         }
     };
     let searcher = pipeline.searcher();
-    let mut extra_lanes = build_dense_lane(&cfg);
-    extra_lanes.extend(build_graph_lane(&cfg));
-    eprintln!("lanes: {} injected beside the index-backed lanes", extra_lanes.len());
+    let mut extra_lanes = Vec::new();
+    if matches!(opts.lanes.as_str(), "all" | "dense") {
+        extra_lanes.extend(build_dense_lane(&cfg));
+    }
+    if matches!(opts.lanes.as_str(), "all" | "graph") {
+        extra_lanes.extend(build_graph_lane(&cfg));
+    }
+    eprintln!(
+        "lanes: {} injected beside the index-backed lanes (--lanes {})",
+        extra_lanes.len(),
+        opts.lanes
+    );
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -110,7 +137,7 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
                 deadline_ms: None,
                 filters: None,
             },
-            engine: true,
+            engine: opts.engine,
             mode: search_api::engine::EngineMode::Auto,
         };
         let started = std::time::Instant::now();
@@ -156,6 +183,7 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     println!("  latency p50  : {} ms", metrics.p50_ms);
     println!("  latency p95  : {} ms", metrics.p95_ms);
     println!("  lane errors  : {failures}");
+    println!("  config       : lanes={} engine={}", opts.lanes, opts.engine);
     println!("  labels       : corpus-derived (title → its document), not human judgements");
 
     if let Some(out) = &opts.out {

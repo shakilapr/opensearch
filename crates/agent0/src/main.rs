@@ -166,7 +166,7 @@ async fn main() -> ExitCode {
             Some("run") => evalrun::run(&args).await,
             _ => {
                 eprintln!("usage: agent0 eval build-set [--out FILE] [--sample N] [--min-title-words N] [--max-title-words N] [--min-body-chars N]");
-                eprintln!("       agent0 eval run [--set FILE] [--limit N] [--out metrics.json]");
+                eprintln!("       agent0 eval run [--set FILE] [--limit N] [--out metrics.json] [--lanes all|none|dense|graph] [--no-engine]");
                 ExitCode::from(2)
             }
         },
