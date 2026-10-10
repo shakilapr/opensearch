@@ -1,10 +1,16 @@
-//! The planner client: a [`search_engine::QueryPlanner`] over the cached, single-flight
-//! [`search_organize::LlmClient`].
+//! The planner client: a [`search_engine::QueryPlanner`] over `search-organize`'s cached,
+//! live-verified query planner.
 //!
-//! `QueryPlanner::plan` is synchronous (the engine calls it on the search hot path), so the
-//! client owns a small dedicated Tokio runtime and drives the async client to completion. When
-//! `plan` is invoked from inside another Tokio runtime it is moved to a fresh OS thread first,
-//! because nesting `block_on` on a runtime thread panics.
+//! `QueryPlanner::plan` is synchronous (the engine calls it on the search hot path), so the client
+//! owns a small dedicated Tokio runtime and drives the async `LlmClient::plan_query` to
+//! completion. When `plan` is invoked from inside another Tokio runtime it is moved to a fresh OS
+//! thread first, because nesting `block_on` on a runtime thread panics.
+//!
+//! The prompt and the response parser are **not** duplicated here: they live in
+//! `search_organize::queryplan`, which is the live-verified implementation (its plan was checked
+//! against the real model). This crate owns only two things: the synchronous engine seam, and the
+//! mapping from a `QueryPlan` onto the engine's §8 probe list. A second prompt for the same job
+//! would be a second thing to keep correct.
 //!
 //! Failures never propagate to the search: a transport error, a timeout, or an unparseable
 //! response all become an empty plan plus a note, so retrieval proceeds exactly as it would with
@@ -15,10 +21,9 @@ use std::sync::Arc;
 
 use search_engine::analyze::QueryAnalysis;
 use search_engine::{PlannedQueries, QueryPlanner};
-use search_organize::{CacheStats, LlmClient, OrganizeError};
+use search_organize::{CacheStats, LlmClient, OrganizeError, QueryPlan};
 
 use crate::config::PlannerConfig;
-use crate::prompt::{build_prompt, parse_plan};
 
 /// A failure to construct the planner (bad config, or no runtime could be built).
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +34,45 @@ pub enum PlannerError {
     /// The dedicated runtime could not be built.
     #[error("failed to build the planner runtime: {0}")]
     Runtime(String),
+}
+
+/// Map a `search-organize` plan onto the engine's probe list.
+///
+/// The plan's rewritten query — required terms (`+term`), exclusions (`-term`), and phrases folded
+/// in as `"a b"~3` — becomes **one** §8 expansion variant, searched alongside the original under
+/// the §10 family cap. A query that the planner left unchanged yields no variant at all, which is
+/// the identity case. The plan's canonical entities and exclusions go into the trace notes: they
+/// are what makes the decision auditable, and the entities are the input the §9.4 graph walk
+/// wants.
+pub fn plan_to_probes(
+    plan: Option<QueryPlan>,
+    original: &str,
+    max_expansions: usize,
+) -> PlannedQueries {
+    let Some(plan) = plan else {
+        return PlannedQueries::none();
+    };
+    let original = original.trim();
+
+    let mut expansions: Vec<String> = Vec::new();
+    let rewritten = plan.query.trim();
+    // Only a *changed* query is a probe; echoing the original would search it twice.
+    if !rewritten.is_empty() && rewritten != original && max_expansions > 0 {
+        expansions.push(rewritten.to_string());
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    if !plan.entities.is_empty() {
+        notes.push(format!("entities: {}", plan.entities.join(", ")));
+    }
+    if !plan.phrases.is_empty() {
+        notes.push(format!("phrases: {}", plan.phrases.join(", ")));
+    }
+    if !plan.negatives.is_empty() {
+        notes.push(format!("negatives: {}", plan.negatives.join(", ")));
+    }
+
+    PlannedQueries { expansions, notes }
 }
 
 struct Inner {
@@ -101,17 +145,11 @@ impl LlmQueryPlanner {
     async fn plan_inner(
         &self,
         query: &str,
-        analysis: &QueryAnalysis,
+        _analysis: &QueryAnalysis,
     ) -> Result<PlannedQueries, OrganizeError> {
-        let prompt = build_prompt(query, analysis);
-        let content = self.inner.client.complete(&prompt).await?;
-        Ok(match parse_plan(&content, self.inner.max_expansions, query) {
-            Ok(planned) => planned,
-            Err(e) => PlannedQueries {
-                expansions: Vec::new(),
-                notes: vec![format!("unparseable model output ({e})")],
-            },
-        })
+        // The engine has no conversation history yet, so the planner is asked with an empty one.
+        let plan = self.inner.client.plan_query(query, &[]).await?;
+        Ok(plan_to_probes(plan, query, self.inner.max_expansions))
     }
 }
 

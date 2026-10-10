@@ -47,40 +47,45 @@ exactly that case, which is why the default timeout is a long 180 s.
 
 ## What the planner returns, and how it is used
 
+The prompt and the response parser live in `search-organize`'s `queryplan` module
+(`crates/organize/src/queryplan.rs`) — the live-verified implementation — and `search-planner`
+owns only the *synchronous* engine seam and the mapping onto the engine's probe list. One prompt
+for one job.
+
 The model is asked for one JSON object:
 
 ```json
-{"expansions": ["paged attention", "\"memory complexity\"~3"], "notes": "entities + phrase"}
+{"query": "+flash +attention +memory -economic", "entities": ["FlashAttention"],
+ "phrases": ["flash attention"], "negatives": ["economic"]}
 ```
 
-Each probe is a **Tantivy query string**, so the indexer's existing syntax is the contract: quoted
-phrases with proximity slop (`"memory complexity"~3`), field-free terms, `+`/`-` operators. The
-indexer needed no change for this — the parser already honours `"a b"~N`.
+`query` is a **Tantivy query string**, so the indexer's existing syntax is the contract:
+`+term` required, `-term` excluded, `"a b"~3` phrase proximity. The indexer needed no change for
+this — the parser already honours all three. Multi-word `phrases` are folded into `query` as
+`"a b"~3` by the parser, because retrieval only ever sees one string and a live run showed the
+model reporting phrases separately (a phrase it identified would otherwise be silently lost).
 
-The engine then, for each planned variant (the original first, family 0, then each expansion under
-a shared rewrite family):
+`search-planner` maps that onto `search_engine::PlannedQueries`:
 
-* searches it in every lane alongside the original, and
-* fuses per family, applying the §10 rule that a cluster of near-identical rewrites must not
-  outvote the query the user typed.
+* **`expansions`** — the rewritten `query`, when it differs from the original. The engine searches
+  it as one §8 variant, in a rewrite family, alongside the original (family 0), and fuses per
+  family under the §10 cap that stops a cluster of rewrites from outvoting the query the user
+  typed. A query the planner left unchanged yields **no** variant — the identity case.
+* **`notes`** — the canonical entities, phrases and negatives, surfaced in the response `trace`.
+  This is what makes the decision auditable per request, and the entities are the input the §9.4
+  graph walk wants.
 
 Every expansion is still subject to `plan::variant_preserves_constraints`: a probe that drops an
 identifier, a negation, a date, or a quoted phrase the query had is **rejected** downstream, so a
-planner cannot smuggle in a rewrite that loses a constraint. The response `trace` records what the
-planner produced (`planner: N expansion probe(s) [...]`) and any notes, so the decision is
-auditable per request.
+planner cannot smuggle in a rewrite that loses a constraint.
 
-## Prompt budget
+## Prompt shape
 
-Constants in `crates/planner/src/prompt.rs`:
-
-* **at most 4000 characters total** (`MAX_PROMPT_CHARS`) — never exceeded on the wire;
-* **at most 200 characters per probe** (`MAX_EXPANSION_CHARS`), truncated not dropped;
-* at most 12 analysis hint terms per category (identifiers, phrases, content terms);
-* the free-text note is truncated to 300 characters.
-
-The prompt text carries a version (`PROMPT_VERSION = "plan-v1"`) that is part of the cache key, so
-a prompt change never reuses a plan minted under older instructions.
+The prompt is `search-organize`'s (`build_query_prompt`): it teaches the Tantivy syntax
+(`+term`, `-term`, `"a b"~3`), forbids answering the question, and states the JSON contract. It
+embeds the question verbatim and, when supplied, at most **6** prior conversation turns (for
+resolving pronouns). The engine currently passes **no** history — it has no conversation state —
+so this is the forward-looking half of the contract.
 
 ## Cost and latency
 
@@ -111,4 +116,5 @@ The engine's ablation harness (`crates/bench`) and the acceptance suite measure 
 fixture; neither currently exercises a live planner (it needs a key). What is pinned hermetically
 is the *mechanism*: that expansions are searched, that the family cap holds, that an empty or
 failing plan is a no-op, and that the planner reaches the engine end to end through
-`POST /search {engine:true}`.
+`POST /search {engine:true}`. The prompt itself was checked live against kitani (three questions,
+9.3 s — see the `queryplan` commit); the *quality* delta on the corpus is still unmeasured.

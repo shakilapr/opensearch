@@ -1,7 +1,8 @@
 //! Hermetic tests for the LLM query planner.
 //!
-//! No network, no credential, no sleeps: the LLM transport is a fake, so the cache, the parse and
-//! the `QueryPlanner` implementation are all exercised for real.
+//! No network, no credential, no sleeps: the LLM transport is a fake, so the cache, the mapping
+//! and the `QueryPlanner` implementation are all exercised for real. The prompt and the response
+//! parser belong to `search-organize` and are tested there (including against the live model).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,9 +12,9 @@ use async_trait::async_trait;
 use search_engine::analyze::analyze_query;
 use search_engine::QueryPlanner;
 use search_organize::{LlmClient, LlmConfig, OrganizeError, Transport};
-use search_planner::{parse_plan, with_client};
+use search_planner::{plan_to_probes, with_client};
 
-fn cfg(dir: &Path) -> LlmConfig {
+fn cfg(_dir: &Path) -> LlmConfig {
     LlmConfig {
         base_url: "http://planner.test/v1".to_string(),
         model: "test-model".to_string(),
@@ -64,26 +65,44 @@ fn client_with(dir: &Path, transport: Arc<dyn Transport>) -> Arc<LlmClient> {
 }
 
 #[test]
-fn plan_returns_expansions_and_the_second_identical_query_is_cached() {
+fn plan_returns_the_rewritten_query_as_a_probe_with_the_entities_in_the_notes() {
     let dir = tempfile::TempDir::new().unwrap();
     let transport = FakeTransport::new(
-        r#"{"expansions": ["paged attention", "\"memory complexity\"~3"], "notes": "entities + phrase"}"#,
+        r#"{"query": "+flash +attention +memory -economic", "entities": ["FlashAttention"], "phrases": ["flash attention"], "negatives": ["economic"]}"#,
     );
     let client = client_with(dir.path(), transport.clone());
     let planner = with_client(client, 3).expect("planner builds");
 
     let q = "how does flash attention reduce memory";
-    let analysis = analyze_query(q, 0, 0);
+    let planned = planner.plan(q, &analyze_query(q, 0, 0));
 
-    let first = planner.plan(q, &analysis);
-    assert_eq!(
-        first.expansions,
-        vec!["paged attention".to_string(), "\"memory complexity\"~3".to_string()]
+    // `search-organize` folds an identified phrase into the query as `"a b"~3` (a live run showed
+    // the model reporting phrases separately from the query, so a phrase would otherwise be lost
+    // between the two). The probe is therefore the required terms *plus* the folded phrase.
+    assert_eq!(planned.expansions.len(), 1);
+    let probe = &planned.expansions[0];
+    assert!(probe.starts_with("+flash +attention +memory -economic"), "{probe}");
+    assert!(probe.contains("\"flash attention\"~3"), "the phrase must be folded in: {probe}");
+    assert!(
+        planned.notes.iter().any(|n| n.contains("entities: FlashAttention")),
+        "the canonical entity must be visible in the trace: {:?}",
+        planned.notes
     );
-    assert_eq!(first.notes, vec!["entities + phrase".to_string()]);
+    assert!(planned.notes.iter().any(|n| n.contains("negatives: economic")), "{:?}", planned.notes);
+}
 
-    // The same query must not pay the model twice.
+#[test]
+fn the_second_identical_query_is_served_from_the_cache() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let transport = FakeTransport::new(r#"{"query": "+zeta"}"#);
+    let client = client_with(dir.path(), transport.clone());
+    let planner = with_client(client, 3).expect("planner builds");
+
+    let q = "zeta";
+    let analysis = analyze_query(q, 0, 0);
+    let first = planner.plan(q, &analysis);
     let second = planner.plan(q, &analysis);
+
     assert_eq!(second, first);
     assert_eq!(transport.calls(), 1, "the second identical plan must be served from the cache");
 }
@@ -106,7 +125,7 @@ fn a_transport_failure_becomes_an_empty_plan_with_a_note_not_a_panic() {
 }
 
 #[test]
-fn an_unparseable_response_becomes_an_empty_plan_with_a_note() {
+fn an_unparseable_response_becomes_an_empty_plan() {
     let dir = tempfile::TempDir::new().unwrap();
     let transport = FakeTransport::new("I am sorry, I cannot do that.");
     let client = client_with(dir.path(), transport);
@@ -116,17 +135,43 @@ fn an_unparseable_response_becomes_an_empty_plan_with_a_note() {
     let planned = planner.plan(q, &analyze_query(q, 0, 0));
 
     assert!(planned.expansions.is_empty());
-    assert!(
-        planned.notes.iter().any(|n| n.contains("unparseable")),
-        "the parse failure must be reported: {:?}",
-        planned.notes
-    );
+    assert!(planned.is_empty());
 }
 
 #[test]
-fn the_planner_never_returns_more_than_its_cap() {
-    // Even if the model over-returns, the cap holds. The engine caps again on top.
-    let body = r#"{"expansions": ["a", "b", "c", "d", "e"]}"#;
-    let p = parse_plan(body, 2, "q").unwrap();
-    assert_eq!(p.expansions, vec!["a".to_string(), "b".to_string()]);
+fn an_unchanged_query_yields_no_probe_and_an_entity_only_plan_still_reports_it() {
+    // A bare keyword search is returned unchanged by the planner: probing it again would search
+    // the original twice. An entity-only plan (e.g. the question is just "vLLM?") carries no
+    // probe but must still surface the entity, which is what the graph walk consumes.
+    use search_organize::QueryPlan;
+
+    let unchanged = plan_to_probes(
+        Some(QueryPlan {
+            query: "rust async".to_string(),
+            entities: vec![],
+            phrases: vec![],
+            negatives: vec![],
+        }),
+        "rust async",
+        3,
+    );
+    assert!(unchanged.expansions.is_empty(), "an unchanged query is not a probe");
+
+    let entity_only = plan_to_probes(
+        Some(QueryPlan {
+            query: String::new(),
+            entities: vec!["vLLM".to_string()],
+            phrases: vec![],
+            negatives: vec![],
+        }),
+        "vLLM?",
+        3,
+    );
+    assert!(entity_only.expansions.is_empty());
+    assert!(entity_only.notes.iter().any(|n| n.contains("vLLM")), "{:?}", entity_only.notes);
+}
+
+#[test]
+fn a_missing_plan_is_the_identity() {
+    assert!(plan_to_probes(None, "anything", 3).is_empty());
 }
