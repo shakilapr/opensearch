@@ -189,3 +189,65 @@ async fn empty_record_text_is_rejected() {
         "empty record text must be Invalid, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The structure the organizing model produced reaches the INDEX (searchable)
+// ---------------------------------------------------------------------------
+//
+// NOTE on read-back: `headings`, `doc_type` and `language` are INDEXED-not-STORED in the frozen
+// schema, and `Indexer::all_docs` rebuilds documents through a converter that hardcodes all four
+// (including `entities`, which IS stored). So these tests assert what the index *promises* —
+// that the structured fields are searchable — and not what `all_docs` echoes back. The read-back
+// loss is a separate, known gap.
+
+#[tokio::test]
+async fn import_makes_the_structured_extras_searchable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = test_config(dir.path());
+    let p = Pipeline::open_with(&cfg, false).unwrap();
+
+    let url = "https://dataset.example/records/structured-note";
+    let mut rec = record(url, "Body prose that names nothing in particular.");
+    rec.extras.insert("summary".to_string(), "A short summary about kelvin optics.".to_string());
+    rec.extras.insert("topics".to_string(), "kelvinoptics, zeta-ray".to_string());
+    rec.extras
+        .insert("key_entities".to_string(), "Kelvin Optics Institute, zeta-ray".to_string());
+    rec.extras.insert("doc_type".to_string(), "research-paper".to_string());
+    rec.extras.insert("language".to_string(), "fr".to_string());
+    p.import_record(&rec).unwrap();
+
+    // A topic that appears ONLY in the model's output must be findable: that is what makes the
+    // structured pack a richer index rather than the same index with extra bytes.
+    for term in ["zeta-ray", "kelvinoptics"] {
+        let resp = p.search(term, 10).await.unwrap();
+        assert_eq!(resp.results.len(), 1, "topics must be indexed; {term:?} found {:?}", resp.results);
+        assert_eq!(resp.results[0].canonical_url, url);
+    }
+    // The summary is indexed with the headings, so a phrase from it matches.
+    let resp = p.search("kelvin optics", 10).await.unwrap();
+    assert_eq!(resp.results.len(), 1, "the summary must be indexed: {:?}", resp.results);
+    // And the model's entities are indexed as entities.
+    let resp = p.search("Kelvin Optics Institute", 10).await.unwrap();
+    assert_eq!(resp.results.len(), 1, "key_entities must be indexed: {:?}", resp.results);
+
+    // Control: a term from nowhere must not match.
+    let resp = p.search("unrelatedquokka", 10).await.unwrap();
+    assert!(resp.results.is_empty(), "nothing may be invented: {:?}", resp.results);
+}
+
+#[tokio::test]
+async fn import_without_extras_still_indexes_a_plain_record() {
+    // A raw pack (`export --raw`) carries no structured extras; it must keep working and acquire
+    // no fabricated structure.
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = test_config(dir.path());
+    let p = Pipeline::open_with(&cfg, false).unwrap();
+    let url = "https://dataset.example/records/plain-note";
+    p.import_record(&record(url, "A plain record about plainwombat subjects.")).unwrap();
+    let resp = p.search("plainwombat", 10).await.unwrap();
+    assert_eq!(resp.results.len(), 1, "a plain record is still searchable: {:?}", resp.results);
+    for term in ["kelvinoptics", "zeta-ray", "research-paper"] {
+        let resp = p.search(term, 10).await.unwrap();
+        assert!(resp.results.is_empty(), "no structure may be invented: {term:?} -> {:?}", resp.results);
+    }
+}

@@ -1310,18 +1310,42 @@ impl Pipeline {
         let resource_id = ResourceId::from_canonical_url(&canonical);
 
         let body = rec.text.as_bytes();
+        // Carry the structure the organizing model produced into the index.
+        //
+        // These fields arrive in `extras` and used to be dropped on the floor: every page that was
+        // exported through the cheap model came back with its summary, topics, key entities, type
+        // and language, and the import indexed the raw text and nothing else — paying for the
+        // structuring and then discarding it. `headings`, `entities`, `doc_type` and `language` are
+        // all indexed fields, so populating them is what makes the structured pack a richer index
+        // rather than the same index with extra bytes.
+        //
+        // The summary goes into `headings` (which the schema indexes and boosts, and which is
+        // searched alongside the title) because the frozen schema has no summary field of its own.
+        let mut headings: Vec<String> = Vec::new();
+        if let Some(summary) = non_empty(rec.extras.get("summary")) {
+            headings.push(summary.to_string());
+        }
+        headings.extend(
+            list_from(rec.extras.get("topics")).into_iter(),
+        );
+        let entities = list_from(rec.extras.get("key_entities"));
+        let doc_type = non_empty(rec.extras.get("doc_type"))
+            .unwrap_or("record")
+            .to_string();
+        let language = non_empty(rec.extras.get("language")).map(|s| s.to_string());
+
         let doc = NormalizedDoc {
             url: canonical.clone(),
             title: rec.title.clone(),
             text: rec.text.clone(),
-            headings: Vec::new(),
-            entities: Vec::new(),
-            language: None,
+            headings,
+            entities,
+            language,
             description: None,
             published_at: rec.published_at,
             modified_at: None,
             outlinks: Vec::new(),
-            doc_type: "record".to_string(),
+            doc_type,
             text_len: rec.text.len(),
         };
         let outcome = FetchOutcome {
@@ -2099,6 +2123,25 @@ fn is_loopback_url(raw: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// A trimmed, non-empty value, or `None`. Used when lifting optional pack fields into the index.
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value.map(|v| v.trim()).filter(|v| !v.is_empty())
+}
+
+/// A comma-separated list from the pack (`"vLLM, Paged Attention"` -> two entries), skipping
+/// blanks and trimming. The organizer writes lists this way in `extras`.
+fn list_from(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.split(',')
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Map an HTTP status onto the shared error taxonomy (no panics).
