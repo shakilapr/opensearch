@@ -518,3 +518,61 @@ async fn engine_empty_query_is_400() {
     assert_eq!(s, 400, "engine empty query: {b}");
     assert!(b["error"].as_str().unwrap().contains("query"));
 }
+
+/// A planner that always returns one expansion probe, to prove the planner reaches the engine
+/// through the HTTP route and that its probes are launched.
+struct FixedPlanner;
+
+impl search_engine::QueryPlanner for FixedPlanner {
+    fn plan(
+        &self,
+        _query: &str,
+        _analysis: &search_engine::QueryAnalysis,
+    ) -> search_engine::PlannedQueries {
+        search_engine::PlannedQueries {
+            expansions: vec!["stub expansion probe".to_string()],
+            notes: vec!["fixed".to_string()],
+        }
+    }
+}
+
+#[tokio::test]
+async fn planner_reaches_the_engine_route_and_its_probe_is_launched() {
+    // The whole point of the planner seam: an injected planner must actually change what the
+    // engine searches, end to end, through `POST /search {engine:true}`.
+    let state =
+        AppState::new(Arc::new(StubSearcher::new(5))).with_planner(Arc::new(FixedPlanner));
+    let addr = boot(state).await;
+    let (status, body) =
+        call(addr, "POST", "/search", Some(r#"{"query":"rust","engine":true}"#)).await;
+    assert_eq!(status, 200, "engine search: {body}");
+
+    let trace: Vec<String> = body["trace"]
+        .as_array()
+        .expect("trace array")
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        trace.iter().any(|l| l.contains("planner: 1 expansion probe(s)")),
+        "the planner's probes must appear in the trace: {trace:?}"
+    );
+    assert!(
+        trace.iter().any(|l| l.contains("planner: fixed")),
+        "the planner's notes must appear in the trace: {trace:?}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_planner_the_engine_searches_only_the_original() {
+    // The default path is unchanged: no planner, no planner trace line.
+    let addr = simple_boot(5).await;
+    let (status, body) =
+        call(addr, "POST", "/search", Some(r#"{"query":"rust","engine":true}"#)).await;
+    assert_eq!(status, 200, "engine search: {body}");
+    let trace = body["trace"].as_array().expect("trace array");
+    assert!(
+        !trace.iter().any(|v| v.as_str().unwrap_or("").contains("planner:")),
+        "no planner line without a planner: {trace:?}"
+    );
+}

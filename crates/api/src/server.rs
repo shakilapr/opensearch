@@ -36,6 +36,8 @@ pub struct Inner {
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     /// Optional §22.1 answer generator; `None` keeps the engine lexical-only.
     answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
+    /// Optional §6/§8 LLM query planner; `None` searches only the original query.
+    planner: Option<Arc<dyn search_engine::QueryPlanner + Send + Sync>>,
     /// Extra retrieval lanes fused into every engine query (today: the dense lane and the §9.4
     /// entity-graph lane). Built by the binary, which owns the feature and environment decisions.
     extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
@@ -49,6 +51,7 @@ impl AppState {
                 searcher,
                 deep: None,
                 answerer: None,
+                planner: None,
                 extra_lanes: Vec::new(),
                 started: Instant::now(),
             }),
@@ -65,6 +68,7 @@ impl AppState {
                 searcher,
                 deep: Some(deep),
                 answerer: None,
+                planner: None,
                 extra_lanes: Vec::new(),
                 started: Instant::now(),
             }),
@@ -79,6 +83,7 @@ impl AppState {
     ) -> Self {
         let searcher = self.inner.searcher.clone();
         let deep = self.inner.deep.clone();
+        let planner = self.inner.planner.clone();
         let extra_lanes = self.inner.extra_lanes.clone();
         let started = self.inner.started;
         Self {
@@ -86,6 +91,30 @@ impl AppState {
                 searcher,
                 deep,
                 answerer: Some(answerer),
+                planner,
+                extra_lanes,
+                started,
+            }),
+        }
+    }
+
+    /// Attach the optional §6/§8 LLM query planner used by the engine path.
+    /// Preserves the existing searcher/deep/answerer wiring.
+    pub fn with_planner(
+        self,
+        planner: Arc<dyn search_engine::QueryPlanner + Send + Sync>,
+    ) -> Self {
+        let searcher = self.inner.searcher.clone();
+        let deep = self.inner.deep.clone();
+        let answerer = self.inner.answerer.clone();
+        let extra_lanes = self.inner.extra_lanes.clone();
+        let started = self.inner.started;
+        Self {
+            inner: Arc::new(Inner {
+                searcher,
+                deep,
+                answerer,
+                planner: Some(planner),
                 extra_lanes,
                 started,
             }),
@@ -101,9 +130,10 @@ impl AppState {
         let searcher = self.inner.searcher.clone();
         let deep = self.inner.deep.clone();
         let answerer = self.inner.answerer.clone();
+        let planner = self.inner.planner.clone();
         let started = self.inner.started;
         Self {
-            inner: Arc::new(Inner { searcher, deep, answerer, extra_lanes, started }),
+            inner: Arc::new(Inner { searcher, deep, answerer, planner, extra_lanes, started }),
         }
     }
 
@@ -119,6 +149,11 @@ impl AppState {
     /// The answer generator, when one was configured.
     pub fn answerer(&self) -> Option<&(dyn search_engine::Answerer + Send + Sync)> {
         self.inner.answerer.as_deref()
+    }
+
+    /// The query planner, when one was configured.
+    pub fn planner(&self) -> Option<&(dyn search_engine::QueryPlanner + Send + Sync)> {
+        self.inner.planner.as_deref()
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -288,12 +323,15 @@ async fn search(
         // §6–§18 engine path. The clock is read HERE, at the HTTP boundary, and
         // passed into the engine as unix seconds.
         let answerer = state.inner.answerer.clone();
+        let planner = state.inner.planner.clone();
         let extra_lanes = state.inner.extra_lanes.clone();
         let now_ms = now_unix_s();
         let resp = tokio::task::spawn_blocking(move || {
             let answerer_ref: Option<&dyn search_engine::Answerer> =
                 answerer.as_deref().map(|a| a as &dyn search_engine::Answerer);
-            run_engine_search(searcher.as_ref(), req, now_ms, answerer_ref, &extra_lanes)
+            let planner_ref: Option<&dyn search_engine::QueryPlanner> =
+                planner.as_deref().map(|p| p as &dyn search_engine::QueryPlanner);
+            run_engine_search(searcher.as_ref(), req, now_ms, answerer_ref, planner_ref, &extra_lanes)
         })
         .await
         .map_err(|e| ApiError::internal(format!("search task panicked: {e}")))?
@@ -409,7 +447,7 @@ pub async fn serve(
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
 ) -> AppResult<()> {
-    serve_with(cfg, searcher, deep, None, Vec::new()).await
+    serve_with(cfg, searcher, deep, None, None, Vec::new()).await
 }
 
 /// Bind and serve until the process is stopped, with an optional §22.1 answer
@@ -424,6 +462,7 @@ pub async fn serve_with(
     searcher: Arc<dyn Searcher + Send + Sync>,
     deep: Option<Arc<dyn DeepSearcher + Send + Sync>>,
     answerer: Option<Arc<dyn search_engine::Answerer + Send + Sync>>,
+    planner: Option<Arc<dyn search_engine::QueryPlanner + Send + Sync>>,
     extra_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>>,
 ) -> AppResult<()> {
     // Ensure a subscriber exists even when the caller (e.g. an embedding binary)
@@ -435,6 +474,13 @@ pub async fn serve_with(
     };
     let state = match answerer {
         Some(a) => state.with_answerer(a),
+        None => state,
+    };
+    let state = match planner {
+        Some(p) => {
+            tracing::info!("serving with the injected LLM query planner");
+            state.with_planner(p)
+        }
         None => state,
     };
     let state = if extra_lanes.is_empty() {

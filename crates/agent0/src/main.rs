@@ -337,9 +337,26 @@ async fn run_serve() -> ExitCode {
         tracing::info!("{}", search_answer::disabled_reason().message());
     }
 
+    // §6/§8 LLM query planning is opt-in and env-driven. `None` (no key, or the feature
+    // disabled) searches only the original query; the search path is then unchanged.
+    let planner: Option<std::sync::Arc<dyn search_engine::QueryPlanner + Send + Sync>> =
+        match search_planner::from_env() {
+            Some(p) => {
+                tracing::info!(model = p.model(), "query planning enabled");
+                Some(
+                    std::sync::Arc::new(p)
+                        as std::sync::Arc<dyn search_engine::QueryPlanner + Send + Sync>,
+                )
+            }
+            None => {
+                tracing::info!("{}", search_planner::disabled_reason().message());
+                None
+            }
+        };
+
     let mut extra_lanes = build_dense_lane(&cfg);
     extra_lanes.extend(build_graph_lane(&cfg));
-    if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, extra_lanes).await {
+    if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, planner, extra_lanes).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);
     }

@@ -563,6 +563,7 @@ pub fn run_engine_search(
     req: EngineSearchRequest,
     now_ms: i64,
     answerer: Option<&dyn Answerer>,
+    planner: Option<&dyn search_engine::QueryPlanner>,
     extra_lanes: &ExtraLanes,
 ) -> AppResult<EngineSearchResponse> {
     let started = Instant::now();
@@ -641,7 +642,7 @@ pub fn run_engine_search(
         aliases: &aliases,
         stats,
         now: now_ms,
-        planner: None,
+        planner,
     };
 
     let engine_resp = search_engine::run_search(core_req, &deps);
