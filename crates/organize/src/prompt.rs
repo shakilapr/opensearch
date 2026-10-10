@@ -154,7 +154,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Strip fences and return the outermost `{...}` object, if any.
-fn extract_json(raw: &str) -> Option<String> {
+pub(crate) fn extract_json(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let unfenced = trimmed
         .strip_prefix("```json")

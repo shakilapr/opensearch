@@ -25,6 +25,7 @@ mod client;
 mod config;
 mod error;
 mod prompt;
+mod queryplan;
 mod transport;
 
 pub use client::{CacheStats, LlmClient};
@@ -33,6 +34,7 @@ pub use config::{
 };
 pub use error::OrganizeError;
 pub use prompt::{build_prompt, parse_response, Organized};
+pub use queryplan::{build_query_prompt, parse_plan, QueryPlan};
 pub use transport::Transport;
 
 /// Re-exported verbatim: the organizer emits the dataset pack record, not a look-alike.
