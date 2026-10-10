@@ -12,7 +12,8 @@ User=search
 Group=search
 WorkingDirectory=/opt/search
 Environment=SEARCH_DATA_DIR=/var/lib/search
-Environment=SEARCH_BIND=127.0.0.1:8080
+# 8080 is taken by code-server on the current host, so the API binds 8090 and nginx proxies to it.
+Environment=SEARCH_BIND=127.0.0.1:8090
 Environment=RUST_LOG=info
 ExecStart=/opt/search/bin/agent0 serve
 Restart=on-failure
@@ -24,6 +25,12 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/search
 LimitNOFILE=65536
+
+# The service user must OWN the data root: the metadata store is SQLite in WAL mode and is opened
+# read-write even for serving, so a read-only grant fails at startup with
+# "Failed to acquire Lockfile: IoError(PermissionDenied)" and the unit restart-loops.
+#   useradd --system --no-create-home --shell /usr/sbin/nologin search
+#   chown -R search:search /var/lib/search
 
 [Install]
 WantedBy=multi-user.target
