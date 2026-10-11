@@ -12,12 +12,14 @@
 #
 # Usage:
 #   scripts/scale-crawl.sh [shards] [max_docs_per_shard] [concurrency] [seeds_file]
-# Defaults: 8 shards, 200000 docs each, concurrency 32, seeds built from Tranco top-1M.
+# Defaults: 8 shards, 200000 docs each, concurrency 64, seeds built from Tranco top-1M.
 set -uo pipefail
 
 SHARDS="${1:-8}"
 MAX_DOCS="${2:-200000}"
-CONCURRENCY="${3:-32}"
+# Cross-origin in-flight fetches per shard: 64 by default (or SEARCH_CRAWL_CONCURRENCY)
+# so a 16-core box's network + parse work is actually overlapped.
+CONCURRENCY="${3:-${SEARCH_CRAWL_CONCURRENCY:-64}}"
 SEEDS="${4:-}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,10 +64,10 @@ worker() {
   local k="$1"
   mkdir -p "$FLEET/shard-$k" "$RAW/shard-$k"
   while [ ! -f "$FLEET/stop" ]; do
-    SEARCH_DATA_DIR="$FLEET/shard-$k" \
-    SEARCH_CRAWL_ORIGIN_INTERVAL_MS="${ORIGIN_INTERVAL_MS:-250}" \
     # NOTE: the seeds file is POSITIONAL (`agent0 crawl <seedsfile>`), not a `--seeds` flag — the
     # first attempt here passed `--seeds FILE`, which the CLI read as a filename called "--seeds".
+    SEARCH_DATA_DIR="$FLEET/shard-$k" \
+    SEARCH_CRAWL_ORIGIN_INTERVAL_MS="${ORIGIN_INTERVAL_MS:-250}" \
     timeout 21600 "$BIN" crawl "$WORK/shard-$k.txt" \
       --out "$RAW/shard-$k" \
       --max-docs "$MAX_DOCS" \

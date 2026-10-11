@@ -70,7 +70,8 @@
 //! ## Politeness
 //!
 //! Concurrency is bounded **across different origins** (`--concurrency`,
-//! default 8). Within an origin at most one request is ever in flight, and a
+//! default 64, or `SEARCH_CRAWL_CONCURRENCY`). Within an origin at most one
+//! request is ever in flight, and a
 //! minimum interval separates consecutive requests to the same origin. The
 //! interval defaults to 1000 ms and is configurable with
 //! `SEARCH_CRAWL_ORIGIN_INTERVAL_MS`. This is implemented locally (a per-origin
@@ -102,7 +103,14 @@ const DEFAULT_OUT: &str = "raw-dataset";
 /// Default bound on successfully ingested documents.
 const DEFAULT_MAX_DOCS: usize = 10_000;
 /// Default bound on in-flight fetches across different origins.
-const DEFAULT_CONCURRENCY: usize = 8;
+///
+/// The crawl is network-I/O bound: at concurrency 8 a 16-core box sat at ~30%
+/// CPU and ~66 docs/min, while the implied fetch latency (concurrency /
+/// throughput ≈ 29 s) showed the fetches were simply not overlapped. 64 slots
+/// per process keeps the core's parse/index work busy without touching the
+/// per-origin politeness floor (one request in flight per origin, plus the
+/// configured interval), so no host is ever hammered.
+const DEFAULT_CONCURRENCY: usize = 64;
 /// Default per-origin minimum interval between requests (milliseconds).
 const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 
@@ -185,7 +193,7 @@ impl std::fmt::Debug for CrawlOptions {
 }
 
 impl CrawlOptions {
-    /// Production defaults: `raw-dataset/`, 10 000 docs, 8 origins in flight.
+    /// Production defaults: `raw-dataset/`, 10 000 docs, 64 origins in flight.
     pub fn new(seeds_file: impl Into<PathBuf>) -> Self {
         let max_docs = DEFAULT_MAX_DOCS;
         Self {
@@ -276,7 +284,12 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
     };
 
     let max_docs = flag_usize(args, "--max-docs").unwrap_or(DEFAULT_MAX_DOCS);
-    let concurrency = flag_usize(args, "--concurrency").unwrap_or(DEFAULT_CONCURRENCY).max(1);
+    // `--concurrency` wins; otherwise `SEARCH_CRAWL_CONCURRENCY`; otherwise the
+    // default. Always at least 1.
+    let concurrency = resolve_concurrency(
+        flag_usize(args, "--concurrency"),
+        std::env::var("SEARCH_CRAWL_CONCURRENCY").ok(),
+    );
     let out = flag_str(args, "--out").unwrap_or_else(|| DEFAULT_OUT.to_string());
     let max_urls = flag_usize(args, "--max-urls").unwrap_or_else(|| max_docs.saturating_mul(10));
     // Link following is on by default; `--no-follow-links` turns it off.
@@ -339,6 +352,15 @@ fn flag_str(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .filter(|v| !v.trim().is_empty())
         .cloned()
+}
+
+/// Resolve the fleet-wide in-flight fetch bound. Precedence: `--concurrency`
+/// flag, then `SEARCH_CRAWL_CONCURRENCY`, then [`DEFAULT_CONCURRENCY`]. A
+/// non-numeric or absent env value is ignored; the result is never below 1.
+fn resolve_concurrency(flag: Option<usize>, env: Option<String>) -> usize {
+    flag.or_else(|| env.and_then(|v| v.trim().parse::<usize>().ok()))
+        .unwrap_or(DEFAULT_CONCURRENCY)
+        .max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,5 +1745,20 @@ mod tests {
         assert!(is_dns_failure("Name or service not known"));
         assert!(!is_dns_failure("network error: connection refused"));
         assert!(!is_dns_failure("rate limited (HTTP 429) for https://x/"));
+    }
+
+    #[test]
+    fn concurrency_resolution_precedence_and_clamp() {
+        // Flag wins over the environment.
+        assert_eq!(resolve_concurrency(Some(3), Some("128".into())), 3);
+        // Environment is used when no flag is present.
+        assert_eq!(resolve_concurrency(None, Some("128".into())), 128);
+        // Whitespace around the env value is tolerated.
+        assert_eq!(resolve_concurrency(None, Some("  128 ".into())), 128);
+        // Absent/invalid env falls back to the raised default.
+        assert_eq!(resolve_concurrency(None, None), DEFAULT_CONCURRENCY);
+        assert_eq!(resolve_concurrency(None, Some("nope".into())), DEFAULT_CONCURRENCY);
+        // A zero bound is clamped to 1, never a wedged crawl.
+        assert_eq!(resolve_concurrency(Some(0), None), 1);
     }
 }
