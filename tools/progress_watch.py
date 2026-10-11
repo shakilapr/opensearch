@@ -728,6 +728,21 @@ def start_structuring(plan: dict, metrics: dict) -> None:
             log("structuring: all shards structured")
 
 
+def dispatch_is_live(item: dict, window_s: int = 600) -> bool:
+    """Is this item's opencode session still writing to its log?
+
+    Deliberately NOT a pgrep: the shell that runs `pgrep -fa 'opencode run'` carries that string in
+    its own command line, so pgrep matches itself and the count is never zero - which made the
+    supervisor wait on a session that had already died. A recent write to the item's own dispatch log
+    cannot be faked by the checking process, and it also catches a session that is alive but silent.
+    """
+    logf = OPS / f"dispatch-{item['id']}.log"
+    try:
+        return (time.time() - logf.stat().st_mtime) < window_s
+    except OSError:
+        return False
+
+
 def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> None:
     """Re-run the crate tests HERE and merge. A child's success is a self-report until then."""
     plan = load_plan()
@@ -798,12 +813,8 @@ def dispatch_code(plan: dict, item: dict) -> None:
         if [l for l in newc.strip().splitlines() if l.strip()]:
             log(f"dispatch {item['id']}: recovering commits already in {wt}")
             verify_and_merge(plan, item, wt, branch, 0)
-        elif sh(
-            f"pgrep -fa 'opencode run' | grep -c 'dispatch-{item['id']}'"
-        )[1].strip() not in ("", "0"):
-            # Scope the check to THIS item. A global 'opencode run' match also finds sessions
-            # belonging to other projects and then waits forever on a session that is not ours.
-            log(f"dispatch {item['id']}: {wt} exists and this item's session is running; waiting")
+        elif dispatch_is_live(item):
+            log(f"dispatch {item['id']}: {wt} exists and this item's session is live; waiting")
         else:
             log(f"dispatch {item['id']}: stale empty worktree; removing so the item can retry")
             sh(f"git worktree remove --force {wt}; git branch -D {branch}")
