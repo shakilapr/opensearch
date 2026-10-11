@@ -53,6 +53,11 @@ STATE = OPS / "state.json"
 LOCK = OPS / "watch.lock"
 RESEARCH_LEASH_S = 1800
 CLONES_PER_CYCLE = 2
+# The crawl fleet's own settings, so a diagnosis can name the ceiling it is working against.
+CRAWL_CONCURRENCY = 32
+CRAWL_ORIGIN_INTERVAL_MS = 250
+CRAWL_ORIGIN_CAP = 250
+SIDECAR_LOG = DATA / "sidecar-build.log"
 
 
 def log(msg: str) -> None:
@@ -101,7 +106,9 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE.write_text(json.dumps(state, indent=2) + "\n")
+    merged = load_state()
+    merged.update(state)
+    STATE.write_text(json.dumps(merged, indent=2) + "\n")
 
 
 # --------------------------------------------------------------------------- metrics
@@ -212,10 +219,33 @@ def collect() -> dict:
         if docs:
             total += docs
         m["shards"][str(s)] = entry
+    m["crawl_concurrency"] = CRAWL_CONCURRENCY
+    m["crawl_origin_interval_ms"] = CRAWL_ORIGIN_INTERVAL_MS
+    # NOTE: computed AFTER total_docs_per_min below, or it reads None on every cycle.
+    rate = None
+    if rate and rate > 0:
+        # With C concurrent fetches sustaining R per second, the average request occupies a slot
+        # for C/R seconds. That is the measurement that says whether the box is idle because each
+        # fetch is slow (timeouts, blocked hosts, politeness) or because nothing is concurrent.
+        m["implied_fetch_s"] = round(CRAWL_CONCURRENCY / (rate / 60.0), 2)
+    errs = 0
+    seen_any = False
+    for s_ in SHARDS:
+        logf = FLEET / f"shard-{s_}.log"
+        if not logf.exists():
+            continue
+        seen_any = True
+        rc_e, out_e = sh(f"grep -ciE 'timed out|timeout|connection refused|too many requests|429|403' {logf}")
+        if out_e.strip().isdigit():
+            errs += int(out_e.strip())
+    m["crawl_error_lines"] = errs if seen_any else None
     m["total_docs"] = total or None
     prev_total = prev.get("total_docs")
     if total and prev_total and prev_ts and now > prev_ts:
         m["total_docs_per_min"] = round((total - prev_total) * 60.0 / (now - prev_ts), 1)
+    rate = m.get("total_docs_per_min")
+    if rate and rate > 0:
+        m["implied_fetch_s"] = round(CRAWL_CONCURRENCY / (rate / 60.0), 2)
     save_state({"ts_epoch": now, "shards": {k: {"docs": v.get("docs")} for k, v in m["shards"].items()},
                 "total_docs": total or None})
     return m
@@ -337,6 +367,65 @@ Write the report to {out_rel} now."""
         log(f"research {item['id']}: BLOCKED - report missing or too short ({len(body)} chars)")
 
 
+# --------------------------------------------------------------------------- sidecars
+
+
+def refresh_sidecars(plan: dict, metrics: dict) -> None:
+    """Rebuild the graph and dense sidecars when the serving index generation changes.
+
+    Both are rebuildable from the index alone (the pack carries the text), so this is additive and
+    idempotent; it is also slow (a graph build over 19k docs measured 495 s), so it runs detached and
+    is collected on a later cycle by "artifact newer than the generation it was started for".
+    """
+    gen = metrics.get("index_generation_local") or metrics.get("index_generation_live")
+    item = item_by_id(plan, "sidecar-refresh")
+    if gen is None or item is None:
+        return
+    st = load_state()
+    if st.get("sidecar_generation") == gen and st.get("sidecar_done_generation") == gen:
+        if item["status"] != "done":
+            item["status"] = "done"
+            item["evidence"] = f"sidecars rebuilt for generation {gen}"
+            save_plan(plan)
+        return
+    binary = REPO / "target" / "release" / "agent0"
+    running = sh("pgrep -f 'agent0 (graph|embed) build' | wc -l")[1].strip()
+    if running not in ("", "0"):
+        return
+    started = st.get("sidecar_started_ts")
+    if st.get("sidecar_generation") == gen and started:
+        # A build was started for this generation: does its output exist and postdate it?
+        graph = DATA / "graph" / "entities.bin"
+        vectors = DATA / "vectors.bin"
+        try:
+            fresh = graph.exists() and vectors.exists() and min(
+                graph.stat().st_mtime, vectors.stat().st_mtime
+            ) > started
+        except OSError:
+            fresh = False
+        if fresh:
+            save_state({"sidecar_done_generation": gen})
+            item["status"] = "done"
+            item["evidence"] = f"graph + dense sidecars rebuilt for generation {gen}"
+            save_plan(plan)
+            log(f"sidecars: rebuilt for generation {gen}")
+        return
+    if not binary.exists():
+        return
+    cmd = (
+        f"cd {REPO} && SEARCH_DATA_DIR=/var/lib/search SEARCH_READ_ONLY=auto "
+        f"timeout 21600 {binary} embed build >> {SIDECAR_LOG} 2>&1; "
+        f"SEARCH_DATA_DIR=/var/lib/search timeout 21600 {binary} graph build >> {SIDECAR_LOG} 2>&1"
+    )
+    DATA.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(cmd, shell=True, cwd=str(REPO), start_new_session=True)
+    save_state({"sidecar_generation": gen, "sidecar_started_ts": time.time()})
+    item["status"] = "in_progress"
+    item["evidence"] = f"rebuilding sidecars for generation {gen} (started {metrics['ts']})"
+    save_plan(plan)
+    log(f"sidecars: rebuild started for generation {gen} (previous generation changed)")
+
+
 # --------------------------------------------------------------------------- throughput
 
 
@@ -368,6 +457,16 @@ def throughput_guard(plan: dict, metrics: dict) -> None:
         log(
             f"throughput: host idle (load1 {load} of {cores} cores, {procs} crawler processes, "
             f"rate {rate} docs/min) - restarted shard {s}"
+        )
+    implied = metrics.get("implied_fetch_s")
+    if implied and implied > 10:
+        log(
+            f"throughput DIAGNOSIS: at concurrency {metrics.get('crawl_concurrency')} the observed "
+            f"rate implies a mean fetch latency of {implied} s per request - the box is idle because "
+            f"each fetch holds a slot for {implied} s (slow hosts, timeouts or politeness delays), "
+            f"not because too few requests are in flight. Raising concurrency is the wrong fix: "
+            f"measure where the time goes first ({metrics.get('crawl_error_lines')} error/timeout lines "
+            f"in the shard logs)."
         )
     elif idle:
         log(
@@ -465,6 +564,49 @@ def start_structuring(plan: dict, metrics: dict) -> None:
             log("structuring: all shards structured")
 
 
+def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> None:
+    """Re-run the crate tests HERE and merge. A child's success is a self-report until then."""
+    rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
+    commits = [l for l in newc.strip().splitlines() if l.strip()]
+    if not commits:
+        item["status"] = "blocked"
+        item["reason"] = f"no commit in {wt} (rc={rc}); worktree kept for inspection"
+        save_plan(plan)
+        log(f"verify {item['id']}: BLOCKED - no commit produced")
+        return
+    crates = item.get("test_crates", [])
+    if not crates:
+        rc3, out3 = sh(
+            f"git -C {wt} diff --name-only {plan.get('_base', 'HEAD')}..HEAD | "
+            f"sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
+        )
+        crates = [c.strip() for c in out3.splitlines() if c.strip()]
+    pkgs = " ".join(f"-p {c}" if c.startswith("search-") else f"-p search-{c}" for c in crates)
+    rc4, out4 = sh(
+        f"cd {wt} && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 {CARGO} test {pkgs} 2>&1 | tail -40",
+        timeout=1600,
+    )
+    summary = "; ".join(l.strip() for l in out4.splitlines() if "test result:" in l) or out4[-200:]
+    if "test result: FAILED" in out4 or rc4 != 0:
+        item["status"] = "blocked"
+        item["reason"] = f"tests failed on {wt}: {summary[:400]}"
+        save_plan(plan)
+        log(f"verify {item['id']}: BLOCKED - tests failed: {summary[:200]}")
+        return
+    rc5, out5 = sh(f"cd {REPO} && git merge --no-edit {branch} 2>&1 | tail -3")
+    if rc5 != 0:
+        item["status"] = "blocked"
+        item["reason"] = f"merge failed (worktree {wt} kept): {out5.strip()[:300]}"
+        save_plan(plan)
+        log(f"verify {item['id']}: BLOCKED - merge failed")
+        return
+    rc6, head = sh("git rev-parse --short HEAD")
+    item["status"] = "done"
+    item["evidence"] = f"{commits[-1].split()[0]} merged as {head.strip()}; tests: {summary[:200]}"
+    save_plan(plan)
+    log(f"verify {item['id']}: DONE - {item['evidence']}")
+
+
 def dispatch_code(plan: dict, item: dict) -> None:
     """Dispatch one coding task to opencode in an isolated worktree, then verify it here."""
     wid = f"wt-{item['id'][:18]}"
@@ -472,7 +614,17 @@ def dispatch_code(plan: dict, item: dict) -> None:
     branch = wid
     model = item.get("model") or DEFAULT_MODEL
     if wt.exists():
-        log(f"dispatch {item['id']}: worktree {wt} already exists, skipping (inspect it)")
+        # A worktree left by an interrupted cycle must not strand the item forever: if it holds
+        # commits, verify and merge them; if it holds nothing, remove it so the item can retry.
+        rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
+        if [l for l in newc.strip().splitlines() if l.strip()]:
+            log(f"dispatch {item['id']}: recovering commits already in {wt}")
+            verify_and_merge(plan, item, wt, branch, 0)
+        elif sh(f"pgrep -fa 'opencode run' | grep -v pgrep | wc -l")[1].strip() not in ("", "0"):
+            log(f"dispatch {item['id']}: {wt} exists and a session is running; waiting")
+        else:
+            log(f"dispatch {item['id']}: stale empty worktree; removing so the item can retry")
+            sh(f"git worktree remove --force {wt}; git branch -D {branch}")
         return
     rc, out = sh(f"git worktree add -b {branch} {wt} {plan.get('_base', 'HEAD')}")
     if rc != 0:
@@ -511,16 +663,8 @@ REPORT: files changed, the exact test command, its result, and anything you coul
     except OSError:
         pass
 
-    rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
-    commits = [l for l in newc.strip().splitlines() if l.strip()]
-    if not commits:
-        item["status"] = "blocked"
-        item["reason"] = (
-            f"opencode produced no commit (rc={rc}); worktree kept at {wt}. Log tail: {tail[-300:]}"
-        )
-        save_plan(plan)
-        log(f"dispatch {item['id']}: BLOCKED - no commit produced")
-        return
+    verify_and_merge(plan, item, wt, branch, rc)
+    return
 
     crates = [c for c in item.get("test_crates", [])]
     if not crates:
@@ -607,6 +751,9 @@ watcher could not read is written `unavailable`, never guessed.
 | crawl rate (all shards) | {n(metrics.get('total_docs_per_min'), ' docs/min')} |
 | crawler processes / cores | {n(metrics.get('crawler_procs'))} / {n(metrics.get('cores'))} |
 | load average (1 min) | {n(metrics.get('load1'))} |
+| crawl concurrency / origin interval | {n(metrics.get('crawl_concurrency'))} / {n(metrics.get('crawl_origin_interval_ms'), ' ms')} |
+| implied mean fetch latency | {n(metrics.get('implied_fetch_s'), ' s')} |
+| crawl error/timeout lines | {n(metrics.get('crawl_error_lines'))} |
 | LLM cache entries (structuring is free when cached) | {n(metrics['llm_cache_entries'])} |
 | disk free | {metrics['disk_free_gb']} GB |
 | HEAD | `{metrics['commit']}` ({n(metrics['dirty_files'])} dirty files) |
@@ -652,6 +799,7 @@ def main() -> int:
             start_structuring(plan, metrics)
             unblock_deps(plan)
             clone_references(plan, metrics)
+            refresh_sidecars(plan, metrics)
             throughput_guard(plan, metrics)
             if not args.no_dispatch:
                 # Research first: it is cheap, it runs on the browsing model, and the index-model

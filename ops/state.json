@@ -1,18 +1,20 @@
 {
-  "ts_epoch": 1791692183.8551786,
+  "ts_epoch": 1791693278.9005816,
   "shards": {
     "0": {
-      "docs": 59959
+      "docs": 60421
     },
     "1": {
-      "docs": 54416
+      "docs": 54908
     },
     "2": {
-      "docs": 59092
+      "docs": 59321
     },
     "3": {
-      "docs": 59095
+      "docs": 59282
     }
   },
-  "total_docs": 232562
+  "total_docs": 233932,
+  "sidecar_generation": 19254,
+  "sidecar_started_ts": 1791693012.2486231
 }

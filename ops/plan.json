@@ -129,7 +129,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:34:38+0200: 94.4 docs/min, load1 12.7/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "MEASURED 2026-10-11: 76,349 error/timeout lines across the shard logs, dominated by ~39,700 HTTP 429s (10,412/10,187/9,736/9,358 per shard) plus ~1,800 DNS failures; 94 docs/min at load 3.77-12.7 on 16 cores."
     },
     {
       "id": "sidecar-refresh",
@@ -139,6 +139,14 @@
       "detail": "The engine's extra lanes read sidecars (graph/entities.bin, vectors.bin) that go stale whenever the index is rebuilt. Both are rebuildable from the index alone, so this is additive: when the serving generation changes, run embed build then graph build detached and collect the result on a later cycle. A graph build over 19k documents measured 495 s, so it must never run inside a cycle.",
       "verify": "both sidecars exist and are newer than the generation they were built for; the generation is recorded in ops/state.json.",
       "evidence": "rebuilding sidecars for generation 19254 (started 2026-10-11T06:30:10+0200)"
+    },
+    {
+      "id": "crawl-429-backoff",
+      "kind": "code",
+      "status": "todo",
+      "title": "Stop wasting the crawl on HTTP 429: back off per host and move on",
+      "detail": "MEASURED: ~39,700 HTTP 429 responses across the four shards (10,412 shard 0, 10,187 shard 2, 9,736 shard 3, 9,358 shard 1) plus ~1,800 DNS failures - 76,349 error/timeout lines in total - while the box sits at load 3.8 of 16 cores and the fleet sustains only 52-94 docs/min. The crawler is spending its slots on hosts that are telling it to slow down. Fix in the fetcher/queue: honour Retry-After when present, back off exponentially per origin (not globally), and on a 429 move the slot to another origin instead of retrying the same one - host diversity is the resource we are not using. DNS failures must be counted and skipped, not retried forever. Keep the politeness guarantees: this must not become a way to hammer a host harder.",
+      "verify": "after the change, a crawl window shows the 429 count falling as a share of responses and docs/min rising, with per-origin request rate never above the configured floor."
     }
   ]
 }
