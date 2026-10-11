@@ -20,12 +20,15 @@ multi-week architecture work, gated by the plan on proven quality.
   `source_profile` rows); freshness metadata (`published_at`/`modified_at`/`fetched_at`/
   `verified_at`/`feed_watermark` kept distinct); source-first retrieval; UI wired to the real API
   with a "Why this result?" provenance panel (`ui/src/components/SearchItem.tsx`);
-  **11 788+ indexed documents** in the live run.
+  **19 255 indexed documents across 222 hosts** in the serving index (generation 19254,
+  2026-10-11), and a separate four-shard fleet build past **323 000 documents / 3 948 hosts**.
 - **Left:**
-  1. **Source breadth — data.** 69 hosts measured against a target of "hundreds–thousands". The
-     seeds file now holds ~235 distinct roots ordered breadth-first, the crawl caps attempts per
-     origin (`--origin-cap` / `ORIGIN_CAP`), and (as of this audit) the crawler runs *beside* the
-     server, so the corpus can grow without taking the API down. It needs hours of crawl time.
+  1. **Source breadth — data.** 222 hosts in the serving index (3 948 across the fleet build)
+    against a target of "hundreds–thousands"; the fleet is **not yet merged** into the serving
+    index (see `docs/ROADMAP.md` gap 1). The seeds file holds ~235 distinct roots ordered
+    breadth-first, the crawl caps attempts per origin (`--origin-cap` / `ORIGIN_CAP`), and the
+    crawler runs *beside* the server, so the corpus can grow without taking the API down. It
+    needs hours of crawl time.
   2. **Browser escalation — done, live-verified.** `crates/browser` had **no dependents** and its
      real driver had never been compiled. Both are fixed: an HTML page that normalizes to no text
      escalates once to a `BrowserFetcher` and is indexed from the render (falling through to the
@@ -69,7 +72,8 @@ multi-week architecture work, gated by the plan on proven quality.
      (a `LaneSearcher` over it, brute-force cosine, refusing a store whose dimension does not
      match its embedder), `agent0 embed build` (backfill, opens the index **read-only** so it runs
      beside a crawl), and API wiring (`AppState::with_extra_lanes`; the engine fuses any injected
-     lane by rank, naming it in `lane_ranks`). BGE is the default build (`default = ["bge"]`).
+     lane by rank, naming it in `lane_ranks`). BGE is **opt-in** (`--features bge`); the default
+     build uses the lexical `HashEmbedder`, so it needs no model download.
      Live: `dense lane enabled docs=12486`, and every result for "what is retrieval augmented
      generation" carries `{"bm25": n, "dense": m, "source_first": k}` with dense ordering
      genuinely different from BM25. Remaining refinement: brute force does not scale past ~100K

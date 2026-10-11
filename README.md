@@ -145,9 +145,17 @@ otherwise.
 ## Status
 
 The build stages and their real status are in [`docs/ROADMAP.md`](docs/ROADMAP.md). In
-short: the single-box spine (Stages 0–10) is implemented and covered by hermetic tests;
-Stages 7 and 8 are **partial** (MCP `deep_search`/`fetch_doc` are not yet backed by the
-HTTP API; the Stage-8 `acceptance` crate is empty); distributed crawl is not started.
-Known gaps include no real BGE/SPLADE weights, no trained cross-encoder (deterministic
-lexical proxies are used and labelled as such), single-box only, and a frontier
-single-writer exception. Read that file before relying on a stage.
+short: the single-box spine (Stages 0–10) is implemented and covered by hermetic tests.
+All three MCP tools (`search`/`deep_search`/`fetch_doc`) are backed by `HttpBackend` — a
+loopback HTTP client, so MCP still needs a running API, but nothing is stubbed. The Stage-8
+`acceptance` crate holds **13 hermetic tests** and is green; the browser escalation path is
+**wired** (`SEARCH_BROWSER=1`, feature `chromium`); the entity-graph lane **runs**.
+Distributed crawl is not started. Known gaps include no real BGE/SPLADE weights, no trained
+cross-encoder (deterministic lexical proxies are used and labelled as such), single-box
+only, and a frontier single-writer exception. Read that file before relying on a stage.
+
+Corpus figures are **dated**, because they drift as the crawler runs. As of **generation
+19254 (2026-10-11)** the *serving* index holds **19 255 documents across 222 hosts**; a
+separate four-shard *fleet* build has grown to **~323 000 documents across 3 948 hosts** and
+is **not yet imported** into the serving index (`ops/state.json` carries the live counts;
+tracked as the `deploy-fleet-corpus` work item). Cite the generation, not the prose.
