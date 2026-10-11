@@ -1,0 +1,85 @@
+{
+  "_doc": "Machine-readable work plan. progress_watch.py reads this, executes `auto` items, dispatches `code` items to opencode in an isolated worktree, and only marks an item done when its `verify` command passes. Never tick an item by hand because it looks finished: record the evidence.",
+  "_kinds": {
+    "auto": "A command the watcher runs itself (idempotent, read-only or additive).",
+    "code": "A coding task the watcher dispatches to opencode, one deliverable per session.",
+    "ops": "A deployment/operations action; requires a passing `gate` before it may run.",
+    "decision": "Needs a human choice; the watcher only surfaces it."
+  },
+  "items": [
+    {
+      "id": "scan-cost-attribution",
+      "title": "Attribute the 426.9 ms single index scan (engine path) vs 56 ms (legacy path)",
+      "kind": "code",
+      "status": "todo",
+      "owner": "opencode",
+      "detail": "MEASURED: engine path p50 452 ms of which one index scan is 426.9 ms; the legacy query::execute path returns the same 10 results for 56 ms. Research (apizio/t/sonar) ranks the likely causes: (1) large internal candidate limit, (2) multi-term disjunction / phrase / slop query shape, (3) poor pruning, (4) single-segment layout blocking search_with_executor. Instrument the candidate limit actually passed to Searcher::search, and the segment count, before changing anything.",
+      "verify": "A per-stage timing line showing the candidate limit and segment count actually used, plus before/after p50 with nDCG@10 unchanged."
+    },
+    {
+      "id": "fast-mode-graph-skip-test",
+      "title": "Pin the fast-mode graph-lane skip with a test",
+      "kind": "code",
+      "status": "todo",
+      "owner": "opencode",
+      "detail": "Commit 245d20a makes fast mode skip the graph lane because it measured +261 ms p50 for -0.4 pt nDCG, but landed build-verified with no test. Add a test that a Fast-mode request does not run a lane exposing an expanding view, and that Auto/Deep still do.",
+      "verify": "cargo test -p search-api passes and the new test fails if the skip is removed."
+    },
+    {
+      "id": "fleet-structuring",
+      "title": "Structure the crawled fleet into index-model packs",
+      "kind": "auto",
+      "status": "in_progress",
+      "owner": "watch",
+      "detail": "Shard 0 export running with the shared LLM cache. Shards 1-3 queue behind it. Each shard has its own Tantivy index, so export reads it and writes a pack; repeated pages are free because the cache key includes the URL.",
+      "command": "SEARCH_DATA_DIR=/var/lib/search-fleet/shard-{shard} SEARCH_LLM_CACHE=/var/lib/search/llm-cache SEARCH_LLM_CONCURRENCY=32 timeout 14400 target/release/agent0 export /var/lib/search-fleet/pack-shard-{shard}",
+      "verify": "pack-shard-{shard}/manifest.json exists with a record count > 0 and a failure count that is reported honestly (never hidden)."
+    },
+    {
+      "id": "arxiv-fetch-and-cli",
+      "title": "Fetch an arXiv feed and expose the paper seed generator as a CLI subcommand",
+      "kind": "code",
+      "status": "todo",
+      "owner": "opencode",
+      "detail": "The pure parser landed (46ac38e). Still missing: the thin HTTP wrapper that fetches http://export.arxiv.org/api/query, a `agent0 seeds papers` subcommand emitting the URLs to a seeds file, and OAI-PMH ListRecords URLs for a configurable repository set. Follow the existing subcommand style in crates/agent0/src/main.rs.",
+      "verify": "cargo test -p search-sources -p search-agent0 passes; a hermetic test covers the wrapper with a stub transport (no network in tests)."
+    },
+    {
+      "id": "pdf-ingest-wiring",
+      "title": "Verify (or add) PDF routing into the parser and the index",
+      "kind": "code",
+      "status": "todo",
+      "owner": "opencode",
+      "detail": "8 PDFs in 221,000 pages. Read crates/router classification, crates/pdf and the pipeline ingest path; add the missing wiring if absent, and confirm a raw PDF is stored compressed like other blobs.",
+      "verify": "A hermetic test that an application/pdf response reaches the parser and is indexed, with the raw blob gzipped."
+    },
+    {
+      "id": "dedupe-cross-shard",
+      "title": "Deduplicate identical pages across the four fleet shards",
+      "kind": "auto",
+      "status": "todo",
+      "owner": "watch",
+      "detail": "Shards are host-disjoint, so cross-shard duplicates are rare by construction; structuring repeats are already free because the LLM cache key includes the URL. Low priority: measure the duplicate rate over blob sha256 before spending anything on it.",
+      "verify": "A measured duplicate rate reported; if it is negligible, close this item as not-worth-doing rather than leaving it open."
+    },
+    {
+      "id": "deploy-fleet-corpus",
+      "title": "Import the fleet packs into the serving index and deploy",
+      "kind": "ops",
+      "status": "blocked",
+      "owner": "watch",
+      "gate": "SEARCH_DATA_DIR=<staging> target/release/agent0 eval run --set benchmarks/queries.corpus.jsonl --limit 10 --lanes none",
+      "detail": "Blocked until the packs exist. The live site serves 19,255 pages while ~221,000 are on disk. Import into a STAGING data dir first and require nDCG@10 >= the current deployed 0.4913 before any swap; a corpus that answers worse is not progress.",
+      "verify": "Staging eval nDCG@10 recorded, then the swap, then a live curl showing the new document count - never the other way round."
+    },
+    {
+      "id": "stored-fields-decision",
+      "title": "Decide the stored-fields question (headings/doc_type/language are indexed-not-stored)",
+      "kind": "decision",
+      "status": "blocked",
+      "owner": "human",
+      "detail": "Read-back is lossy: all_docs rebuilds documents through a converter that hardcodes those fields, so they are searchable but not recoverable via export --raw. Options: a schema version bump with a re-index (correct, expensive), or a sidecar (cheap, one more artifact to keep consistent).",
+      "verify": "A recorded decision with its cost, not an implicit drift."
+    }
+  ]
+}
