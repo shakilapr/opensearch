@@ -204,3 +204,11 @@ $RECYCLE.BIN/
 # Reference material downloaded for analysis (repos, papers). Never served, never committed:
 # the watcher clones here and the improve-the-index-model step reads it.
 references/
+
+# Watcher machine state: the raw metric series and its lock are not knowledge, they are noise.
+ops/progress.jsonl
+ops/state.json
+ops/watch.lock
+ops/watch.log
+ops/dispatch-*.log
+ops/research-*.log

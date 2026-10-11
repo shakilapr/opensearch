@@ -58,6 +58,13 @@ CRAWL_CONCURRENCY = 32
 CRAWL_ORIGIN_INTERVAL_MS = 250
 CRAWL_ORIGIN_CAP = 250
 SIDECAR_LOG = DATA / "sidecar-build.log"
+# The user's stated failure criterion: below this, the box is being wasted, whatever the
+# throughput number says. The supervisor must measure it, report it as a failure, act on what it
+# can safely do itself, and queue agent work for what it cannot.
+UTIL_TARGET_PCT = 80.0
+UTIL_SAMPLE_S = 0.5
+STAT = Path("/proc/stat")
+MEMINFO = Path("/proc/meminfo")
 
 
 def log(msg: str) -> None:
@@ -109,6 +116,56 @@ def save_state(state: dict) -> None:
     merged = load_state()
     merged.update(state)
     STATE.write_text(json.dumps(merged, indent=2) + "\n")
+
+
+def cpu_utilization() -> float | None:
+    """Busy CPU across all cores over a short sample, from /proc/stat deltas.
+
+    Load average is not utilisation: a box with 32 runnable-but-blocked tasks on 16 cores reports a
+    load of 32 and 3% busy. Only the jiffy deltas answer "how much of the CPU is actually used".
+    """
+    def snap() -> tuple[int, int] | None:
+        try:
+            first = STAT.read_text().splitlines()[0].split()
+        except (OSError, IndexError):
+            return None
+        if not first or first[0] != "cpu":
+            return None
+        try:
+            vals = [int(v) for v in first[1:11]]
+        except ValueError:
+            return None
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+        return sum(vals), idle
+
+    a = snap()
+    if a is None:
+        return None
+    time.sleep(UTIL_SAMPLE_S)
+    b = snap()
+    if b is None:
+        return None
+    total = b[0] - a[0]
+    idle = b[1] - a[1]
+    if total <= 0:
+        return None
+    return round(100.0 * (total - idle) / total, 1)
+
+
+def ram_utilization() -> float | None:
+    try:
+        info = {}
+        for line in MEMINFO.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                info[parts[0].rstrip(":")] = int(parts[1])
+    except (OSError, ValueError):
+        return None
+    total = info.get("MemTotal")
+    avail = info.get("MemAvailable")
+    if not total or avail is None:
+        return None
+    return round(100.0 * (total - avail) / total, 1)
 
 
 # --------------------------------------------------------------------------- metrics
@@ -197,6 +254,15 @@ def collect() -> dict:
     # which reported 13 "crawlers" for 4 shards.
     rc0, procs = sh("ps -eo comm,args --no-headers | awk '$1==\"agent0\" && / crawl /' | wc -l")
     m["crawler_procs"] = int(procs.strip()) if procs.strip().isdigit() else None
+    m["cpu_util_pct"] = cpu_utilization()
+    m["ram_util_pct"] = ram_utilization()
+    m["util_target_pct"] = UTIL_TARGET_PCT
+    m["util_ok"] = (
+        m["cpu_util_pct"] is not None
+        and m["ram_util_pct"] is not None
+        and m["cpu_util_pct"] >= UTIL_TARGET_PCT
+        and m["ram_util_pct"] >= UTIL_TARGET_PCT
+    )
     rc, out = sh(f"find {DATA}/llm-cache -name '*.json' 2>/dev/null | wc -l", timeout=60)
     if out.strip().isdigit():
         m["llm_cache_entries"] = int(out.strip())
@@ -238,7 +304,12 @@ def collect() -> dict:
         rc_e, out_e = sh(f"grep -ciE 'timed out|timeout|connection refused|too many requests|429|403' {logf}")
         if out_e.strip().isdigit():
             errs += int(out_e.strip())
-    m["crawl_error_lines"] = errs if seen_any else None
+    # The count is cumulative over the shard logs, so on its own it only ever grows and says
+    # nothing about this cycle. Report the delta since the last cycle alongside it.
+    m["crawl_error_lines_cumulative"] = errs if seen_any else None
+    prev_err = prev.get("crawl_error_lines_cumulative")
+    if prev_err is not None and errs >= prev_err:
+        m["crawl_error_lines_delta"] = errs - prev_err
     m["total_docs"] = total or None
     prev_total = prev.get("total_docs")
     if total and prev_total and prev_ts and now > prev_ts:
@@ -265,11 +336,15 @@ def clone_references(plan: dict, metrics: dict) -> None:
         return
     base = REFERENCES / "repos"
     base.mkdir(parents=True, exist_ok=True)
+    attempts = load_state().get("clone_attempts") or {}
     started = 0
     failures = []
     for r in repos:
         dest = base / r["name"]
         if dest.exists():
+            continue
+        if attempts.get(r["name"], 0) >= 3:
+            failures.append(f"{r['name']}: gave up after 3 attempts")
             continue
         if started >= CLONES_PER_CYCLE:
             break
@@ -280,7 +355,9 @@ def clone_references(plan: dict, metrics: dict) -> None:
             failures.append(f"{r['name']}: {out.strip()[-120:]}")
             log(f"references: clone failed for {r['name']}: {out.strip()[-160:]}")
             shutil.rmtree(dest, ignore_errors=True)
+        attempts[r["name"]] = attempts.get(r["name"], 0) + 1
         started += 1
+    save_state({"clone_attempts": attempts})
     it = item_by_id(plan, "references-repos")
     if not it:
         return
@@ -307,6 +384,17 @@ def dispatch_research(plan: dict, item: dict) -> None:
         return
     out = REPO / out_rel
     out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        try:
+            existing = out.read_text()
+        except OSError:
+            existing = ""
+        if len(existing) >= 1500:
+            item["status"] = "done"
+            item["evidence"] = f"{out_rel} already written ({len(existing)} chars)"
+            save_plan(plan)
+            log(f"research {item['id']}: report already exists ({len(existing)} chars); not re-running")
+            return
     model = item.get("model") or RESEARCH_MODEL
     brief = f"""You are doing RESEARCH ONLY: do not modify any code in this repository. Your entire
 deliverable is a written report at {out_rel} (relative to the working directory). Create that file
@@ -434,6 +522,52 @@ def refresh_sidecars(plan: dict, metrics: dict) -> None:
 # --------------------------------------------------------------------------- throughput
 
 
+def ensure_utilization_item(plan: dict, metrics: dict) -> None:
+    """Keep a live, evidence-carrying work item for the utilisation shortfall.
+
+    The supervisor measures and takes the safe actions itself (restarting an idle shard); it cannot
+    rewrite the fetcher's concurrency model or parallelise the structuring pipeline, so that part
+    goes to an agent with the numbers attached.
+    """
+    it = item_by_id(plan, "raise-resource-utilization")
+    cpu, ram = metrics.get("cpu_util_pct"), metrics.get("ram_util_pct")
+    measured = (
+        f"MEASURED {metrics['ts']}: CPU {cpu}% and RAM {ram}% against an {UTIL_TARGET_PCT:.0f}% "
+        f"target; crawl {metrics.get('total_docs_per_min')} docs/min with "
+        f"{metrics.get('crawler_procs')} crawler process(es) on {metrics.get('cores')} cores; "
+        f"implied mean fetch latency {metrics.get('implied_fetch_s')} s"
+    )
+    if it is None:
+        plan["items"].append(
+            {
+                "id": "raise-resource-utilization",
+                "kind": "code",
+                "status": "todo",
+                "title": "Raise CPU and RAM utilisation to the 80% target",
+                "detail": (
+                    measured
+                    + ". The box is idle while work is queued. Levers to evaluate and MEASURE, not "
+                    "assume: more crawl shards/processes (each shard owns its data root; host "
+                    "diversity is also what fixes the 429 storm), higher per-shard concurrency, more "
+                    "parallel structuring workers against the shared LLM cache, and running the "
+                    "embed/graph builds concurrently instead of one at a time. Nothing may push a "
+                    "host harder than its politeness floor."
+                ),
+                "verify": (
+                    "CPU and RAM both at or above 80% on a sustained window, with throughput up and "
+                    "no host hammered past its configured rate."
+                ),
+            }
+        )
+        log("queued raise-resource-utilization as agent work")
+    else:
+        it["detail"] = measured + it["detail"].split(". The box is idle", 1)[-1] if ". The box is idle" in it["detail"] else measured
+        if it["status"] == "done":
+            it["status"] = "todo"  # it regressed: the target is a standing requirement, not a one-off
+        it.pop("reason", None)
+    save_plan(plan)
+
+
 def throughput_guard(plan: dict, metrics: dict) -> None:
     """Watch observed throughput against the resources actually available, and act on underuse."""
     cores = metrics.get("cores")
@@ -463,6 +597,22 @@ def throughput_guard(plan: dict, metrics: dict) -> None:
             f"throughput: host idle (load1 {load} of {cores} cores, {procs} crawler processes, "
             f"rate {rate} docs/min) - restarted shard {s}"
         )
+    # The utilisation target is the user's failure criterion, so it is checked first and its
+    # shortfall is treated as a defect to fix, not a number to display.
+    cpu, ram = metrics.get("cpu_util_pct"), metrics.get("ram_util_pct")
+    if cpu is not None and ram is not None and not metrics.get("util_ok"):
+        below = []
+        if cpu < UTIL_TARGET_PCT:
+            below.append(f"CPU {cpu}%")
+        if ram < UTIL_TARGET_PCT:
+            below.append(f"RAM {ram}%")
+        log(
+            f"UTILISATION FAILURE: {' and '.join(below)} against a {UTIL_TARGET_PCT:.0f}% target "
+            f"(load1 {load} of {cores} cores, {procs} crawler process(es), rate {rate} docs/min). "
+            f"The box is being wasted. Acting: restarting an idle shard where a seed file exists, "
+            f"and queuing the rest as agent work."
+        )
+        ensure_utilization_item(plan, metrics)
     implied = metrics.get("implied_fetch_s")
     if implied and implied > 10:
         log(
@@ -532,6 +682,7 @@ def start_structuring(plan: dict, metrics: dict) -> None:
     if not (REPO / "target" / "release" / "agent0").exists():
         log("skip structuring: no release binary")
         return
+    started = load_state().get("structuring") or {}
     for s in SHARDS:
         info = metrics["shards"][str(s)]
         docs, recs = info.get("docs"), info.get("pack_records")
@@ -539,6 +690,12 @@ def start_structuring(plan: dict, metrics: dict) -> None:
             continue
         if recs is not None and recs >= docs:
             continue  # this shard is already structured
+        # The index keeps growing while it is crawled, so "records < docs" is true forever and would
+        # re-export the same shard every cycle. Only re-export when it has grown materially since the
+        # pack was started (10%), otherwise the pack is current enough.
+        at_start = (started.get(str(s)) or {}).get("docs_at_start")
+        if recs is not None and at_start and docs <= at_start * 1.1:
+            continue
         out = FLEET / f"pack-shard-{s}"
         out.mkdir(parents=True, exist_ok=True)
         env = (
@@ -550,6 +707,8 @@ def start_structuring(plan: dict, metrics: dict) -> None:
             f"> {FLEET}/pack-shard-{s}.log 2>&1"
         )
         subprocess.Popen(cmd, shell=True, cwd=str(REPO), start_new_session=True)
+        started[str(s)] = {"docs_at_start": docs, "ts": time.time()}
+        save_state({"structuring": started})
         log(f"structuring: started export for shard {s} (indexed {docs}, pack records {recs})")
         it = item_by_id(plan, "fleet-structuring")
         if it:
@@ -588,13 +747,23 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
             f"sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
         )
         crates = [c.strip() for c in out3.splitlines() if c.strip()]
-    pkgs = " ".join(f"-p {c}" if c.startswith("search-") else f"-p search-{c}" for c in crates)
-    rc4, out4 = sh(
-        f"cd {wt} && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 {CARGO} test {pkgs} 2>&1 | tail -40",
-        timeout=1600,
-    )
-    summary = "; ".join(l.strip() for l in out4.splitlines() if "test result:" in l) or out4[-200:]
-    if "test result: FAILED" in out4 or rc4 != 0:
+    pkgs = []
+    for c in crates:
+        rc_n, out_n = sh(f"grep -m1 '^name' {wt}/crates/{c}/Cargo.toml | cut -d\" -f2")
+        pkgs.append(f"-p {out_n.strip()}" if out_n.strip() else f"-p search-{c}")
+    if not pkgs:
+        # A docs-only change: there is nothing to test, and an empty -p list would silently run
+        # the whole workspace (slow enough to look like a test failure).
+        summary = "no crate touched: no tests to run"
+        rc4, out4 = 0, summary
+    else:
+        rc4, out4 = sh(
+            f"cd {wt} && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 {CARGO} test "
+            f"{' '.join(pkgs)} 2>&1 | tail -40",
+            timeout=1600,
+        )
+        summary = "; ".join(l.strip() for l in out4.splitlines() if "test result:" in l) or out4[-200:]
+    if pkgs and ("test result: FAILED" in out4 or rc4 != 0):
         item["status"] = "blocked"
         item["reason"] = f"tests failed on {wt}: {summary[:400]}"
         save_plan(plan)
@@ -608,6 +777,8 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
         log(f"verify {item['id']}: BLOCKED - merge failed")
         return
     rc6, head = sh("git rev-parse --short HEAD")
+    # Merged work needs no worktree; leaving it behind only accumulates stale branches and disk.
+    sh(f"git worktree remove --force {wt}; git branch -D {branch}")
     item["status"] = "done"
     item["evidence"] = f"{commits[-1].split()[0]} merged as {head.strip()}; tests: {summary[:200]}"
     save_plan(plan)
@@ -637,6 +808,7 @@ def dispatch_code(plan: dict, item: dict) -> None:
             log(f"dispatch {item['id']}: stale empty worktree; removing so the item can retry")
             sh(f"git worktree remove --force {wt}; git branch -D {branch}")
         return
+    sh(f"git branch -D {branch}")  # a leftover branch makes the add below fail silently forever
     rc, out = sh(f"git worktree add -b {branch} {wt} {plan.get('_base', 'main')}")
     if rc != 0:
         log(f"dispatch {item['id']}: worktree add failed: {out.strip()[:200]}")
@@ -765,12 +937,15 @@ watcher could not read is written `unavailable`, never guessed.
 | live service up | {metrics.get('service_live_up')} |
 | local service up | {metrics.get('service_local_up')} |
 | main-pack records (index model) | {n(metrics['pack_records_main'])} |
+| CPU used (target {n(metrics.get('util_target_pct'), '%')}) | {n(metrics.get('cpu_util_pct'), '%')} |
+| RAM used (target {n(metrics.get('util_target_pct'), '%')}) | {n(metrics.get('ram_util_pct'), '%')} |
+| resource utilisation | {'PASS' if metrics.get('util_ok') else 'FAIL - resources are being wasted'} |
 | crawl rate (all shards) | {n(metrics.get('total_docs_per_min'), ' docs/min')} |
 | crawler processes / cores | {n(metrics.get('crawler_procs'))} / {n(metrics.get('cores'))} |
 | load average (1 min) | {n(metrics.get('load1'))} |
 | crawl concurrency / origin interval | {n(metrics.get('crawl_concurrency'))} / {n(metrics.get('crawl_origin_interval_ms'), ' ms')} |
 | implied mean fetch latency | {n(metrics.get('implied_fetch_s'), ' s')} |
-| crawl error/timeout lines | {n(metrics.get('crawl_error_lines'))} |
+| crawl error lines (since last cycle / total) | {n(metrics.get('crawl_error_lines_delta'))} / {n(metrics.get('crawl_error_lines_cumulative'))} |
 | LLM cache entries (structuring is free when cached) | {n(metrics['llm_cache_entries'])} |
 | disk free | {metrics['disk_free_gb']} GB |
 | HEAD | `{metrics['commit']}` ({n(metrics['dirty_files'])} dirty files) |
