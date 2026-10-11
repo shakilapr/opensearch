@@ -22,6 +22,7 @@ Usage:  python3 tools/progress_watch.py [--interval 300] [--once] [--no-dispatch
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -49,6 +50,7 @@ DISPATCH_LEASH_S = 2700
 REFERENCES = REPO / "references"
 REF_SPEC = OPS / "references.json"
 STATE = OPS / "state.json"
+LOCK = OPS / "watch.lock"
 RESEARCH_LEASH_S = 1800
 CLONES_PER_CYCLE = 2
 
@@ -301,6 +303,27 @@ Write the report to {out_rel} now."""
         body = out.read_text()
     except OSError:
         body = ""
+    if len(body) < 1500:
+        # opencode sometimes answers in the session transcript instead of using its write tool,
+        # and losing a real report to that is not acceptable. Capture the reply, label where it
+        # came from, and keep the content unedited.
+        try:
+            raw = logf.read_text()
+        except OSError:
+            raw = ""
+        cleaned = "\n".join(
+            line
+            for line in raw.splitlines()
+            if line.strip() and not line.lstrip().startswith(("\u2192", "\u2717", "!", ">", "```"))
+        )
+        if len(cleaned) >= 1500:
+            header = (
+                f"<!-- Captured from the opencode session transcript ({logf.name}): the model "
+                f"answered inline instead of writing this file. Content is unedited. -->\n\n"
+            )
+            out.write_text(header + cleaned + "\n")
+            body = out.read_text()
+            log(f"research {item['id']}: captured an inline answer into {out_rel}")
     if len(body) >= 1500:
         first = next((l.strip() for l in body.splitlines() if l.strip().startswith("#")), "")
         item["status"] = "done"
@@ -608,6 +631,17 @@ def main() -> int:
     ap.add_argument("--no-dispatch", action="store_true")
     args = ap.parse_args()
     OPS.mkdir(exist_ok=True)
+    # One cycle at a time. A manual run racing the service let the last writer win, which
+    # silently reverted a freshly-blocked item back to todo.
+    lock_fh = LOCK.open("w")
+    try:
+        # flock(), not fcntl(): fcntl(fd, F_SETLK) needs a struct-flock argument and raises
+        # OSError without one, which made this guard fire on EVERY run and exit immediately -
+        # the service flapped in an auto-restart loop and never completed a cycle.
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another progress-watch is running; exiting")
+        return 1
     log("progress-watch starting" + (" (once)" if args.once else f" (interval {args.interval}s)"))
     while True:
         try:
