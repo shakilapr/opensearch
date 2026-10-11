@@ -573,7 +573,7 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
     """Re-run the crate tests HERE and merge. A child's success is a self-report until then."""
     plan = load_plan()
     item = item_by_id(plan, item["id"]) or item
-    rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
+    rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'main')}..HEAD")
     commits = [l for l in newc.strip().splitlines() if l.strip()]
     if not commits:
         item["status"] = "blocked"
@@ -584,7 +584,7 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
     crates = item.get("test_crates", [])
     if not crates:
         rc3, out3 = sh(
-            f"git -C {wt} diff --name-only {plan.get('_base', 'HEAD')}..HEAD | "
+            f"git -C {wt} diff --name-only {plan.get('_base', 'main')}..HEAD | "
             f"sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
         )
         crates = [c.strip() for c in out3.splitlines() if c.strip()]
@@ -623,17 +623,21 @@ def dispatch_code(plan: dict, item: dict) -> None:
     if wt.exists():
         # A worktree left by an interrupted cycle must not strand the item forever: if it holds
         # commits, verify and merge them; if it holds nothing, remove it so the item can retry.
-        rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
+        rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'main')}..HEAD")
         if [l for l in newc.strip().splitlines() if l.strip()]:
             log(f"dispatch {item['id']}: recovering commits already in {wt}")
             verify_and_merge(plan, item, wt, branch, 0)
-        elif sh(f"pgrep -fa 'opencode run' | grep -v pgrep | wc -l")[1].strip() not in ("", "0"):
-            log(f"dispatch {item['id']}: {wt} exists and a session is running; waiting")
+        elif sh(
+            f"pgrep -fa 'opencode run' | grep -c 'dispatch-{item['id']}'"
+        )[1].strip() not in ("", "0"):
+            # Scope the check to THIS item. A global 'opencode run' match also finds sessions
+            # belonging to other projects and then waits forever on a session that is not ours.
+            log(f"dispatch {item['id']}: {wt} exists and this item's session is running; waiting")
         else:
             log(f"dispatch {item['id']}: stale empty worktree; removing so the item can retry")
             sh(f"git worktree remove --force {wt}; git branch -D {branch}")
         return
-    rc, out = sh(f"git worktree add -b {branch} {wt} {plan.get('_base', 'HEAD')}")
+    rc, out = sh(f"git worktree add -b {branch} {wt} {plan.get('_base', 'main')}")
     if rc != 0:
         log(f"dispatch {item['id']}: worktree add failed: {out.strip()[:200]}")
         return
@@ -663,7 +667,10 @@ REPORT: files changed, the exact test command, its result, and anything you coul
         f"> {logf} 2>&1"
     )
     log(f"dispatch {item['id']}: opencode on {model}, leash {DISPATCH_LEASH_S}s, worktree {wt}")
-    rc, out = sh(cmd, timeout=DISPATCH_LEASH_S + 120)
+    # cwd MUST be the worktree. Launched from the repo root, opencode treats the worktree as an
+    # external directory and auto-rejects every read in it, so the session dies in seconds with
+    # "no commit produced" - which is exactly what it did until this was fixed.
+    rc, out = sh(cmd, timeout=DISPATCH_LEASH_S + 120, cwd=wt)
     tail = ""
     try:
         tail = logf.read_text()[-600:]
@@ -676,7 +683,7 @@ REPORT: files changed, the exact test command, its result, and anything you coul
     crates = [c for c in item.get("test_crates", [])]
     if not crates:
         rc3, out3 = sh(
-            f"git -C {wt} diff --name-only {plan.get('_base', 'HEAD')}..HEAD | sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
+            f"git -C {wt} diff --name-only {plan.get('_base', 'main')}..HEAD | sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
         )
         crates = [c.strip() for c in out3.splitlines() if c.strip()]
     pkg_flags = " ".join(f"-p search-{c}" if not c.startswith("search-") else f"-p {c}" for c in crates)
