@@ -200,3 +200,7 @@ $RECYCLE.BIN/
 # Dataset adapters' offline fixtures are small and committed on purpose.
 !datasets/fixtures/
 !datasets/fixtures/**
+
+# Reference material downloaded for analysis (repos, papers). Never served, never committed:
+# the watcher clones here and the improve-the-index-model step reads it.
+references/

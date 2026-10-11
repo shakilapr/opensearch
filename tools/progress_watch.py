@@ -46,6 +46,11 @@ CARGO = os.path.expanduser("~/.cargo/bin/cargo")
 DEFAULT_MODEL = "crowbot/deepseek-v4.1-flash"  # key is in the opencode config, so the service needs no env var
 RESEARCH_MODEL = "apizio/t/sonar"
 DISPATCH_LEASH_S = 2700
+REFERENCES = REPO / "references"
+REF_SPEC = OPS / "references.json"
+STATE = OPS / "state.json"
+RESEARCH_LEASH_S = 1800
+CLONES_PER_CYCLE = 2
 
 
 def log(msg: str) -> None:
@@ -79,6 +84,22 @@ def curl_json(url: str, timeout: int = 10) -> dict | None:
         return json.loads(out)
     except json.JSONDecodeError:
         return None
+
+
+# --------------------------------------------------------------------------- state
+
+
+def load_state() -> dict:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def save_state(state: dict) -> None:
+    STATE.write_text(json.dumps(state, indent=2) + "\n")
 
 
 # --------------------------------------------------------------------------- metrics
@@ -154,12 +175,27 @@ def collect() -> dict:
         "shards": {},
         "export_running": export_running(),
     }
+    prev = load_state()
+    prev_shards = prev.get("shards") or {}
+    prev_ts = prev.get("ts_epoch")
+    now = time.time()
+    try:
+        m["cores"] = os.cpu_count()
+        m["load1"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        m["cores"], m["load1"] = None, None
+    # Count the crawler BINARY only: pgrep -f also matches the timeout/bash wrappers around it,
+    # which reported 13 "crawlers" for 4 shards.
+    rc0, procs = sh("ps -eo comm,args --no-headers | awk '$1==\"agent0\" && / crawl /' | wc -l")
+    m["crawler_procs"] = int(procs.strip()) if procs.strip().isdigit() else None
     rc, out = sh(f"find {DATA}/llm-cache -name '*.json' 2>/dev/null | wc -l", timeout=60)
     if out.strip().isdigit():
         m["llm_cache_entries"] = int(out.strip())
+    total = 0
     for s in SHARDS:
-        m["shards"][str(s)] = {
-            "docs": shard_docs(s),
+        docs = shard_docs(s)
+        entry = {
+            "docs": docs,
             "raw_bytes": dir_bytes(REPO / "raw-dataset" / f"shard-{s}"),
             "pack_records": pack_records(s),
             "running": bool(
@@ -168,7 +204,161 @@ def collect() -> dict:
                 .isdigit()
             ),
         }
+        prev_docs = (prev_shards.get(str(s)) or {}).get("docs")
+        if docs is not None and prev_docs is not None and prev_ts and now > prev_ts:
+            entry["docs_per_min"] = round((docs - prev_docs) * 60.0 / (now - prev_ts), 1)
+        if docs:
+            total += docs
+        m["shards"][str(s)] = entry
+    m["total_docs"] = total or None
+    prev_total = prev.get("total_docs")
+    if total and prev_total and prev_ts and now > prev_ts:
+        m["total_docs_per_min"] = round((total - prev_total) * 60.0 / (now - prev_ts), 1)
+    save_state({"ts_epoch": now, "shards": {k: {"docs": v.get("docs")} for k, v in m["shards"].items()},
+                "total_docs": total or None})
     return m
+
+
+# --------------------------------------------------------------------------- research / references
+
+
+def clone_references(plan: dict, metrics: dict) -> None:
+    """Clone the reference repos, a couple per cycle. Gitignored; never served, never committed."""
+    if not REF_SPEC.exists():
+        return
+    try:
+        repos = json.loads(REF_SPEC.read_text()).get("repos", [])
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"references: spec unreadable: {exc}")
+        return
+    base = REFERENCES / "repos"
+    base.mkdir(parents=True, exist_ok=True)
+    started = 0
+    failures = []
+    for r in repos:
+        dest = base / r["name"]
+        if dest.exists():
+            continue
+        if started >= CLONES_PER_CYCLE:
+            break
+        rc, out = sh(f"git clone --depth 1 -q {r['url']} {dest}", timeout=600, cwd=REFERENCES)
+        if rc == 0:
+            log(f"references: cloned {r['name']}")
+        else:
+            failures.append(f"{r['name']}: {out.strip()[-120:]}")
+            log(f"references: clone failed for {r['name']}: {out.strip()[-160:]}")
+            shutil.rmtree(dest, ignore_errors=True)
+        started += 1
+    it = item_by_id(plan, "references-repos")
+    if not it:
+        return
+    present = [r["name"] for r in repos if (base / r["name"]).exists()]
+    if len(present) == len(repos):
+        it["status"] = "done"
+        it["evidence"] = f"cloned {len(present)}/{len(repos)}: " + ", ".join(present)
+    elif failures:
+        it["status"] = "in_progress"
+        it["reason"] = "failures so far: " + "; ".join(failures[:3])
+    else:
+        it["status"] = "in_progress"
+        it["evidence"] = f"cloned {len(present)}/{len(repos)}"
+    save_plan(plan)
+
+
+def dispatch_research(plan: dict, item: dict) -> None:
+    """Dispatch a research question to the browsing model, and require a written answer."""
+    out_rel = item.get("output")
+    if not out_rel:
+        item["status"] = "blocked"
+        item["reason"] = "research item has no `output` path"
+        save_plan(plan)
+        return
+    out = REPO / out_rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    model = item.get("model") or RESEARCH_MODEL
+    brief = f"""You are doing RESEARCH ONLY: do not modify any code in this repository. Your entire
+deliverable is a written report at {out_rel} (relative to the working directory). Create that file
+with your findings, then stop.
+
+QUESTION
+{item['detail']}
+
+REQUIREMENTS
+- Cite sources with links for every non-obvious claim. If you cannot verify something, say so.
+- Be concrete: name techniques, parameters and tradeoffs rather than describing areas.
+- End with a ranked, actionable list (what to do first and what it buys).
+- No hedging generalities, no filler. Length is not a virtue; specificity is.
+
+Write the report to {out_rel} now."""
+    logf = OPS / f"research-{item['id']}.log"
+    cmd = (
+        f"timeout {RESEARCH_LEASH_S} opencode run --model {model} {json.dumps(brief)} "
+        f"> {logf} 2>&1"
+    )
+    log(f"research {item['id']}: {model}, leash {RESEARCH_LEASH_S}s -> {out_rel}")
+    rc, _ = sh(cmd, timeout=RESEARCH_LEASH_S + 120)
+    try:
+        body = out.read_text()
+    except OSError:
+        body = ""
+    if len(body) >= 1500:
+        first = next((l.strip() for l in body.splitlines() if l.strip().startswith("#")), "")
+        item["status"] = "done"
+        item["evidence"] = f"{out_rel} written ({len(body)} chars){'; ' + first if first else ''}"
+        log(f"research {item['id']}: DONE ({len(body)} chars)")
+    else:
+        item["status"] = "blocked"
+        item["reason"] = (
+            f"no usable report at {out_rel} (rc={rc}, {len(body)} chars); log: {logf}"
+        )
+        log(f"research {item['id']}: BLOCKED - report missing or too short ({len(body)} chars)")
+
+
+# --------------------------------------------------------------------------- throughput
+
+
+def throughput_guard(plan: dict, metrics: dict) -> None:
+    """Watch observed throughput against the resources actually available, and act on underuse."""
+    cores = metrics.get("cores")
+    load = metrics.get("load1")
+    procs = metrics.get("crawler_procs")
+    rate = metrics.get("total_docs_per_min")  # None on the first cycle: reported, not invented
+    if not cores or load is None:
+        return
+    idle = load < cores * 0.5
+    stopped = [s for s in SHARDS if not metrics["shards"][str(s)]["running"]]
+    seeded = [s for s in stopped if (FLEET / "work" / f"shard-{s}.txt").exists()]
+    if idle and seeded:
+        s = seeded[0]
+        env = (
+            f"SEARCH_DATA_DIR=/var/lib/search-fleet/shard-{s} SEARCH_CRAWL_ORIGIN_INTERVAL_MS=250 "
+            f"SEARCH_CRAWL_ORIGIN_CAP=250 SEARCH_CRAWL_COMPRESS=1"
+        )
+        cmd = (
+            f"cd {REPO} && mkdir -p /var/lib/search-fleet/shard-{s} raw-dataset/shard-{s} && "
+            f"{env} timeout 86400 {REPO}/target/release/agent0 crawl "
+            f"/var/lib/search-fleet/work/shard-{s}.txt --out raw-dataset/shard-{s} "
+            f"--max-docs 250000 --max-urls 1000000 --concurrency 32 --compress "
+            f"> /var/lib/search-fleet/shard-{s}.log 2>&1"
+        )
+        subprocess.Popen(cmd, shell=True, cwd=str(REPO), start_new_session=True)
+        log(
+            f"throughput: host idle (load1 {load} of {cores} cores, {procs} crawler processes, "
+            f"rate {rate} docs/min) - restarted shard {s}"
+        )
+    elif idle:
+        log(
+            f"throughput: host underused (load1 {load} of {cores} cores, {procs} crawler "
+            f"processes, {rate} docs/min) but no stopped shard has a seed file to restart"
+        )
+    it = item_by_id(plan, "crawl-throughput")
+    if it:
+        it["status"] = "in_progress"
+        it["evidence"] = (
+            f"{metrics['ts']}: {rate} docs/min, load1 {load}/{cores} cores, "
+            f"{procs} crawler process(es), {len(stopped)} shard(s) stopped"
+        )
+        save_plan(plan)
 
 
 # --------------------------------------------------------------------------- plan
@@ -180,6 +370,22 @@ def load_plan() -> dict:
 
 def save_plan(plan: dict) -> None:
     PLAN.write_text(json.dumps(plan, indent=2) + "\n")
+
+
+def unblock_deps(plan: dict) -> None:
+    """A dependent item becomes actionable only when every dependency is genuinely done."""
+    changed = False
+    for it in plan["items"]:
+        deps = it.get("deps") or []
+        if it["status"] == "blocked" and deps and all(
+            (item_by_id(plan, d) or {}).get("status") == "done" for d in deps
+        ):
+            it["status"] = "todo"
+            it.pop("reason", None)
+            log(f"unblocked {it['id']}: deps {', '.join(deps)} are done")
+            changed = True
+    if changed:
+        save_plan(plan)
 
 
 def item_by_id(plan: dict, item_id: str) -> dict | None:
@@ -346,14 +552,14 @@ def render(metrics: dict, plan: dict) -> None:
         return "unavailable" if v is None else f"{v:,}{unit}"
 
     rows = [
-        "| shard | crawler | indexed | pack records | raw |",
-        "|---|---|---|---|---|",
+        "| shard | crawler | indexed | docs/min | pack records | raw |",
+        "|---|---|---|---|---|---|",
     ]
     for s in SHARDS:
         i = metrics["shards"][str(s)]
         rows.append(
             f"| {s} | {'running' if i['running'] else 'stopped'} | {n(i['docs'])} | "
-            f"{n(i['pack_records'])} | {n(i['raw_bytes'])} bytes |"
+            f"{n(i.get('docs_per_min'))} | {n(i['pack_records'])} | {n(i['raw_bytes'])} bytes |"
         )
     items = "\n".join(
         f"| `{it['id']}` | {it['kind']} | **{it['status']}** | "
@@ -369,12 +575,15 @@ watcher could not read is written `unavailable`, never guessed.
 
 | what | value |
 |---|---|
-| live index generation (documents at build) | {n(metrics['index_generation_live'])} |
+| live index generation (documents at build) | {n(metrics.get('index_generation_live'))} |
 | live index manifest | {metrics['index_manifest_live'] or 'unavailable'} |
-| local index generation | {n(metrics['index_generation_local'])} |
-| live service up | {metrics['service_live_up']} |
-| local service up | {metrics['service_local_up']} |
+| local index generation | {n(metrics.get('index_generation_local'))} |
+| live service up | {metrics.get('service_live_up')} |
+| local service up | {metrics.get('service_local_up')} |
 | main-pack records (index model) | {n(metrics['pack_records_main'])} |
+| crawl rate (all shards) | {n(metrics.get('total_docs_per_min'), ' docs/min')} |
+| crawler processes / cores | {n(metrics.get('crawler_procs'))} / {n(metrics.get('cores'))} |
+| load average (1 min) | {n(metrics.get('load1'))} |
 | LLM cache entries (structuring is free when cached) | {n(metrics['llm_cache_entries'])} |
 | disk free | {metrics['disk_free_gb']} GB |
 | HEAD | `{metrics['commit']}` ({n(metrics['dirty_files'])} dirty files) |
@@ -407,11 +616,21 @@ def main() -> int:
             with METRICS.open("a") as fh:
                 fh.write(json.dumps(metrics) + "\n")
             start_structuring(plan, metrics)
+            unblock_deps(plan)
+            clone_references(plan, metrics)
+            throughput_guard(plan, metrics)
             if not args.no_dispatch:
+                # Research first: it is cheap, it runs on the browsing model, and the index-model
+                # work depends on what it finds.
                 for it in plan["items"]:
-                    if it["kind"] == "code" and it["status"] == "todo":
-                        dispatch_code(plan, it)
-                        break  # one session at a time: verification must stay tractable
+                    if it["kind"] == "research" and it["status"] == "todo":
+                        dispatch_research(plan, it)
+                        break
+                else:
+                    for it in plan["items"]:
+                        if it["kind"] == "code" and it["status"] == "todo":
+                            dispatch_code(plan, it)
+                            break  # one session at a time: verification must stay tractable
             for it in plan["items"]:
                 if it["kind"] == "ops":
                     gate_ops(plan, it)

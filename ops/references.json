@@ -1,0 +1,35 @@
+{
+  "_doc": "Reference repositories the watcher clones (depth 1) into references/repos/, which is gitignored. They are read for analysis, never built into the product. Analyses feed the index-model improvement step. Every entry states why it is here.",
+  "repos": [
+    {
+      "name": "tantivy",
+      "url": "https://github.com/quickwit-oss/tantivy",
+      "why": "The lexical engine we actually use. Read how TopDocs, the collector and segment search are implemented, and whether block-max/WAND pruning exists in our version."
+    },
+    {
+      "name": "seismic",
+      "url": "https://github.com/TusKANNy/seismic",
+      "why": "The Seismic benchmark for inference-free learned sparse indexes (block-max WAND based). The closest published design to the weighted activated sparse index we want."
+    },
+    {
+      "name": "pisa",
+      "url": "https://github.com/pisa-engine/pisa",
+      "why": "A modern IR engine built around WAND/BlockMax-WAND and efficient top-k. The clearest reference for early termination done properly."
+    },
+    {
+      "name": "pyserini",
+      "url": "https://github.com/castorini/pyserini",
+      "why": "Reproducible BM25 and learned-sparse baselines with standard metrics; useful for judging whether our nDCG numbers are sane for the corpus."
+    },
+    {
+      "name": "splade",
+      "url": "https://github.com/naver/splade",
+      "why": "Learned sparse expansion. Relevant to document-side weighting at index time, which is where our pack's entities/topics should become weights."
+    },
+    {
+      "name": "faiss",
+      "url": "https://github.com/facebookresearch/faiss",
+      "why": "The dense lane is a doc-id vector store; read the HNSW/IVF search-effort parameters before tuning ours."
+    }
+  ]
+}
