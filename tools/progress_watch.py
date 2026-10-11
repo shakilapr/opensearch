@@ -81,7 +81,15 @@ def sh(cmd: str, timeout: int = 120, cwd: Path | None = None) -> tuple[int, str]
     """Run a shell command. Never raises: a failure is a result, not an exception."""
     try:
         p = subprocess.run(
-            cmd, shell=True, cwd=str(cwd or REPO), capture_output=True, text=True, timeout=timeout
+            cmd,
+            shell=True,
+            # bash, not /bin/sh: the verify commands use `set -o pipefail`, which dash rejects
+            # ("set: Illegal option -o pipefail"), blocking every item as if its tests had failed.
+            executable="/bin/bash",
+            cwd=str(cwd or REPO),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
