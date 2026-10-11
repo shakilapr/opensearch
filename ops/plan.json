@@ -11,10 +11,11 @@
       "id": "scan-cost-attribution",
       "title": "Attribute the 426.9 ms single index scan (engine path) vs 56 ms (legacy path)",
       "kind": "code",
-      "status": "todo",
+      "status": "done",
       "owner": "opencode",
       "detail": "MEASURED: engine path p50 452 ms of which one index scan is 426.9 ms; the legacy query::execute path returns the same 10 results for 56 ms. Research (apizio/t/sonar) ranks the likely causes: (1) large internal candidate limit, (2) multi-term disjunction / phrase / slop query shape, (3) poor pruning, (4) single-segment layout blocking search_with_executor. Instrument the candidate limit actually passed to Searcher::search, and the segment count, before changing anything.",
-      "verify": "A per-stage timing line showing the candidate limit and segment count actually used, plus before/after p50 with nDCG@10 unchanged."
+      "verify": "A per-stage timing line showing the candidate limit and segment count actually used, plus before/after p50 with nDCG@10 unchanged.",
+      "evidence": "b84c324 merged as b84c324; tests: test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s; test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s; test resul"
     },
     {
       "id": "fast-mode-graph-skip-test",
@@ -130,7 +131,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:46:55+0200: 113.2 docs/min, load1 13.9/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T06:50:52+0200: 94.5 docs/min, load1 12.62/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
