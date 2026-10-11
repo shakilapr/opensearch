@@ -11,21 +11,19 @@
       "id": "scan-cost-attribution",
       "title": "Attribute the 426.9 ms single index scan (engine path) vs 56 ms (legacy path)",
       "kind": "code",
-      "status": "blocked",
+      "status": "todo",
       "owner": "opencode",
       "detail": "MEASURED: engine path p50 452 ms of which one index scan is 426.9 ms; the legacy query::execute path returns the same 10 results for 56 ms. Research (apizio/t/sonar) ranks the likely causes: (1) large internal candidate limit, (2) multi-term disjunction / phrase / slop query shape, (3) poor pruning, (4) single-segment layout blocking search_with_executor. Instrument the candidate limit actually passed to Searcher::search, and the segment count, before changing anything.",
-      "verify": "A per-stage timing line showing the candidate limit and segment count actually used, plus before/after p50 with nDCG@10 unchanged.",
-      "reason": "no commit in /root/.hermes/cache/scratch/wt-scan-cost-attribut (rc=0); worktree kept for inspection"
+      "verify": "A per-stage timing line showing the candidate limit and segment count actually used, plus before/after p50 with nDCG@10 unchanged."
     },
     {
       "id": "fast-mode-graph-skip-test",
       "title": "Pin the fast-mode graph-lane skip with a test",
       "kind": "code",
-      "status": "blocked",
+      "status": "todo",
       "owner": "opencode",
       "detail": "Commit 245d20a makes fast mode skip the graph lane because it measured +261 ms p50 for -0.4 pt nDCG, but landed build-verified with no test. Add a test that a Fast-mode request does not run a lane exposing an expanding view, and that Auto/Deep still do.",
-      "verify": "cargo test -p search-api passes and the new test fails if the skip is removed.",
-      "reason": "no commit in /root/.hermes/cache/scratch/wt-fast-mode-graph-sk (rc=0); worktree kept for inspection"
+      "verify": "cargo test -p search-api passes and the new test fails if the skip is removed."
     },
     {
       "id": "fleet-structuring",

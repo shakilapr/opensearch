@@ -654,6 +654,9 @@ DONE MEANS
 {item['verify']}
 
 RULES
+- ALL scratch files go in ./scratch INSIDE this worktree. Never write to /tmp, ~, or any path
+  outside it: those writes are auto-rejected by the permission system and end your session
+  immediately, taking your work with them. Copy a file into ./scratch if you want to mutate it.
 - Run the tests for every crate you touch; they must pass.
 - Commit on the current branch with a clear message.
 - Do NOT commit any key or token. The LLM clients read credentials from the environment.
