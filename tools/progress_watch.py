@@ -329,6 +329,11 @@ Write the report to {out_rel} now."""
     )
     log(f"research {item['id']}: {model}, leash {RESEARCH_LEASH_S}s -> {out_rel}")
     rc, _ = sh(cmd, timeout=RESEARCH_LEASH_S + 120)
+    # The dispatch above can take half an hour. Anything another writer changed in that window
+    # would be reverted by saving the copy we loaded at cycle start, so re-read it.
+    fresh = load_plan()
+    item = item_by_id(fresh, item["id"]) or item
+    plan = fresh
     try:
         body = out.read_text()
     except OSError:
@@ -566,6 +571,8 @@ def start_structuring(plan: dict, metrics: dict) -> None:
 
 def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> None:
     """Re-run the crate tests HERE and merge. A child's success is a self-report until then."""
+    plan = load_plan()
+    item = item_by_id(plan, item["id"]) or item
     rc2, newc = sh(f"git -C {wt} log --oneline {plan.get('_base', 'HEAD')}..HEAD")
     commits = [l for l in newc.strip().splitlines() if l.strip()]
     if not commits:
