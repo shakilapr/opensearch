@@ -201,11 +201,17 @@ fn multiword_capitalized(s: &str) -> Vec<String> {
 fn parse_ts(s: &str) -> Option<i64> {
     // Accept RFC 3339 / ISO 8601 date or datetime; `time` crate is not in the
     // pinned set, so parse the common `YYYY-MM-DD[THH:MM:SS...]` shape by hand.
+    //
+    // The input is arbitrary page text: a `<time datetime>` attribute or a `meta[content]` value
+    // has no schema behind it. A page whose value begins with a multi-byte character (an Arabic
+    // locale page, for instance) has no char boundary at byte 10, and `split_at(10)` PANICKED —
+    // "end byte index 10 is not a char boundary; it is inside 'ي'" — which killed the whole crawl
+    // task, not just the document. Every slice below is a checked `get`.
     let s = s.trim();
     if s.len() < 10 {
         return None;
     }
-    let (date, rest) = s.split_at(10);
+    let (date, rest) = s.split_at_checked(10)?;
     let mut d = date.split('-');
     let y: i64 = d.next()?.parse().ok()?;
     let mo: i64 = d.next()?.parse().ok()?;
@@ -213,8 +219,7 @@ fn parse_ts(s: &str) -> Option<i64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&da) {
         return None;
     }
-    let (hh, mm, ss) = if rest.len() >= 9 {
-        let t = &rest[1..9];
+    let (hh, mm, ss) = if let Some(t) = rest.get(1..9) {
         let mut it = t.split(':');
         (
             it.next().and_then(|v| v.parse().ok()).unwrap_or(0i64),
@@ -284,6 +289,39 @@ mod tests {
     fn parses_published_time() {
         let d = normalize_html("https://x.test/a", PAGE.as_bytes()).unwrap();
         // 2024-03-05T10:00:00Z
+        assert_eq!(d.published_at, Some(1_709_632_800));
+    }
+
+    #[test]
+    fn a_multibyte_datetime_is_rejected_not_a_panic() {
+        // Live regression (shard 3, https://www.premierleague.com/ar/...): a `<time datetime>`
+        // value that begins with a multi-byte character has no char boundary at byte 10, so
+        // `split_at(10)` aborted the crawl task: "end byte index 10 is not a char boundary".
+        // The document must simply carry no timestamp.
+        let page = r#"<html><body>
+            <h1>خبر</h1>
+            <time datetime="يييييييييييي">الآن</time>
+            <p>text body long enough to normalise</p>
+        </body></html>"#;
+        let d = normalize_html("https://x.test/ar", page.as_bytes()).unwrap();
+        assert_eq!(d.published_at, None);
+        assert_eq!(d.modified_at, None);
+
+        // A multi-byte character ending exactly at byte 9 of the time part must not panic either.
+        // (It is not a valid time, so the clock fields default to 0 and the date part stands.)
+        let page = r#"<html><body>
+            <time datetime="2024-03-05T日日日Z">x</time>
+            <p>text body long enough to normalise</p>
+        </body></html>"#;
+        let d = normalize_html("https://x.test/ar2", page.as_bytes()).unwrap();
+        assert_eq!(d.published_at, Some(1_709_596_800)); // 2024-03-05T00:00:00Z
+
+        // And the ASCII shape still parses.
+        let page = r#"<html><body>
+            <time datetime="2024-03-05T10:00:00Z">x</time>
+            <p>text body long enough to normalise</p>
+        </body></html>"#;
+        let d = normalize_html("https://x.test/ok", page.as_bytes()).unwrap();
         assert_eq!(d.published_at, Some(1_709_632_800));
     }
 
