@@ -51,10 +51,11 @@
       "id": "pdf-ingest-wiring",
       "title": "Verify (or add) PDF routing into the parser and the index",
       "kind": "code",
-      "status": "todo",
+      "status": "blocked",
       "owner": "opencode",
       "detail": "8 PDFs in 221,000 pages. Read crates/router classification, crates/pdf and the pipeline ingest path; add the missing wiring if absent, and confirm a raw PDF is stored compressed like other blobs.",
-      "verify": "A hermetic test that an application/pdf response reaches the parser and is indexed, with the raw blob gzipped."
+      "verify": "A hermetic test that an application/pdf response reaches the parser and is indexed, with the raw blob gzipped.",
+      "reason": "tests failed on /root/.hermes/cache/scratch/wt-pdf-ingest-wiring: /bin/sh: 1: set: Illegal option -o pipefail\n"
     },
     {
       "id": "dedupe-cross-shard",
@@ -133,7 +134,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T08:13:26+0200: 79.9 docs/min, load1 3.43/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T08:32:49+0200: 83.9 docs/min, load1 4.46/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
@@ -157,7 +158,7 @@
       "kind": "code",
       "status": "todo",
       "title": "Raise CPU and RAM utilisation to the 80% target",
-      "detail": "MEASURED 2026-10-11T08:13:26+0200: CPU 23.5% and RAM 24.1% against an 80% target; crawl 79.9 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 24.03 s",
+      "detail": "MEASURED 2026-10-11T08:32:49+0200: CPU 13.1% and RAM 24.0% against an 80% target; crawl 83.9 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 22.88 s",
       "verify": "CPU and RAM both at or above 80% on a sustained window, with throughput up and no host hammered past its configured rate."
     }
   ]
