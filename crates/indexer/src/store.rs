@@ -352,6 +352,28 @@ impl Indexer {
         Ok(())
     }
 
+    /// Batched writer on the overlay: add every doc, then commit **once**.
+    ///
+    /// Same delete-then-add semantics as [`Indexer::index_overlay`], but a crawl
+    /// that indexes thousands of pages must not pay a fresh Tantivy segment (and
+    /// the O(index) manifest scan in [`Indexer::publish_manifest`]) per page —
+    /// measured at ~2 s per document, which capped a 4-shard fleet at ~110
+    /// docs/min while every core sat idle. One commit per batch removes that
+    /// ceiling without changing what is indexed or when it becomes visible
+    /// (visibility still comes from the manifest the caller publishes).
+    pub fn index_overlay_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let mut w = self.overlay_writer()?;
+        for doc in docs {
+            w.delete_term(Term::from_field_text(self.fields.doc_id, &doc.doc_id));
+            w.add_document(doc.to_tantivy(&self.schema)).ix()?;
+        }
+        w.commit().ix()?;
+        Ok(())
+    }
+
     /// Batched writer on the base index. One commit for the whole batch.
     pub fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
         let mut w = self.base_writer()?;
@@ -1035,6 +1057,48 @@ mod tests {
         // Searching the old-only term must not resurrect the shadowed version.
         let hits = idx.search("oldbodyterm", 10).unwrap();
         assert!(hits.is_empty(), "shadowed base version must not be returned");
+    }
+
+    #[test]
+    fn index_overlay_batch_commits_once_and_gates_until_publish() {
+        let (_t, idx) = tmp();
+        idx.index_batch(vec![doc("d1", "Base title", "base sharedterm body")])
+            .unwrap();
+        idx.publish_manifest().unwrap();
+
+        // Two docs in one batch, both claiming the generation the next publish
+        // will create (exactly what the crawl's flush does).
+        let generation = idx.visible_generation() + 1;
+        let mut shadow = doc("d1", "Overlay title", "overlay sharedterm zebra").with_version(2);
+        shadow.visible_generation = generation;
+        let mut fresh = doc("d2", "Fresh title", "fresh zebra body");
+        fresh.visible_generation = generation;
+        idx.index_overlay_batch(vec![shadow, fresh]).unwrap();
+
+        // Committed in one call, but gated until the manifest reaches the batch
+        // generation — no doc is exposed ahead of its publish.
+        assert!(
+            idx.search("zebra", 10).unwrap().is_empty(),
+            "batched docs must stay gated until the manifest is published"
+        );
+
+        idx.publish_manifest().unwrap();
+        let mut hits = idx.search("zebra", 10).unwrap();
+        hits.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+        assert_eq!(hits.len(), 2, "both batched docs visible after publish");
+        assert_eq!(hits[0].doc_id, "d1");
+        assert_eq!(hits[0].title, "Overlay title");
+        assert_eq!(hits[0].provenance, Provenance::Overlay);
+        // A term present in both copies resolves to the newer overlay version only.
+        let shared = idx.search("sharedterm", 10).unwrap();
+        assert_eq!(shared.len(), 1, "the overlay copy shadows the base copy");
+        assert_eq!(shared[0].version, 2);
+        assert_eq!(shared[0].provenance, Provenance::Overlay);
+
+        // An empty batch is a no-op, not a commit.
+        let gen_before = idx.visible_generation();
+        idx.index_overlay_batch(Vec::new()).unwrap();
+        assert_eq!(idx.visible_generation(), gen_before);
     }
 
     #[test]

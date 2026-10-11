@@ -442,6 +442,10 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         pipeline.set_browser(browser);
     }
     let pipeline = Arc::new(pipeline);
+    // Bulk crawl: buffer index docs and commit once per batch instead of once
+    // per page. A per-document Tantivy commit + manifest scan measured ~2 s, so
+    // the crawl was commit-bound and the box idle; the tail is flushed below.
+    pipeline.enable_overlay_batching();
 
     // The fetcher used ONLY for discovery bodies (robots/sitemaps/feeds). It is
     // the same `Fetcher` type the pipeline holds; the pipeline does not expose
@@ -600,6 +604,10 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     if !drain.bound_reached() {
         drain.run().await;
     }
+
+    // Commit + publish the final partial batch so the last documents are
+    // searchable and survive a resume (see `Pipeline::enable_overlay_batching`).
+    pipeline.flush_overlay_batch()?;
 
     // Clear the persisted frontier: everything has been logged.
     persist_frontier(&drain.frontier_path, std::iter::empty::<String>());

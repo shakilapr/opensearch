@@ -49,7 +49,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
@@ -108,6 +110,17 @@ pub const DEFAULT_REFRESH_BUDGET: u64 = 10_000;
 const DUE_PROB: f64 = 0.5;
 /// Cap on the candidate URLs offered to a single query-triggered refresh.
 const MAX_REFRESH_CANDIDATES: usize = 64;
+
+/// Overlay docs buffered before a crawl forces a commit + manifest publish.
+///
+/// A per-document Tantivy commit plus the O(index) manifest scan measured ~2 s
+/// per page, so the crawl was commit-bound (a 4-shard fleet sat at ~110 docs/min
+/// with every core idle). Committing once per batch amortises that cost while
+/// keeping the index no more than this many documents behind the crawl log.
+const OVERLAY_BATCH: usize = 128;
+/// Longest a buffered overlay doc may wait before a flush, so a slow trickle of
+/// documents is still published and a kill loses at most a few seconds of work.
+const OVERLAY_BATCH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The result of one [`Pipeline::crawl_one`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +264,17 @@ pub struct Pipeline {
     /// `SEARCH_TRACE_PATH` (or [`Pipeline::set_trace_jsonl`]) makes every
     /// `deep_search` append canonical trace events.
     pub(crate) trace: Option<Arc<PolicyTrace>>,
+    /// Crawl-only overlay batching. When set, `commit_document` buffers the
+    /// built [`IndexDoc`] and commits/publishes once per [`OVERLAY_BATCH`] docs
+    /// (or [`OVERLAY_BATCH_MAX_WAIT`]) instead of once per doc. Off by default,
+    /// so single-document callers (`crawl_one` in tests, `import_record`) keep
+    /// the immediate-visibility contract; only the bulk crawl driver turns it on
+    /// and flushes the tail at the end.
+    batch_overlay: AtomicBool,
+    /// Buffered overlay docs awaiting the next batch commit.
+    overlay_batch: Mutex<Vec<IndexDoc>>,
+    /// Wall-clock of the last batch commit, for the time-based flush bound.
+    overlay_batch_last: Mutex<Instant>,
 }
 
 /// Inputs to [`Pipeline::commit_document`]: the post-fetch half of
@@ -390,6 +414,9 @@ impl Pipeline {
             scheduler: ActivationScheduler::new(scheduler_cfg, BudgetLedger::new(budget_capacity)),
             dispatch_budget: BudgetLedger::new(budget_capacity),
             trace,
+            batch_overlay: AtomicBool::new(false),
+            overlay_batch: Mutex::new(Vec::new()),
+            overlay_batch_last: Mutex::new(Instant::now()),
         })
     }
 
@@ -496,6 +523,75 @@ impl Pipeline {
     ) -> AppResult<T> {
         let w = self.meta.lock().unwrap();
         f(w.conn())
+    }
+
+    /// Turn on crawl overlay batching (see [`Pipeline::flush_overlay_batch`]).
+    /// Only the bulk crawl driver calls this; every other caller keeps
+    /// per-document commit-and-publish visibility.
+    pub fn enable_overlay_batching(&self) {
+        self.batch_overlay.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Buffer one built index document, committing the batch when it is full or
+    /// the wait bound has elapsed.
+    fn buffer_overlay(&self, doc: IndexDoc) -> AppResult<()> {
+        let flush = {
+            let mut buf = self.overlay_batch.lock().unwrap();
+            buf.push(doc);
+            let last = *self.overlay_batch_last.lock().unwrap();
+            buf.len() >= OVERLAY_BATCH || last.elapsed() >= OVERLAY_BATCH_MAX_WAIT
+        };
+        if flush {
+            self.flush_overlay_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Commit + publish every buffered overlay doc in one Tantivy commit and one
+    /// manifest, then advance the metadata watermark to match. Idempotent and
+    /// cheap when nothing is buffered. Callers that enabled batching must call
+    /// this once before exiting or the final partial batch stays uncommitted.
+    pub fn flush_overlay_batch(&self) -> AppResult<()> {
+        let docs = {
+            let mut buf = self.overlay_batch.lock().unwrap();
+            if buf.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *buf)
+        };
+        // Every doc in the batch shares the generation this publish creates, so
+        // the watermark gates exactly this batch and no earlier doc is exposed
+        // ahead of its own publish.
+        let generation = self.indexer.visible_generation() + 1;
+        let docs: Vec<IndexDoc> = docs
+            .into_iter()
+            .map(|mut d| {
+                d.visible_generation = generation;
+                d
+            })
+            .collect();
+        self.indexer.index_overlay_batch(docs)?;
+        let manifest = self.indexer.publish_manifest()?;
+        tracing::info!(
+            target: "agent0::index",
+            generation = manifest.generation,
+            doc_count = manifest.doc_count,
+            "published batched index manifest"
+        );
+        let now = search_core::time::now_unix_s();
+        {
+            let mut w = self.meta.lock().unwrap();
+            Watermark::publish(&w, manifest.generation)?;
+            w.apply_batch(&[Mutation::UpsertManifest {
+                manifest_id: manifest.manifest_id.clone(),
+                generation: manifest.generation as i64,
+                doc_count: manifest.doc_count as i64,
+                base_segments: manifest.base_segments as i64,
+                created_at: now,
+            }])?;
+        }
+        *self.overlay_batch_last.lock().unwrap() = Instant::now();
+        Ok(())
     }
 
     /// Run a `/search` query against the live index, through the source-first
@@ -1235,7 +1331,15 @@ impl Pipeline {
             generation,
             c.now,
         );
-        self.indexer.index_overlay(index_doc)?;
+        // Batched mode buffers the doc; `flush_overlay_batch` assigns the final
+        // generation and publishes. Every other caller indexes and publishes
+        // this one document immediately, exactly as before.
+        let batched = self.batch_overlay.load(AtomicOrdering::Relaxed);
+        if batched {
+            self.buffer_overlay(index_doc)?;
+        } else {
+            self.indexer.index_overlay(index_doc)?;
+        }
         tracing::debug!(
             target: "agent0::index",
             doc_id = c.resource_id.as_str(),
@@ -1248,15 +1352,16 @@ impl Pipeline {
         // GRAPH_INDEXED — recorded no-op: no graph projection wired yet.
         self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::GraphIndexed)?;
 
-        // Publish manifest + watermark, then VISIBLE.
-        let manifest = self.indexer.publish_manifest()?;
-        tracing::info!(
-            target: "agent0::index",
-            generation = manifest.generation,
-            doc_count = manifest.doc_count,
-            "published index manifest"
-        );
-        {
+        // Publish manifest + watermark, then VISIBLE. In batched mode this is
+        // deferred to `flush_overlay_batch` (one publish per batch).
+        if !batched {
+            let manifest = self.indexer.publish_manifest()?;
+            tracing::info!(
+                target: "agent0::index",
+                generation = manifest.generation,
+                doc_count = manifest.doc_count,
+                "published index manifest"
+            );
             let mut w = self.meta.lock().unwrap();
             Watermark::publish(&w, manifest.generation)?;
             w.apply_batch(&[Mutation::UpsertManifest {
@@ -1285,7 +1390,7 @@ impl Pipeline {
             docver_id: docver_id.into_string(),
             version_no,
             content_id: content_id.into_string(),
-            generation: manifest.generation,
+            generation: self.indexer.visible_generation(),
         })
     }
 
