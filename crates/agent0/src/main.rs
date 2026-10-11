@@ -5,6 +5,8 @@
 //! agent0 search <query> [limit]  query the live index
 //! agent0 serve                   start the axum /search API over the index
 //! agent0 refresh                 one Stage-3 background refresh tick
+//! agent0 seeds arxiv [...]       arXiv Atom feed -> a seed file
+//! agent0 seeds oai [...]         OAI-PMH ListRecords URLs -> a seed file
 //! agent0 export <dir> [...]      the live index -> a portable dataset pack
 //! agent0 import <dir> [limit]    a portable dataset pack -> the live index
 //! ```
@@ -189,9 +191,12 @@ async fn main() -> ExitCode {
         Some("refresh") => run_refresh().await,
         Some("export") => run_export(&args).await,
         Some("import") => run_import(&args).await,
+        Some("seeds") => search_agent0::seeds::run(&args).await,
         _ => usage(
             "agent0 <ingest <url> | search <query> [limit] | refresh | serve \
              | crawl <seedsfile> [--max-docs N] [--concurrency C] [--out DIR] [--max-urls N] \
+             | seeds arxiv [--query Q] [--max N] [--out FILE] \
+             | seeds oai [--repo NAME=URL[#SET]]... [--from D] [--until D] [--out FILE] \
              | export <dir> [--limit N] [--raw] [--name NAME] | import <dir> [--limit N]>",
         ),
     }

@@ -53,6 +53,7 @@ search-engine = { path = "../engine" }
 search-answer = { path = "../answer" }
 # §6/§8 LLM query planning: `search-planner` implements search-engine's QueryPlanner.
 search-planner = { path = "../planner" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
