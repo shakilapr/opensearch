@@ -34,6 +34,7 @@ pub mod deep;
 pub mod pipeline;
 pub mod planner_cache;
 pub mod portable;
+pub mod seeds;
 
 pub use deep::{
     run_deep_search, DeepHit, DeepResult, DeepSearchReport, DocText, NoopEmitter, Phase,
