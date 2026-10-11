@@ -762,23 +762,27 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
             f"sed -n 's#^crates/\\([^/]*\\)/.*#\\1#p' | sort -u"
         )
         crates = [c.strip() for c in out3.splitlines() if c.strip()]
-    pkgs = []
+    # Address each crate by MANIFEST PATH. Guessing package names produced a literal
+    # `-p Syntax` and cargo refused to parse, which the pipeline below then reported as success.
+    args = []
     for c in crates:
-        rc_n, out_n = sh(f"grep -m1 '^name' {wt}/crates/{c}/Cargo.toml | cut -d\" -f2")
-        pkgs.append(f"-p {out_n.strip()}" if out_n.strip() else f"-p search-{c}")
-    if not pkgs:
-        # A docs-only change: there is nothing to test, and an empty -p list would silently run
-        # the whole workspace (slow enough to look like a test failure).
+        man = wt / "crates" / c / "Cargo.toml"
+        args.append(f"--manifest-path {man}" if man.exists() else f"-p search-{c}")
+    if not args:
         summary = "no crate touched: no tests to run"
-        rc4, out4 = 0, summary
+        rc4, out4 = 0, "test result: nothing to run"
     else:
+        # `set -o pipefail` is load-bearing: without it the pipeline returns TAIL's status (0), so
+        # a cargo invocation that never ran its tests was recorded as a pass and the item as DONE.
         rc4, out4 = sh(
-            f"cd {wt} && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 {CARGO} test "
-            f"{' '.join(pkgs)} 2>&1 | tail -40",
+            f"cd {wt} && set -o pipefail && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 "
+            f"{CARGO} test {' '.join(args)} 2>&1 | tail -40",
             timeout=1600,
         )
         summary = "; ".join(l.strip() for l in out4.splitlines() if "test result:" in l) or out4[-200:]
-    if pkgs and ("test result: FAILED" in out4 or rc4 != 0):
+    # A run that emitted no test summary did not verify anything, whatever its exit code said.
+    ran_something = "test result:" in out4
+    if args and (rc4 != 0 or "test result: FAILED" in out4 or not ran_something):
         item["status"] = "blocked"
         item["reason"] = f"tests failed on {wt}: {summary[:400]}"
         save_plan(plan)
