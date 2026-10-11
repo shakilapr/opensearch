@@ -80,6 +80,56 @@
       "owner": "human",
       "detail": "Read-back is lossy: all_docs rebuilds documents through a converter that hardcodes those fields, so they are searchable but not recoverable via export --raw. Options: a schema version bump with a re-index (correct, expensive), or a sidecar (cheap, one more artifact to keep consistent).",
       "verify": "A recorded decision with its cost, not an implicit drift."
+    },
+    {
+      "id": "research-index-algorithms",
+      "kind": "research",
+      "status": "todo",
+      "model": "apizio/t/sonar",
+      "title": "Research the state of the art for fast sparse retrieval, early termination and candidate pruning",
+      "detail": "Question: for a LOCAL index of 19k-231k documents sitting on one box, what are the current (2024-2026) best techniques to make a top-k lexical or learned-sparse query fast: early termination (WAND/BlockMax-WAND and successors), block-max and superblock pruning, candidate-limit sizing, segment layouts and query parallelism, and doc-side weighting (learned sparse) instead of query-side expansion. For each: how it works in one paragraph, what it costs, what it buys, and whether it applies to a Tantivy-backed engine. Cite every claim with a link to the paper or repo.",
+      "output": "references/research/index-algorithms.md",
+      "verify": "references/research/index-algorithms.md exists, is at least 1500 characters, cites sources with links, and ends with a ranked list of techniques applicable to our engine."
+    },
+    {
+      "id": "research-search-engine-choice",
+      "kind": "research",
+      "status": "todo",
+      "model": "apizio/t/sonar",
+      "title": "Research why people choose particular search engines, and what that means for ours",
+      "detail": "Question: why do people choose and stay with particular search engines (Google, Bing, Brave, DuckDuckGo, Kagi, Perplexity, Marginalia, and agent-native tools), and what makes them switch? Separate the factors: result quality, latency, privacy/trust, transparency and control, familiarity, price and lock-in, and the ability to verify or cite. For each factor, evidence and sources. Then the actionable half: which of these can a LOCAL, agent-native engine with real crawled data and honest empty states actually win on, and what concrete features would it take? Cite sources with links.",
+      "output": "references/research/search-engine-choice.md",
+      "verify": "references/research/search-engine-choice.md exists, is at least 1500 characters, cites sources, and ends with concrete, buildable recommendations."
+    },
+    {
+      "id": "references-repos",
+      "kind": "auto",
+      "status": "in_progress",
+      "title": "Clone the reference repositories for analysis",
+      "detail": "Clone depth-1 each repo listed in ops/references.json into references/repos/<name> (gitignored, never served). Skip what already exists, at most two per cycle so a cycle stays short, and record a per-repo failure honestly rather than retrying forever.",
+      "verify": "references/repos/<name> exists for every entry of ops/references.json, or the failure is recorded per repo.",
+      "evidence": "cloned 4/6"
+    },
+    {
+      "id": "index-model-improvement",
+      "kind": "code",
+      "status": "blocked",
+      "deps": [
+        "research-index-algorithms",
+        "references-repos"
+      ],
+      "title": "Improve the index model using the research and the reference implementations",
+      "detail": "Read references/research/*.md and the cloned repos under references/repos/, then pick exactly ONE concrete, measurable improvement to our index model (candidates: document-side weights from the pack's entities/topics and summary rather than binary presence; candidate-limit sizing or pruning derived from the scan-cost attribution; a simpler first-pass query with expansions moved to rerank). Implement it, and measure before/after with the eval harness.",
+      "verify": "before/after p50 and nDCG@10 from the same 600-case set, with nDCG unchanged or better; tests pass."
+    },
+    {
+      "id": "crawl-throughput",
+      "kind": "auto",
+      "status": "in_progress",
+      "title": "Watch crawl throughput against the resources actually available, and act",
+      "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
+      "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
+      "evidence": "2026-10-11T06:08:29+0200: 124.6 docs/min, load1 6.42/16 cores, 13 crawler process(es), 0 shard(s) stopped"
     }
   ]
 }
