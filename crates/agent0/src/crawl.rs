@@ -117,13 +117,18 @@ const DEFAULT_MAX_DOCS: usize = 10_000;
 ///
 /// The crawl is network-I/O bound: at concurrency 8 a 16-core box sat at ~30%
 /// CPU and ~66 docs/min, while the implied fetch latency (concurrency /
-/// throughput ≈ 29 s) showed the fetches were simply not overlapped. 128 slots
-/// per process keeps the core's parse/index work busy without touching the
-/// per-origin politeness floor (one request in flight per origin, plus the
-/// configured interval), so no host is ever hammered. It is the *global* fetch
-/// bound, not a per-host one: with the discovery window feeding many distinct
-/// origins, more slots mean more origins resolving, parsing and indexing at once.
-const DEFAULT_CONCURRENCY: usize = 128;
+/// throughput ≈ 29 s) showed the fetches were simply not overlapped. With three
+/// processes at the old 128 slots, a 16-core box still sat at ~14% CPU and
+/// ~14.6% RAM against an 80% target: the aggregate in-flight bound (3 × 128)
+/// was still far below what the box needs to keep every core parsing, deduping
+/// and indexing — the mean fetch latency of ~27 s only fell when the global
+/// bound rose enough to overlap that whole round-trip. 512 slots per process
+/// keeps the core's parse/index work busy without touching the per-origin
+/// politeness floor (one request in flight per origin, plus the configured
+/// interval), so no host is ever hammered. It is the *global* fetch bound, not
+/// a per-host one: with the discovery window feeding many distinct origins,
+/// more slots mean more origins resolving, parsing and indexing at once.
+const DEFAULT_CONCURRENCY: usize = 512;
 /// Default per-origin minimum interval between requests (milliseconds).
 const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 
@@ -135,11 +140,16 @@ const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 /// It is deliberately decoupled from the drain's own `--concurrency` bound: the
 /// drain still respects `--concurrency` (one request in flight per origin, plus
 /// the configured interval), while discovery runs wider. Each discovery task
-/// holds at most one socket, so the window is sized to stay inside the usual
-/// 1024 fd budget alongside the drain's in-flight fetches (4× concurrency =
-/// 512 at the default, +128 drain slots ≈ 640). Override the absolute window
-/// with `SEARCH_CRAWL_DISCOVERY_WINDOW`.
+/// holds at most one socket, so the window is capped at
+/// [`MAX_DISCOVERY_WINDOW`] to stay inside the usual 1024 fd budget alongside
+/// the drain's in-flight fetches. Override the absolute window with
+/// `SEARCH_CRAWL_DISCOVERY_WINDOW`.
 const DISCOVERY_WINDOW_FACTOR: usize = 4;
+
+/// Hard ceiling on the discovery window so a large drain concurrency cannot
+/// exhaust the process's file-descriptor budget (discovery tasks each hold one
+/// socket alongside the drain's in-flight fetches).
+const MAX_DISCOVERY_WINDOW: usize = 1024;
 
 /// Base delay applied to an origin after its first HTTP 429. Consecutive 429s
 /// from the same origin double this (`1s`, `2s`, `4s`, ...) up to
@@ -398,7 +408,12 @@ fn resolve_concurrency(flag: Option<usize>, env: Option<String>) -> usize {
 fn discovery_window(concurrency: usize, env: Option<String>) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| concurrency.max(1).saturating_mul(DISCOVERY_WINDOW_FACTOR))
+        .unwrap_or_else(|| {
+            concurrency
+                .max(1)
+                .saturating_mul(DISCOVERY_WINDOW_FACTOR)
+                .min(MAX_DISCOVERY_WINDOW)
+        })
         .max(1)
 }
 
@@ -1982,6 +1997,9 @@ mod tests {
         // A zero/invalid/non-positive override falls back to the widened default.
         assert_eq!(discovery_window(8, Some("0".into())), 8 * DISCOVERY_WINDOW_FACTOR);
         assert_eq!(discovery_window(8, Some("nope".into())), 8 * DISCOVERY_WINDOW_FACTOR);
+        // The window is capped so a large drain bound cannot exhaust the fd
+        // budget with one socket per discovery task.
+        assert_eq!(discovery_window(4096, None), MAX_DISCOVERY_WINDOW);
     }
 
     /// The log must be appended in place (O(1)) and a torn final write must not

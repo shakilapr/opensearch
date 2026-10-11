@@ -12,14 +12,19 @@
 #
 # Usage:
 #   scripts/scale-crawl.sh [shards] [max_docs_per_shard] [concurrency] [seeds_file]
-# Defaults: 8 shards, 200000 docs each, concurrency 64, seeds built from Tranco top-1M.
+# Defaults: 8 shards, 200000 docs each, concurrency 512, seeds built from Tranco top-1M.
 set -uo pipefail
 
 SHARDS="${1:-8}"
 MAX_DOCS="${2:-200000}"
-# Cross-origin in-flight fetches per shard: 64 by default (or SEARCH_CRAWL_CONCURRENCY)
-# so a 16-core box's network + parse work is actually overlapped.
-CONCURRENCY="${3:-${SEARCH_CRAWL_CONCURRENCY:-64}}"
+# Cross-origin in-flight fetches per shard: 512 by default (or SEARCH_CRAWL_CONCURRENCY)
+# so a 16-core box's network + parse work is actually overlapped. At the old 64 the
+# fleet sat at ~14% CPU / ~14.6% RAM against an 80% target with ~27 s mean fetch
+# latency: the aggregate global fetch bound was the binding constraint, not the
+# per-origin politeness floor (which is unchanged — one request in flight per host
+# plus ORIGIN_INTERVAL_MS). More slots mean more distinct origins resolving, parsing
+# and indexing at once, which is what raises CPU/RAM without hammering any host.
+CONCURRENCY="${3:-${SEARCH_CRAWL_CONCURRENCY:-512}}"
 SEEDS="${4:-}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

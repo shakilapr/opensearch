@@ -17,7 +17,7 @@ OUT="${OUT:-raw-dataset}"
 DATA_DIR="${SEARCH_DATA_DIR:-/var/lib/search}"
 MAX_DOCS="${MAX_DOCS:-10000}"
 MAX_URLS="${MAX_URLS:-200000}"
-CONCURRENCY="${CONCURRENCY:-64}"
+CONCURRENCY="${CONCURRENCY:-512}"
 ORIGIN_INTERVAL_MS="${ORIGIN_INTERVAL_MS:-750}"
 # Per-origin attempt cap: a small value spreads the document budget across many
 # sources (the Stage-1 goal), the derived default is depth-first.
