@@ -41,10 +41,11 @@
       "id": "arxiv-fetch-and-cli",
       "title": "Fetch an arXiv feed and expose the paper seed generator as a CLI subcommand",
       "kind": "code",
-      "status": "todo",
+      "status": "blocked",
       "owner": "opencode",
       "detail": "The pure parser landed (46ac38e). Still missing: the thin HTTP wrapper that fetches http://export.arxiv.org/api/query, a `agent0 seeds papers` subcommand emitting the URLs to a seeds file, and OAI-PMH ListRecords URLs for a configurable repository set. Follow the existing subcommand style in crates/agent0/src/main.rs.",
-      "verify": "cargo test -p search-sources -p search-agent0 passes; a hermetic test covers the wrapper with a stub transport (no network in tests)."
+      "verify": "cargo test -p search-sources -p search-agent0 passes; a hermetic test covers the wrapper with a stub transport (no network in tests).",
+      "reason": "tests failed on /root/.hermes/cache/scratch/wt-arxiv-fetch-and-cl: /bin/sh: 1: set: Illegal option -o pipefail\n"
     },
     {
       "id": "pdf-ingest-wiring",
