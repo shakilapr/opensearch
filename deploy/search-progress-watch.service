@@ -1,0 +1,22 @@
+[Unit]
+Description=Search project progress watcher (measure, improve the index model, drive the next task)
+Documentation=file:///root/projects/search/docs/PROGRESS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/search
+# cargo lives outside the system PATH (user-local toolchain); the watcher builds and tests.
+Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /root/projects/search/tools/progress_watch.py --interval 900
+Restart=always
+RestartSec=60
+# A cycle dispatches an opencode coding session (one deliverable, leashed) and runs cargo tests;
+# it must never be killed mid-verify, so give it room and let Restart=always bring it back.
+TimeoutStopSec=120
+StandardOutput=append:/var/log/search-progress-watch.log
+StandardError=append:/var/log/search-progress-watch.log
+
+[Install]
+WantedBy=multi-user.target
