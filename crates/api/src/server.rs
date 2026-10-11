@@ -175,6 +175,7 @@ impl ApiError {
             AppError::Deadline => StatusCode::GATEWAY_TIMEOUT,
             // "busy" — a resource bound means try again later.
             AppError::LimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {

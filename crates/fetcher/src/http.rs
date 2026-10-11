@@ -42,6 +42,10 @@ pub struct FetchOutcome {
     pub last_modified: Option<String>,
     pub body: Option<Vec<u8>>,
     pub content_type: Option<String>,
+    /// `Retry-After` in seconds when the server sent one (typically with `429`).
+    /// `None` when absent or in the HTTP-date form (the caller falls back to
+    /// exponential backoff).
+    pub retry_after: Option<u64>,
 }
 
 /// Outcome of a conditional fetch ([`Fetcher::fetch_conditional`]).
@@ -69,11 +73,14 @@ pub enum Fetched {
         validators: Validators,
     },
     /// Any other terminal status (e.g. `404`, `500`, or a redirect that ran out
-    /// of hops). No body is read or stored.
+    /// of hops). No body is read or stored. `retry_after` carries the parsed
+    /// `Retry-After` seconds when present (used by the crawler to back off a
+    /// rate-limited origin).
     Other {
         final_url: String,
         status: u16,
         content_type: Option<String>,
+        retry_after: Option<u64>,
     },
 }
 
@@ -298,6 +305,7 @@ impl Fetcher {
                     final_url,
                     status: status.as_u16(),
                     content_type,
+                    retry_after: retry_after_secs(&resp),
                 });
             }
 
@@ -345,6 +353,7 @@ impl Fetcher {
                 last_modified,
                 body: None,
                 content_type,
+                retry_after: None,
             });
         }
 
@@ -356,6 +365,7 @@ impl Fetcher {
                 last_modified,
                 body: None,
                 content_type,
+                retry_after: retry_after_secs(&resp),
             });
         }
 
@@ -378,6 +388,7 @@ impl Fetcher {
             last_modified,
             body: Some(body),
             content_type,
+            retry_after: None,
         })
     }
 }
@@ -419,6 +430,19 @@ fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) ->
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// Parse the `Retry-After` response header (RFC 9110 allows a delay in seconds
+/// or an HTTP-date). Only the integer-seconds form is honoured; the HTTP-date
+/// form — and anything unparseable — yields `None`, letting the caller fall back
+/// to its own exponential backoff. Exposed so the crawler can honour the same
+/// header on its loopback test path.
+pub fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 fn net_err(e: reqwest::Error) -> AppError {

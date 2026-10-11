@@ -106,6 +106,14 @@ const DEFAULT_CONCURRENCY: usize = 8;
 /// Default per-origin minimum interval between requests (milliseconds).
 const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 
+/// Base delay applied to an origin after its first HTTP 429. Consecutive 429s
+/// from the same origin double this (`1s`, `2s`, `4s`, ...) up to
+/// [`MAX_RATE_LIMIT_BACKOFF_MS`]. A server-supplied `Retry-After` overrides the
+/// exponential value entirely.
+const BASE_RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
+/// Ceiling for the exponential per-origin rate-limit backoff.
+const MAX_RATE_LIMIT_BACKOFF_MS: u64 = 300_000;
+
 /// Discovery fan-out bounds (mirror the pipeline's own limits).
 const MAX_SITEMAPS: usize = 8;
 const MAX_CHILD_SITEMAPS: usize = 16;
@@ -239,6 +247,10 @@ pub struct CrawlSummary {
     pub failed: usize,
     /// Documents marked DELETED this run because their URL now answers 404/410 (§44).
     pub deleted: usize,
+    /// Attempts that ended in HTTP 429; the origin was backed off afterwards.
+    pub rate_limited: usize,
+    /// Attempts that failed DNS resolution; counted and skipped, never retried.
+    pub dns_failures: usize,
     pub urls_attempted: usize,
     pub blobs: usize,
     pub bytes: u64,
@@ -434,6 +446,10 @@ struct Counters {
     failed: usize,
     /// §44: documents tombstoned because their URL answered 404/410 after being indexed.
     deleted: usize,
+    /// HTTP 429 responses seen (each one triggers a per-origin backoff).
+    rate_limited: usize,
+    /// DNS resolution failures (permanent for this run; skipped, not retried).
+    dns_failures: usize,
     blobs: usize,
     bytes: u64,
 }
@@ -450,6 +466,12 @@ struct PerUrl {
     content_type: Option<String>,
     /// Raw fetched bytes for the spill (present for ingested/unchanged).
     raw: Option<Vec<u8>>,
+    /// The origin answered HTTP 429: back it off before dispatching to it again.
+    rate_limited: bool,
+    /// `Retry-After` seconds from the 429, when the server supplied one.
+    retry_after: Option<u64>,
+    /// The failure was a DNS resolution error (counted, not retried).
+    dns_failure: bool,
 }
 
 /// Owns the work queue, the per-origin politeness state and the counters.
@@ -472,6 +494,13 @@ struct Drainer {
     /// Attempts charged per origin; a host at `origin_cap()` is retired so no
     /// single sitemap can consume the whole budget (see `dispatch`).
     origin_attempts: HashMap<String, usize>,
+    /// Per-origin wall-clock before which no request may be dispatched, set
+    /// after an HTTP 429. This only ever *adds* delay on top of
+    /// `opts.origin_interval`; it never shortens the configured floor.
+    backoff_until: HashMap<String, Instant>,
+    /// Consecutive 429s per origin, driving the exponential backoff. Cleared by
+    /// any healthy (`ingested`/`unchanged`) response from that origin.
+    backoff_level: HashMap<String, u32>,
     attempts: usize,
     ingested: usize,
     /// Every URL enqueued-but-not-yet-logged (queued + in-flight); persisted to
@@ -506,6 +535,8 @@ impl Drainer {
             rr: 0,
             in_flight: 0,
             origin_attempts: HashMap::new(),
+            backoff_until: HashMap::new(),
+            backoff_level: HashMap::new(),
             attempts: 0,
             ingested: 0,
             remaining: BTreeSet::new(),
@@ -580,6 +611,20 @@ impl Drainer {
         self.queues.values().all(|q| q.is_empty())
     }
 
+    /// Time until the earliest backed-off origin becomes dispatchable again.
+    /// Zero when nothing is in rate-limit backoff.
+    fn next_ready_delay(&self) -> Duration {
+        let now = Instant::now();
+        let mut soonest: Option<Duration> = None;
+        for until in self.backoff_until.values() {
+            if *until > now {
+                let d = *until - now;
+                soonest = Some(soonest.map_or(d, |s| s.min(d)));
+            }
+        }
+        soonest.unwrap_or(Duration::ZERO)
+    }
+
     fn persist(&self) {
         persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
     }
@@ -591,6 +636,8 @@ impl Drainer {
             denied: self.counters.denied,
             failed: self.counters.failed,
             deleted: self.counters.deleted,
+            rate_limited: self.counters.rate_limited,
+            dns_failures: self.counters.dns_failures,
             urls_attempted: self.attempts,
             blobs: self.counters.blobs,
             bytes: self.counters.bytes,
@@ -609,8 +656,17 @@ impl Drainer {
                 }
                 let n = self.dispatch(&mut joinset);
                 if n == 0 {
-                    // Nothing dispatchable right now (interval not elapsed).
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    // Nothing dispatchable right now: the per-origin interval has
+                    // not elapsed, or every eligible origin is in 429 backoff.
+                    // Sleep until the earliest backoff lifts (bounded) rather
+                    // than spinning.
+                    let d = self.next_ready_delay();
+                    let nap = if d.is_zero() {
+                        Duration::from_millis(5)
+                    } else {
+                        d.min(Duration::from_millis(250))
+                    };
+                    tokio::time::sleep(nap).await;
                 } else {
                     self.persist();
                 }
@@ -684,6 +740,14 @@ impl Drainer {
                         continue;
                     }
                 }
+                // Rate-limit backoff: an origin that answered 429 is skipped
+                // until its delay elapses. The slot then goes to whichever other
+                // origin the round-robin reaches — that is the point.
+                if let Some(until) = self.backoff_until.get(o) {
+                    if now < *until {
+                        continue;
+                    }
+                }
                 chosen = Some(o.clone());
                 self.rr = (self.rr + k + 1) % n;
                 break;
@@ -734,6 +798,39 @@ impl Drainer {
             "failed" => self.counters.failed += 1,
             "deleted" => self.counters.deleted += 1,
             _ => {}
+        }
+
+        // Per-origin rate-limit backoff. An origin that answered 429 must not be
+        // asked again until its delay elapses; because dispatch round-robins,
+        // the freed slot moves to another origin instead of hammering this one.
+        // A healthy response clears the origin's backoff entirely. This never
+        // shortens `opts.origin_interval`, so the configured politeness floor is
+        // preserved (backoff only adds delay).
+        if per.rate_limited {
+            let level = self.backoff_level.entry(per.origin.clone()).or_insert(0);
+            *level = level.saturating_add(1);
+            let delay = rate_limit_backoff(per.retry_after, *level);
+            self.backoff_until
+                .insert(per.origin.clone(), Instant::now() + delay);
+            self.counters.rate_limited += 1;
+            tracing::warn!(
+                target: "agent0::crawl",
+                origin = %per.origin,
+                delay_ms = delay.as_millis() as u64,
+                level = *level,
+                "HTTP 429: backing off this origin"
+            );
+        } else if per.outcome == "ingested" || per.outcome == "unchanged" {
+            self.backoff_level.remove(&per.origin);
+            self.backoff_until.remove(&per.origin);
+        }
+        if per.dns_failure {
+            self.counters.dns_failures += 1;
+            tracing::debug!(
+                target: "agent0::crawl",
+                url = %per.url,
+                "DNS resolution failed; counted and skipped"
+            );
         }
 
         // Raw spill: dedupe by sha256. With `--compress` the blob is gzipped: raw pages average
@@ -811,6 +908,9 @@ async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: Stri
                 bytes: 0,
                 content_type: None,
                 raw: None,
+                rate_limited: false,
+                retry_after: None,
+                dns_failure: false,
             };
 
             if let Some(cid) = content_id {
@@ -837,6 +937,17 @@ async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: Stri
                     eprintln!("deletion detection: could not mark {url} deleted: {err}");
                     false
                 });
+            // A 429 is not a failure of the resource; it is the origin asking us
+            // to slow down. Capture its `Retry-After` so the scheduler can honour
+            // it, and count DNS failures (permanent for this run) rather than
+            // letting them churn.
+            let (rate_limited, retry_after) = match &e {
+                search_core::error::AppError::RateLimited {
+                    retry_after_secs, ..
+                } => (true, *retry_after_secs),
+                _ => (false, None),
+            };
+            let dns_failure = !rate_limited && is_dns_failure(&e.to_string());
             PerUrl {
                 url: url.clone(),
                 origin,
@@ -847,6 +958,9 @@ async fn attempt(pipeline: Arc<Pipeline>, cfg: Config, url: String, origin: Stri
                 bytes: 0,
                 content_type: None,
                 raw: None,
+                rate_limited,
+                retry_after,
+                dns_failure,
             }
         }
     }
@@ -1329,6 +1443,36 @@ fn origin_of(raw: &str) -> String {
     }
 }
 
+/// Delay before the next request to an origin that just answered HTTP 429.
+///
+/// A server-supplied `Retry-After` (seconds) wins outright, capped at
+/// [`MAX_RATE_LIMIT_BACKOFF_MS`]. Otherwise the delay doubles per consecutive
+/// 429: `level` is 1 for the first 429 (`base`), 2 for the second (`2·base`),
+/// and so on, capped at the ceiling. It always adds delay on top of
+/// `opts.origin_interval` — it can only slow a host down, never speed it up —
+/// except when a server explicitly asks for `Retry-After: 0`.
+fn rate_limit_backoff(retry_after: Option<u64>, level: u32) -> Duration {
+    if let Some(secs) = retry_after {
+        return Duration::from_secs(secs).min(Duration::from_millis(MAX_RATE_LIMIT_BACKOFF_MS));
+    }
+    let shift = level.saturating_sub(1).min(16);
+    let ms = BASE_RATE_LIMIT_BACKOFF_MS.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(MAX_RATE_LIMIT_BACKOFF_MS))
+}
+
+/// Whether an error message is a DNS resolution failure. Such a failure is
+/// permanent for the lifetime of a run, so the URL is counted and skipped
+/// instead of being retried; the scheduler never re-queues it in this run.
+fn is_dns_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("dns error")
+        || m.contains("failed to lookup address")
+        || m.contains("name or service not known")
+        || m.contains("nodename nor servname")
+        || m.contains("no such host")
+        || m.contains("temporary failure in name resolution")
+}
+
 fn resolve_against(origin: &str, url: &str) -> String {
     if url.starts_with("http://") || url.starts_with("https://") {
         return url.to_string();
@@ -1539,5 +1683,45 @@ mod tests {
         );
         // Unparseable input has no site key.
         assert!(site_key("not a url").is_none());
+    }
+
+    #[test]
+    fn rate_limit_backoff_honours_retry_after_and_caps() {
+        // `Retry-After` wins outright over the exponential value.
+        assert_eq!(rate_limit_backoff(Some(3), 1), Duration::from_secs(3));
+        // ... but is capped at the ceiling.
+        assert_eq!(
+            rate_limit_backoff(Some(u64::MAX), 1),
+            Duration::from_millis(MAX_RATE_LIMIT_BACKOFF_MS)
+        );
+        // Without a header the delay doubles per consecutive 429: 1s, 2s, 4s.
+        assert_eq!(
+            rate_limit_backoff(None, 1),
+            Duration::from_millis(BASE_RATE_LIMIT_BACKOFF_MS)
+        );
+        assert_eq!(
+            rate_limit_backoff(None, 2),
+            Duration::from_millis(2 * BASE_RATE_LIMIT_BACKOFF_MS)
+        );
+        assert_eq!(
+            rate_limit_backoff(None, 3),
+            Duration::from_millis(4 * BASE_RATE_LIMIT_BACKOFF_MS)
+        );
+        // ... and is capped.
+        assert_eq!(
+            rate_limit_backoff(None, 99),
+            Duration::from_millis(MAX_RATE_LIMIT_BACKOFF_MS)
+        );
+    }
+
+    #[test]
+    fn dns_failure_detection() {
+        assert!(is_dns_failure(
+            "network error: error trying to connect: dns error: failed to lookup address information"
+        ));
+        assert!(is_dns_failure("dns error"));
+        assert!(is_dns_failure("Name or service not known"));
+        assert!(!is_dns_failure("network error: connection refused"));
+        assert!(!is_dns_failure("rate limited (HTTP 429) for https://x/"));
     }
 }

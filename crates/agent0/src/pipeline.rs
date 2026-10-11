@@ -965,7 +965,7 @@ impl Pipeline {
             if let Some(l) = &lease {
                 let _ = self.frontier.fail(l, now, false);
             }
-            return Err(classify_status(outcome.status, &canonical));
+            return Err(classify_status(outcome.status, &canonical, outcome.retry_after));
         }
 
         let body = outcome.body.clone().unwrap_or_default();
@@ -1355,6 +1355,7 @@ impl Pipeline {
             last_modified: None,
             body: Some(body.to_vec()),
             content_type: Some("text/plain; charset=utf-8".to_string()),
+            retry_after: None,
         };
         let now = search_core::time::now_unix_s();
         self.commit_document(CommitDoc {
@@ -1438,6 +1439,7 @@ impl Pipeline {
                 last_modified: validators.last_modified,
                 body: None,
                 content_type: None,
+                retry_after: None,
             },
             Fetched::Modified {
                 final_url,
@@ -1452,11 +1454,13 @@ impl Pipeline {
                 last_modified: validators.last_modified,
                 body: Some(body),
                 content_type,
+                retry_after: None,
             },
             Fetched::Other {
                 final_url,
                 status,
                 content_type,
+                retry_after,
             } => FetchOutcome {
                 final_url,
                 status,
@@ -1464,6 +1468,7 @@ impl Pipeline {
                 last_modified: None,
                 body: None,
                 content_type,
+                retry_after,
             },
         })
     }
@@ -1492,6 +1497,7 @@ impl Pipeline {
         let etag = header_string(&resp, reqwest::header::ETAG);
         let last_modified = header_string(&resp, reqwest::header::LAST_MODIFIED);
         let content_type = header_string(&resp, reqwest::header::CONTENT_TYPE);
+        let retry_after = search_fetcher::http::retry_after_secs(&resp);
         let code = status.as_u16();
         if code == 304 || !status.is_success() {
             return Ok(FetchOutcome {
@@ -1501,6 +1507,7 @@ impl Pipeline {
                 last_modified,
                 body: None,
                 content_type,
+                retry_after,
             });
         }
         let body = search_fetcher::read_body_capped(resp, &self.cfg.limits).await?;
@@ -1511,6 +1518,7 @@ impl Pipeline {
             last_modified,
             body: Some(body),
             content_type,
+            retry_after: None,
         })
     }
 
@@ -2145,10 +2153,13 @@ fn list_from(value: Option<&String>) -> Vec<String> {
 }
 
 /// Map an HTTP status onto the shared error taxonomy (no panics).
-fn classify_status(status: u16, url: &str) -> AppError {
+fn classify_status(status: u16, url: &str, retry_after: Option<u64>) -> AppError {
     match status {
         404 | 410 => AppError::NotFound(format!("HTTP {status} for {url}")),
-        429 => AppError::LimitExceeded(format!("HTTP 429 (rate limited) for {url}")),
+        429 => AppError::RateLimited {
+            url: url.to_string(),
+            retry_after_secs: retry_after,
+        },
         400..=499 => AppError::Network(format!("HTTP {status} (client error) for {url}")),
         _ => AppError::Network(format!("HTTP {status} (server error) for {url}")),
     }

@@ -190,10 +190,66 @@ async fn spawn_recording_fixture(
     (format!("http://{addr}"), fx)
 }
 
+/// A fixture whose `/seed` links to two same-origin documents that both answer
+/// `429 Too Many Requests` with `Retry-After: 1`. Used to prove the crawler
+/// backs off a rate-limited origin instead of retrying it immediately.
+async fn spawn_429_fixture(seed_html: &'static str) -> (String, Fx) {
+    let fx = Fx::default();
+
+    let robots_fx = fx.clone();
+    let mut router = Router::new().route(
+        "/robots.txt",
+        get(move || {
+            let fx = robots_fx.clone();
+            async move {
+                fx.record("/robots.txt");
+                ([(header::CONTENT_TYPE, "text/plain")], ROBOTS_OPEN).into_response()
+            }
+        }),
+    );
+
+    let seed_fx = fx.clone();
+    router = router.route(
+        "/seed",
+        get(move || {
+            let fx = seed_fx.clone();
+            async move {
+                fx.record("/seed");
+                ([(header::CONTENT_TYPE, "text/html")], seed_html).into_response()
+            }
+        }),
+    );
+
+    for path in ["/blog/one-two.html", "/blog/three-four.html"] {
+        let fxc = fx.clone();
+        router = router.route(
+            path,
+            get(move || {
+                let fx = fxc.clone();
+                let p = path;
+                async move {
+                    fx.record(p);
+                    let mut hm = HeaderMap::new();
+                    hm.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    (StatusCode::TOO_MANY_REQUESTS, hm, "").into_response()
+                }
+            }),
+        );
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{addr}"), fx)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
 fn test_config(data_dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.data_dir = data_dir.to_path_buf();
@@ -1181,3 +1237,39 @@ fn build_ascii_pdf(text: &str) -> String {
     ));
     out
 }
+
+/// An origin that answers HTTP 429 with `Retry-After` must not be asked again
+/// until the delay elapses. Both limited documents are fetched exactly once (no
+/// immediate retry), and the second same-origin request waits out the backoff.
+#[tokio::test]
+async fn http_429_backs_off_the_origin_before_the_next_request() {
+    const SEED_HTML: &str = "<!doctype html><html><body>\
+        <a href=\"/blog/one-two.html\">one</a>\
+        <a href=\"/blog/three-four.html\">two</a>\
+        </body></html>";
+    let (base, fx) = spawn_429_fixture(SEED_HTML).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base}/seed")]);
+
+    let summary = crawl(options(seeds, out.clone()), &cfg).await.unwrap();
+
+    // Both rate-limited documents were fetched exactly once: the crawler does
+    // not retry the same URL, it backs the origin off.
+    let first = fx.times("/blog/one-two.html");
+    let second = fx.times("/blog/three-four.html");
+    assert_eq!(first.len(), 1, "one-two fetched exactly once");
+    assert_eq!(second.len(), 1, "three-four fetched exactly once");
+
+    // Whichever order the two same-origin documents were queued in, the second
+    // request waited out `Retry-After: 1` on the origin the first one 429'd.
+    let gap = first[0].max(second[0]).duration_since(first[0].min(second[0]));
+    assert!(
+        gap >= Duration::from_millis(900),
+        "second same-origin request arrived {gap:?} after the 429; expected >= ~1s"
+    );
+
+    assert_eq!(summary.rate_limited, 2, "both 429s counted");
+}
+

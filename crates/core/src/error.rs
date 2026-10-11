@@ -37,6 +37,16 @@ pub enum AppError {
     #[error("resource limit exceeded: {0}")]
     LimitExceeded(String),
 
+    /// The origin answered HTTP 429 (Too Many Requests). Carries the parsed
+    /// `Retry-After` delay in seconds when the server supplied one. The crawl
+    /// scheduler backs off per origin instead of retrying, so this is **not**
+    /// frontier-retryable (a blind retry is what the backoff exists to avoid).
+    #[error("rate limited (HTTP 429) for {url}")]
+    RateLimited {
+        url: String,
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("lease fencing failed: {0}")]
     LeaseFenced(String),
 
