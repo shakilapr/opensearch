@@ -10,6 +10,7 @@
 //! the page a title describes", not human-judged relevance; and the run is single-box with whatever
 //! lanes are built on this host, which the output records.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use search_core::contract::SearchRequest;
@@ -76,6 +77,18 @@ impl Options {
     }
 }
 
+/// Nearest-rank percentile over `values` (sorts in place). Empty → 0. Mirrors
+/// `search_eval`'s latency percentile so the stage numbers use the same convention.
+fn percentile_micros(values: &mut [u64], p: f64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    let rank = (p / 100.0 * n as f64).ceil() as usize;
+    values[rank.saturating_sub(1).min(n - 1)]
+}
+
 pub async fn run(args: &[String]) -> std::process::ExitCode {
     let opts = Options::from_args(args);
     let cfg = search_core::config::Config::from_env();
@@ -125,6 +138,13 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
+    // Diagnostic per-stage timing for this run only. `timing::enable` is a no-op for the
+    // request path's determinism (see `search_engine::timing`); it just makes the engine
+    // record `Instant` deltas that we drain per case. Off, the engine reads no clock.
+    search_engine::timing::enable();
+    let mut stage_us: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
+    let mut stage_count: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
+
     let mut results: Vec<RunResult> = Vec::with_capacity(cases.len());
     let mut failures = 0usize;
     for case in &cases {
@@ -141,17 +161,29 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
             mode: search_api::engine::EngineMode::Auto,
         };
         let started = std::time::Instant::now();
-        match search_api::engine::run_engine_search(
-            searcher.as_ref(),
-            req,
-            now_ms,
-            None,
-            None,
-            &extra_lanes,
-        ) {
-            Ok(resp) => {
-                let ranked: Vec<String> =
-                    resp.results.iter().map(|r| r.base.doc_id.clone()).collect();
+        let _ = search_engine::timing::take();
+        let _ = search_engine::timing::take_counts();
+        let ranked: Result<Vec<String>, String> = if opts.engine {
+            search_api::engine::run_engine_search(
+                searcher.as_ref(),
+                req,
+                now_ms,
+                None,
+                None,
+                &extra_lanes,
+            )
+            .map(|resp| resp.results.iter().map(|r| r.base.doc_id.clone()).collect())
+            .map_err(|e| e.to_string())
+        } else {
+            // `--no-engine`: the frozen legacy lexical path, exactly as the server runs it
+            // when `engine: false` (api/src/server.rs), so the comparison is real rather
+            // than a second copy of the engine path.
+            search_api::query::execute(searcher.as_ref(), &req.base)
+                .map(|resp| resp.results.iter().map(|r| r.doc_id.clone()).collect())
+                .map_err(|e| e.to_string())
+        };
+        match ranked {
+            Ok(ranked) => {
                 results.push(RunResult {
                     case_id: case.id.clone(),
                     ranked,
@@ -165,7 +197,24 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
                 }
             }
         }
+        // Sum the stages a single case ran (retrieval/evidence fire once per round) and
+        // append one observation per stage, so percentiles are per-query totals.
+        let mut per_case: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for (stage, us) in search_engine::timing::take() {
+            *per_case.entry(stage).or_default() += us;
+        }
+        for (stage, us) in per_case {
+            stage_us.entry(stage).or_default().push(us);
+        }
+        let mut per_case_counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for (stage, n) in search_engine::timing::take_counts() {
+            *per_case_counts.entry(stage).or_default() += n;
+        }
+        for (stage, n) in per_case_counts {
+            stage_count.entry(stage).or_default().push(n);
+        }
     }
+    search_engine::timing::disable();
 
     // Cases that failed to run are scored as empty rankings rather than dropped: dropping them
     // would silently raise the average by removing the queries the engine could not serve.
@@ -184,6 +233,24 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     println!("  latency p95  : {} ms", metrics.p95_ms);
     println!("  lane errors  : {failures}");
     println!("  config       : lanes={} engine={}", opts.lanes, opts.engine);
+    // Per-stage breakdown over the cases actually run. Values are per-query totals (a stage
+    // that ran in several rounds is summed), reported at p50/p95 in milliseconds.
+    if !stage_us.is_empty() {
+        println!("  per-stage (ms, per-query totals):");
+        for (stage, mut v) in stage_us {
+            let p50 = percentile_micros(&mut v, 50.0) as f64 / 1000.0;
+            let p95 = percentile_micros(&mut v, 95.0) as f64 / 1000.0;
+            println!("    {stage:<16} p50 {p50:8.1}  p95 {p95:8.1}  n={}", v.len());
+        }
+    }
+    if !stage_count.is_empty() {
+        println!("  per-stage call counts (per query):");
+        for (stage, mut v) in stage_count {
+            let p50 = percentile_micros(&mut v, 50.0);
+            let p95 = percentile_micros(&mut v, 95.0);
+            println!("    {stage:<16} p50 {p50:8}  p95 {p95:8}  n={}", v.len());
+        }
+    }
     println!("  labels       : corpus-derived (title → its document), not human judgements");
 
     if let Some(out) = &opts.out {
