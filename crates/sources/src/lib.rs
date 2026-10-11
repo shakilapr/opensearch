@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arxiv;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
