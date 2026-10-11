@@ -1086,3 +1086,98 @@ async fn blobs_stay_uncompressed_without_the_flag() {
     let bones = blob_files(&out);
     assert!(bones.iter().all(|b| !b.ends_with(".gz")), "default stays raw: {bones:?}");
 }
+
+/// An `application/pdf` response must route to the PDF parser, land in the
+/// index, and have its raw bytes stored gzipped in the raw dataset exactly like
+/// every other blob under `--compress` (so a corpus of huge PDFs fits on disk).
+#[tokio::test]
+async fn compressed_pdf_raw_blob_is_gzipped_and_indexed() {
+    const MARKER: &str = "zephyrpdfcrawlmarker";
+    let pdf = build_ascii_pdf(MARKER);
+    let (base, _fx) = spawn_recording_fixture(
+        vec![(
+            "/paper.pdf".to_string(),
+            "application/pdf".to_string(),
+            pdf.clone(),
+        )],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let url = format!("{base}/paper.pdf");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[url.clone()]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.compress = true;
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 1, "the PDF must route + ingest: {summary:?}");
+
+    // Indexed: the PDF's extracted text layer is present in the index.
+    let ro = Pipeline::open_read_only(&cfg, true).expect("read-only open");
+    let docs = ro.all_docs().expect("all_docs");
+    assert!(
+        docs.iter()
+            .any(|d| !d.tombstone && d.body.contains(MARKER)),
+        "the PDF text layer must be indexed: {docs:?}"
+    );
+
+    // Raw blob: gzipped on disk, named for the type, and inflating to exactly
+    // the fetched PDF bytes.
+    let bones = blob_files(&out);
+    assert_eq!(bones.len(), 1, "{bones:?}");
+    assert!(
+        bones[0].ends_with(".pdf.gz"),
+        "the PDF raw blob must be gzipped and type-named: {bones:?}"
+    );
+    let raw = std::fs::read(out.join("blobs").join(&bones[0])).expect("read blob");
+    assert_eq!(&raw[..2], &[0x1f, 0x8b], "gzip magic: {bones:?}");
+    let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+    let mut inflated = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut inflated).expect("inflate");
+    assert_eq!(
+        inflated,
+        pdf.as_bytes(),
+        "the gzipped blob must inflate to the exact fetched PDF bytes"
+    );
+}
+
+/// Build a valid single-page PDF with a real text layer as pure ASCII, so it can
+/// be served through the `String`-bodied fixture without lossy UTF-8 conversion.
+fn build_ascii_pdf(text: &str) -> String {
+    let content = format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET");
+    let objects: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources \
+         << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    ];
+
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets: Vec<usize> = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_pos = out.len();
+    let n = objects.len() + 1;
+    out.push_str(&format!("xref\n0 {n}\n"));
+    out.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        out.push_str(&format!("{off:010} 00000 n \n"));
+    }
+    out.push_str(&format!(
+        "trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n"
+    ));
+    out
+}
