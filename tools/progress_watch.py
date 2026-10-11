@@ -57,6 +57,11 @@ CLONES_PER_CYCLE = 2
 CRAWL_CONCURRENCY = 32
 CRAWL_ORIGIN_INTERVAL_MS = 250
 CRAWL_ORIGIN_CAP = 250
+# A shard that has written nothing to its log for this long is treated as dead even while its
+# process still exists. The crawler can panic a task and leave the run loop parked forever (32
+# threads on futex_wait_queue, zero open sockets, zero index writes) — a wedged process, not a
+# slow one. 5 minutes is far longer than any healthy gap between ingested documents.
+SHARD_STALL_S = 300
 SIDECAR_LOG = DATA / "sidecar-build.log"
 # The user's stated failure criterion: below this, the box is being wasted, whatever the
 # throughput number says. The supervisor must measure it, report it as a failure, act on what it
@@ -277,15 +282,28 @@ def collect() -> dict:
     total = 0
     for s in SHARDS:
         docs = shard_docs(s)
+        # `running` must mean "the process exists AND the shard is making progress". The previous
+        # form was `bool(pgrep...wc -l .strip().isdigit())`, and `"0".isdigit()` is True, so this
+        # was ALWAYS True: the watcher could not see a stopped shard, never restarted one, and
+        # reported a dead-but-present process as healthy. Shard 3 sat deadlocked for five hours
+        # behind that one expression.
+        logf = FLEET / f"shard-{s}.log"
+        proc = sh(f"pgrep -f 'crawl /var/lib/search-fleet/work/shard-{s}' | head -1")[1].strip()
+        age = None
+        if logf.exists():
+            try:
+                age = int(time.time() - logf.stat().st_mtime)
+            except OSError:
+                age = None
+        stalled = age is not None and age > SHARD_STALL_S
         entry = {
             "docs": docs,
             "raw_bytes": dir_bytes(REPO / "raw-dataset" / f"shard-{s}"),
             "pack_records": pack_records(s),
-            "running": bool(
-                sh(f"pgrep -fa 'crawl /var/lib/search-fleet/work/shard-{s}' | grep -v pgrep | wc -l")[1]
-                .strip()
-                .isdigit()
-            ),
+            "pid": proc or None,
+            "log_age_s": age,
+            "stalled": stalled,
+            "running": bool(proc) and not stalled,
         }
         prev_docs = (prev_shards.get(str(s)) or {}).get("docs")
         if docs is not None and prev_docs is not None and prev_ts and now > prev_ts:
@@ -587,7 +605,17 @@ def throughput_guard(plan: dict, metrics: dict) -> None:
     idle = load < cores * 0.5
     stopped = [s for s in SHARDS if not metrics["shards"][str(s)]["running"]]
     seeded = [s for s in stopped if (FLEET / "work" / f"shard-{s}.txt").exists()]
-    if idle and seeded:
+    # A stalled shard still has a process holding the index lock, so it must be killed before it
+    # can be restarted; otherwise the new crawler fails to open the store and the fleet stays down.
+    for s in stopped:
+        info = metrics["shards"][str(s)]
+        if info.get("stalled") and info.get("pid"):
+            sh(f"kill -9 {info['pid']}")
+            log(
+                f"throughput: shard {s} STALLED (no log write for {info.get('log_age_s')}s, "
+                f"pid {info['pid']} still alive) - killed it; a wedged crawler is not a slow one"
+            )
+    if seeded:
         s = seeded[0]
         env = (
             f"SEARCH_DATA_DIR=/var/lib/search-fleet/shard-{s} SEARCH_CRAWL_ORIGIN_INTERVAL_MS=250 "
@@ -598,12 +626,13 @@ def throughput_guard(plan: dict, metrics: dict) -> None:
             f"{env} timeout 86400 {REPO}/target/release/agent0 crawl "
             f"/var/lib/search-fleet/work/shard-{s}.txt --out raw-dataset/shard-{s} "
             f"--max-docs 250000 --max-urls 1000000 --concurrency 32 --compress "
-            f"> /var/lib/search-fleet/shard-{s}.log 2>&1"
+            f">> /var/lib/search-fleet/shard-{s}.log 2>&1"
         )
         subprocess.Popen(cmd, shell=True, cwd=str(REPO), start_new_session=True)
+        # Append, never truncate: `> log` threw away the evidence that explains why a shard died.
         log(
-            f"throughput: host idle (load1 {load} of {cores} cores, {procs} crawler processes, "
-            f"rate {rate} docs/min) - restarted shard {s}"
+            f"throughput: restarting shard {s} (load1 {load} of {cores} cores, {procs} crawler "
+            f"processes, rate {rate} docs/min, {len(stopped)} shard(s) down)"
         )
     # The utilisation target is the user's failure criterion, so it is checked first and its
     # shortfall is treated as a defect to fix, not a number to display.
@@ -668,6 +697,34 @@ def unblock_deps(plan: dict) -> None:
             it["status"] = "todo"
             it.pop("reason", None)
             log(f"unblocked {it['id']}: deps {', '.join(deps)} are done")
+            changed = True
+    if changed:
+        save_plan(plan)
+
+
+def retry_harness_blocked(plan: dict) -> None:
+    """Re-open items whose block was a bug in THIS watcher, not in their own code.
+
+    `dispatch_code` only dispatches `todo` items, so anything marked `blocked` was stranded
+    forever — including items whose tests never ran because the harness was broken. Two such
+    bugs have been fixed (verify commands ran under /bin/sh, which rejects `set -o pipefail`;
+    and `--manifest-path` was passed once per crate in a single cargo call). An item whose
+    recorded reason names one of those, and which produced no failing assertion of its own, is
+    returned to `todo` so it is re-dispatched and re-verified with the fixed harness.
+    """
+    harness_signatures = (
+        "Illegal option -o pipefail",
+        "cannot be used multiple times",
+    )
+    changed = False
+    for it in plan["items"]:
+        if it["status"] != "blocked":
+            continue
+        reason = str(it.get("reason", ""))
+        if any(sig in reason for sig in harness_signatures):
+            it["status"] = "todo"
+            it["reason"] = f"retry after harness fix (was: {reason[:120]})"
+            log(f"retry {it['id']}: its block was a harness bug, not its own code; re-queued")
             changed = True
     if changed:
         save_plan(plan)
@@ -1024,6 +1081,7 @@ def main() -> int:
                 fh.write(json.dumps(metrics) + "\n")
             start_structuring(plan, metrics)
             unblock_deps(plan)
+            retry_harness_blocked(plan)
             clone_references(plan, metrics)
             refresh_sidecars(plan, metrics)
             throughput_guard(plan, metrics)
