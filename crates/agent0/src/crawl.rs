@@ -32,21 +32,26 @@
 //!
 //! ## Discovery + draining
 //!
-//! Seeds are processed one at a time: each unseen seed is expanded with the
-//! existing discovery path ([`Pipeline::discover`]: robots.txt `Sitemap:` lines,
-//! sitemap indexes, feeds advertised by the seed HTML) **and** by re-fetching the
-//! advertised sitemap/feed bodies and re-parsing them with
+//! Seeds are discovered in concurrent chunks: every unseen seed in a chunk is
+//! expanded with the existing discovery path ([`Pipeline::discover`]: robots.txt
+//! `Sitemap:` lines, sitemap indexes, feeds advertised by the seed HTML) **and**
+//! by re-fetching the advertised sitemap/feed bodies and re-parsing them with
 //! `search_discovery::{parse_sitemap, parse_feed, sitemaps_in_robots,
-//! sitemap_index_urls}`. The work queue is drained before moving to the next
-//! seed, so `--max-docs`/`--max-urls` are reached without first discovering the
-//! whole seed set. Every discovered URL enters the same queue (`frontier.json`)
-//! after dedup against the log and the queue.
+//! sitemap_index_urls}`. One task per seed means a chunk touches many origins at
+//! once (never two simultaneous requests to the same host), and the next chunk's
+//! discovery is started before the current chunk is drained so the network-bound
+//! discovery overlaps the CPU-bound drain. The queue therefore holds many
+//! origins at once and the cross-origin concurrency bound is actually filled —
+//! discovering and draining one seed at a time parked the whole run inside a
+//! single origin and left the box idle with work queued. Every discovered URL
+//! enters the same queue (`frontier.json`) after dedup against the log and the
+//! queue.
 //!
 //! ## Link following
 //!
 //! Many roots (arxiv `/list/...`, news home pages, blog indexes) publish no
 //! sitemap and no feed, so discovery alone contributes almost nothing. After the
-//! sitemap work, [`discover_seed`] therefore also fetches the **seed page's**
+//! sitemap work, [`discover_seed_urls`] therefore also fetches the **seed page's**
 //! HTML and enqueues the document-shaped links found on it
 //! ([`article_links`]), same-origin only. This is **one level deep** and only
 //! for pages that were given as seeds or resumed from the frontier — a page that
@@ -393,16 +398,18 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // the same `Fetcher` type the pipeline holds; the pipeline does not expose
     // its instance, so one is built here. `fetch` re-validates SSRF on every
     // hop; the loopback escape is enabled only for the hermetic test path.
-    let fetcher = Fetcher::new(cfg.limits.clone(), cfg.user_agent.clone())
-        .with_allowed_types(vec![
-            "text/*".to_string(),
-            "application/xml".to_string(),
-            "application/rss+xml".to_string(),
-            "application/atom+xml".to_string(),
-            "application/xhtml+xml".to_string(),
-            "application/json".to_string(),
-        ])
-        .allow_private_addresses_for_tests(opts.allow_loopback);
+    let fetcher = Arc::new(
+        Fetcher::new(cfg.limits.clone(), cfg.user_agent.clone())
+            .with_allowed_types(vec![
+                "text/*".to_string(),
+                "application/xml".to_string(),
+                "application/rss+xml".to_string(),
+                "application/atom+xml".to_string(),
+                "application/xhtml+xml".to_string(),
+                "application/json".to_string(),
+            ])
+            .allow_private_addresses_for_tests(opts.allow_loopback),
+    );
 
     let mut drain = Drainer::new(
         pipeline.clone(),
@@ -416,8 +423,17 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
 
     let seeds = parse_seeds(&opts.seeds_file)?;
 
-    // Interleave discovery and draining: discover one unseen seed, enqueue its
-    // frontier, drain, then move on. Stops as soon as a bound is met.
+    // Discovery and draining run together, in chunks of seeds.
+    //
+    // The old shape discovered ONE seed and then drained its (single-origin)
+    // queue to empty before touching the next, so at most one host was ever in
+    // flight: the concurrency slots sat idle, the box read ~16% CPU with work
+    // queued, and every origin took its turn being hammered. Here a whole chunk
+    // of seeds is discovered concurrently — each task owns a distinct origin, so
+    // no host is hit twice at once, and that host diversity is also what defuses
+    // a 429 storm — and the next chunk's discovery is spawned BEFORE the current
+    // chunk is drained, so the network-bound discovery overlaps the CPU-bound
+    // drain. The drain then sees many origins and fills its slots.
     //
     // This runs BEFORE the resumed backlog on purpose. The pending frontier
     // left by a previous run can be dominated by one host's sitemap (a live
@@ -426,17 +442,62 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // seeds listed below were never even discovered. Seeds first makes a
     // resumed crawl breadth-first; the stale backlog goes last, and the
     // document bound normally stops the run before reaching it.
-    for seed in &seeds {
-        if drain.is_seen(seed) {
-            continue;
+    let chunk_size = opts.concurrency.max(1);
+    let follow_links = opts.follow_links;
+    let mut next_seed = 0usize;
+    let mut chunk: Vec<String> = Vec::new();
+    let mut discovery: JoinSet<Vec<String>> = JoinSet::new();
+
+    // Prime the first chunk; its tasks discover while this task waits on them.
+    spawn_discovery_chunk(
+        &mut discovery,
+        &mut chunk,
+        &seeds,
+        &mut next_seed,
+        chunk_size,
+        &pipeline,
+        &fetcher,
+        follow_links,
+        &drain.seen,
+    );
+
+    loop {
+        // Collect the in-flight chunk (spawned last iteration or above) and
+        // enqueue everything it found. Joining here is also what lets the
+        // previous `drain.run()` overlap this discovery.
+        while let Some(res) = discovery.join_next().await {
+            for u in res.unwrap_or_default() {
+                drain.enqueue(u);
+            }
         }
-        discover_seed(&pipeline, &fetcher, seed, &mut drain).await;
-        drain.enqueue_seed(seed.clone());
+        for seed in chunk.drain(..) {
+            drain.enqueue_seed(seed);
+        }
         drain.persist();
-        drain.run().await;
+
+        // The seed list is exhausted and everything it produced has drained.
+        if next_seed >= seeds.len() && drain.queues_empty() {
+            break;
+        }
         if drain.bound_reached() {
             break;
         }
+
+        // Start the next chunk discovering before draining this one so the two
+        // overlap.
+        spawn_discovery_chunk(
+            &mut discovery,
+            &mut chunk,
+            &seeds,
+            &mut next_seed,
+            chunk_size,
+            &pipeline,
+            &fetcher,
+            follow_links,
+            &drain.seen,
+        );
+
+        drain.run().await;
     }
 
     // The pending frontier from a previous run, drained last: everything in it
@@ -564,10 +625,6 @@ impl Drainer {
             remaining: BTreeSet::new(),
             counters: Counters::default(),
         }
-    }
-
-    fn is_seen(&self, url: &str) -> bool {
-        self.seen.contains(url)
     }
 
     fn enqueue(&mut self, url: String) {
@@ -1021,9 +1078,51 @@ pub fn read_pipeline_bytes(cfg: &Config, content_id: &str) -> Option<Vec<u8>> {
 // Discovery
 // ---------------------------------------------------------------------------
 
-/// Expand one seed: the existing pipeline discovery path plus a direct
-/// sitemap/feed re-parse, enqueuing every discovered URL.
-async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain: &mut Drainer) {
+/// Start discovery for up to `chunk_size` not-yet-seen seeds from
+/// `seeds[*next..]`, spawning one task per seed into `discovery`.
+///
+/// Each task owns a distinct origin, so a chunk discovers many hosts
+/// concurrently without ever making two simultaneous requests to the same host.
+/// The returned URLs are enqueued by the caller once the chunk's tasks complete.
+#[allow(clippy::too_many_arguments)]
+fn spawn_discovery_chunk(
+    discovery: &mut JoinSet<Vec<String>>,
+    chunk: &mut Vec<String>,
+    seeds: &[String],
+    next: &mut usize,
+    chunk_size: usize,
+    pipeline: &Arc<Pipeline>,
+    fetcher: &Arc<Fetcher>,
+    follow_links: bool,
+    seen: &HashSet<String>,
+) {
+    while *next < seeds.len() && chunk.len() < chunk_size {
+        let seed = seeds[*next].clone();
+        *next += 1;
+        if seen.contains(&seed) {
+            continue;
+        }
+        let pl = pipeline.clone();
+        let ft = fetcher.clone();
+        let seed_for_task = seed.clone();
+        discovery
+            .spawn(async move { discover_seed_urls(&pl, &ft, &seed_for_task, follow_links).await });
+        chunk.push(seed);
+    }
+}
+
+/// Expand one seed and return every URL it discovered (the seed itself is not
+/// included; the caller enqueues it). Runs the existing pipeline discovery path
+/// plus a direct sitemap/feed re-parse, and follows the seed page's own
+/// same-origin document links one level deep.
+async fn discover_seed_urls(
+    pipeline: &Pipeline,
+    fetcher: &Fetcher,
+    seed: &str,
+    follow_links: bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
     // (1) Existing discovery path: robots -> sitemaps -> feeds, persisted and
     // pushed to the metadata frontier. Errors are non-fatal.
     if let Err(e) = pipeline.discover(seed).await {
@@ -1043,21 +1142,21 @@ async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain
                 .take(MAX_SITEMAPS)
                 .collect();
             for sm in sitemaps {
-                expand_sitemap(fetcher, &origin, &sm, drain).await;
+                out.extend(expand_sitemap(fetcher, &origin, &sm).await);
             }
         }
     }
 
     // (2b) Follow document links published on the seed page itself.
     //
-    // One level only: `discover_seed` runs for seeds (and frontier entries),
-    // never for pages reached by following a link, so a followed page is fetched
-    // and indexed by the normal drain but its own links are never expanded.
+    // One level only: discovery runs for seeds (and frontier entries), never for
+    // pages reached by following a link, so a followed page is fetched and
+    // indexed by the normal drain but its own links are never expanded.
     //
     // `Pipeline::discover` already fetched this page for feed discovery but does
     // not surface the body (pipeline.rs is out of scope), so the seed HTML is
     // fetched once more here with the module's discovery `Fetcher`.
-    if drain.opts.follow_links {
+    if follow_links {
         if let Some(bytes) = fetch_body(fetcher, seed).await {
             let html = String::from_utf8_lossy(&bytes).to_string();
             let seed_site = site_key(seed);
@@ -1065,7 +1164,7 @@ async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain
                 // Same-origin only, with `www.`/scheme normalisation (see
                 // `site_key`).
                 if site_key(&link) == seed_site {
-                    drain.enqueue(link);
+                    out.push(link);
                 }
             }
         }
@@ -1076,7 +1175,7 @@ async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain
         if let Some(bytes) = fetch_body(fetcher, &feed_url).await {
             let entries = parse_feed(&bytes, &feed_url).unwrap_or_default();
             for r in entries.into_iter().take(MAX_DISCOVERED) {
-                drain.enqueue(r.url);
+                out.push(r.url);
             }
         }
     }
@@ -1087,14 +1186,18 @@ async fn discover_seed(pipeline: &Pipeline, fetcher: &Fetcher, seed: &str, drain
         "SELECT url FROM frontier_entry LIMIT ?1",
         MAX_DISCOVERED as i64,
     ) {
-        drain.enqueue(u);
+        out.push(u);
     }
+
+    out
 }
 
 /// Fetch a sitemap; if it is an index, follow exactly one level of children.
-async fn expand_sitemap(fetcher: &Fetcher, origin: &str, sm_url: &str, drain: &mut Drainer) {
+/// Returns every resource URL found.
+async fn expand_sitemap(fetcher: &Fetcher, origin: &str, sm_url: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     let Some(bytes) = fetch_body(fetcher, sm_url).await else {
-        return;
+        return out;
     };
     let children = sitemap_index_urls(&bytes).unwrap_or_default();
     if !children.is_empty() {
@@ -1108,15 +1211,16 @@ async fn expand_sitemap(fetcher: &Fetcher, origin: &str, sm_url: &str, drain: &m
             };
             let resources = parse_sitemap(&cb, &child).unwrap_or_default();
             for r in resources.into_iter().take(MAX_DISCOVERED) {
-                drain.enqueue(r.url);
+                out.push(r.url);
             }
         }
     } else {
         let resources = parse_sitemap(&bytes, sm_url).unwrap_or_default();
         for r in resources.into_iter().take(MAX_DISCOVERED) {
-            drain.enqueue(r.url);
+            out.push(r.url);
         }
     }
+    out
 }
 
 /// Read a string column from the pipeline's metadata DB (read-only).
@@ -1163,7 +1267,7 @@ async fn fetch_body(fetcher: &Fetcher, url: &str) -> Option<Vec<u8>> {
 /// Kept links are deduped preserving first-seen order and truncated to `cap`.
 ///
 /// This function is **origin-agnostic** — same-origin enforcement happens at the
-/// call site ([`discover_seed`]).
+/// call site ([`discover_seed_urls`]).
 ///
 /// Safety on malformed input: a single left-to-right pass over at most
 /// [`MAX_LINK_SCAN_BYTES`] bytes (a 5 MB body is truncated there, so the scan is
