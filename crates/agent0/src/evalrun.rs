@@ -144,6 +144,9 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     search_engine::timing::enable();
     let mut stage_us: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
     let mut stage_count: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
+    // Diagnostic scalars the API records per request: the candidate limit actually passed to
+    // `Searcher::search` and the base segment count. This is the attribution line.
+    let mut stage_gauge: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
 
     let mut results: Vec<RunResult> = Vec::with_capacity(cases.len());
     let mut failures = 0usize;
@@ -163,6 +166,7 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
         let started = std::time::Instant::now();
         let _ = search_engine::timing::take();
         let _ = search_engine::timing::take_counts();
+        let _ = search_api::engine::take_gauges();
         let ranked: Result<Vec<String>, String> = if opts.engine {
             search_api::engine::run_engine_search(
                 searcher.as_ref(),
@@ -213,6 +217,9 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
         for (stage, n) in per_case_counts {
             stage_count.entry(stage).or_default().push(n);
         }
+        for (name, value) in search_api::engine::take_gauges() {
+            stage_gauge.entry(name).or_default().push(value);
+        }
     }
     search_engine::timing::disable();
 
@@ -249,6 +256,17 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
             let p50 = percentile_micros(&mut v, 50.0);
             let p95 = percentile_micros(&mut v, 95.0);
             println!("    {stage:<16} p50 {p50:8}  p95 {p95:8}  n={}", v.len());
+        }
+    }
+    // The attribution line: the candidate limit the scan actually ran with, and the index
+    // layout it ran against. `index_scan_limit` is 10 for the legacy path and the engine's
+    // per-lane breadth (up to 200) for the engine path — the cause of the scan-cost gap.
+    if !stage_gauge.is_empty() {
+        println!("  scan config (per query):");
+        for (name, mut v) in stage_gauge {
+            let p50 = percentile_micros(&mut v, 50.0);
+            let p95 = percentile_micros(&mut v, 95.0);
+            println!("    {name:<16} p50 {p50:8}  p95 {p95:8}  n={}", v.len());
         }
     }
     println!("  labels       : corpus-derived (title → its document), not human judgements");

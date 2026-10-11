@@ -348,6 +348,9 @@ pub fn execute(searcher: &dyn Searcher, req: &SearchRequest) -> AppResult<Search
 
     // Ask the indexer for enough candidates to satisfy offset + page.
     let want = limit.saturating_add(req.offset);
+    // Diagnostic: the candidate limit the legacy path hands the index (offset + page), so an
+    // eval run can put it beside the engine's per-lane breadth on the same timing line.
+    crate::engine::record_gauge("index_scan_limit", want as u64);
     let mut hits = searcher.search(query, want, filters.as_ref())?;
 
     // Authoritative facet enforcement for what the API can verify. Facets the
@@ -386,6 +389,9 @@ pub fn execute(searcher: &dyn Searcher, req: &SearchRequest) -> AppResult<Search
     }
 
     let manifest = searcher.manifest()?;
+    // Diagnostic: the index layout the scan runs against, mirrored from the engine path.
+    crate::engine::record_gauge("base_segments", manifest.base_segments);
+    crate::engine::record_gauge("index_docs", manifest.doc_count);
 
     // Degradations: searcher-reported ones plus "no published manifest", which
     // means the response cannot be reproduced from a published generation.

@@ -29,6 +29,7 @@ use search_engine::evidence::EvidenceVerifier;
 use search_engine::coord::RuleSelector;
 use search_retrieval::{Candidate, Lane, LaneSearcher, RetrievalError};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -183,6 +184,31 @@ type SearchKey = (String, usize, Option<String>);
 /// Request-scoped memo of successful `Searcher::search` calls, shared by the lanes.
 pub type SearchCache = Arc<Mutex<HashMap<SearchKey, Arc<Vec<IndexHit>>>>>;
 
+// ---------------------------------------------------------------------------
+// Diagnostic gauges
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Diagnostic scalars for the current query — the candidate limit actually passed to
+    /// `Searcher::search`, the base segment count — as `(name, value)` in first-seen order.
+    ///
+    /// Populated only while `search_engine::timing` is enabled, so a normal request is
+    /// byte-identical to before (the same determinism rule the engine's timing module uses).
+    static GAUGES: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record one diagnostic scalar for the current query. No-op unless engine timing is on.
+pub fn record_gauge(name: &'static str, value: u64) {
+    if search_engine::timing::enabled() {
+        GAUGES.with(|g| g.borrow_mut().push((name, value)));
+    }
+}
+
+/// Drain the accumulated `(name, value)` gauges for the current query.
+pub fn take_gauges() -> Vec<(&'static str, u64)> {
+    GAUGES.with(|g| std::mem::take(&mut *g.borrow_mut()))
+}
+
 impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
     /// A lane adapter stamping every candidate with `lane`, with its own (unshared) cache.
     pub fn new(searcher: &'a S, lane: Lane) -> Self {
@@ -230,6 +256,10 @@ impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
             }
         }
         search_engine::timing::count("index_scans");
+        // Attribute the scan: the exact candidate limit handed to the index. The engine's
+        // per-lane breadth (up to 200 for Auto) is what the index scan cost scales with, so
+        // recording it here is what turns "one scan is 426.9 ms" into a cause.
+        record_gauge("index_scan_limit", limit as u64);
         let filters = source_id.map(|s| SearchFilters {
             source_id: Some(s.to_string()),
             ..Default::default()
@@ -635,6 +665,10 @@ pub fn run_engine_search(
     let limit = normalize_limit(req.base.limit)?;
 
     let manifest = searcher.manifest()?;
+    // Attribution: the index layout the scan runs against. A single-segment base is what
+    // blocks Tantivy's multi-segment executor path, so the count belongs next to the limit.
+    record_gauge("base_segments", manifest.base_segments);
+    record_gauge("index_docs", manifest.doc_count);
 
     // §8/§17 stats the planner conditions on. `avg_doc_len` is not exposed by the
     // API's manifest, so it is reported as `0.0` (unknown) rather than invented.
@@ -979,5 +1013,89 @@ mod tests {
         // Same query and limit but a source filter is a different scan.
         let _ = bm25.search("rust async", 5, Some("news")).unwrap();
         assert_eq!(s.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn engine_records_scan_limit_and_segment_count_only_when_timing_is_enabled() {
+        struct ManifestSearcher;
+        impl Searcher for ManifestSearcher {
+            fn search(
+                &self,
+                _q: &str,
+                _limit: usize,
+                _f: Option<&SearchFilters>,
+            ) -> AppResult<Vec<IndexHit>> {
+                Ok(vec![IndexHit {
+                    doc_id: "d1".to_string(),
+                    version: 1,
+                    resource_id: "r1".to_string(),
+                    work_id: None,
+                    content_id: None,
+                    url: "https://example.test/d1".to_string(),
+                    title: "Doc One".to_string(),
+                    snippet: "snippet".to_string(),
+                    source_id: Some("news".to_string()),
+                    doc_type: None,
+                    language: None,
+                    published_at: None,
+                    modified_at: None,
+                    fetched_at: 0,
+                    lane: "lexical_base".to_string(),
+                    provenance: search_core::Provenance::Snapshot,
+                    score: 1.0,
+                    signals: Vec::new(),
+                }])
+            }
+            fn manifest(&self) -> AppResult<search_core::IndexManifest> {
+                Ok(search_core::IndexManifest {
+                    manifest_id: "gen-7".to_string(),
+                    generation: 7,
+                    doc_count: 235_204,
+                    base_segments: 1,
+                    watermark: 7,
+                    embedding_model_ids: Vec::new(),
+                    metadata_version: 7,
+                    created_at: 0,
+                    published_at: None,
+                })
+            }
+        }
+
+        let req = || EngineSearchRequest {
+            base: SearchRequest {
+                query: "rust async runtime".to_string(),
+                limit: 10,
+                offset: 0,
+                timezone: "UTC".to_string(),
+                deadline_ms: None,
+                filters: None,
+            },
+            engine: true,
+            mode: EngineMode::Auto,
+        };
+        let no_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> = Vec::new();
+
+        // Timing off: the request path reads no clock and records nothing.
+        search_engine::timing::disable();
+        let _ = take_gauges();
+        let _ = run_engine_search(&ManifestSearcher, req(), 0, None, None, &no_lanes).unwrap();
+        assert!(take_gauges().is_empty(), "gauges are a no-op unless timing is enabled");
+
+        // Timing on: the exact candidate limit and the index layout are recorded.
+        search_engine::timing::enable();
+        let _ = take_gauges();
+        let _ = run_engine_search(&ManifestSearcher, req(), 0, None, None, &no_lanes).unwrap();
+        let gauges = take_gauges();
+        search_engine::timing::disable();
+
+        let value = |name: &str| gauges.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        assert_eq!(value("base_segments"), Some(1), "segment count is attributed");
+        assert_eq!(value("index_docs"), Some(235_204));
+        // Auto: base 100 + one per 100k docs (room 100) = 102 on this corpus.
+        assert_eq!(
+            value("index_scan_limit"),
+            Some(102),
+            "the engine's per-lane breadth is the candidate limit the scan ran with"
+        );
     }
 }
