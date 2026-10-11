@@ -135,7 +135,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T11:29:38+0200: 81.5 docs/min, load1 5.34/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T11:44:40+0200: 77.6 docs/min, load1 4.62/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
@@ -159,7 +159,7 @@
       "kind": "code",
       "status": "todo",
       "title": "Raise CPU and RAM utilisation to the 80% target",
-      "detail": "MEASURED 2026-10-11T11:29:38+0200: CPU 34.8% and RAM 25.5% against an 80% target; crawl 81.5 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 23.56 s",
+      "detail": "MEASURED 2026-10-11T11:44:40+0200: CPU 32.4% and RAM 25.4% against an 80% target; crawl 77.6 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 24.74 s",
       "verify": "CPU and RAM both at or above 80% on a sustained window, with throughput up and no host hammered past its configured rate."
     }
   ]
