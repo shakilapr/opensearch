@@ -118,14 +118,15 @@
     {
       "id": "index-model-improvement",
       "kind": "code",
-      "status": "todo",
+      "status": "blocked",
       "deps": [
         "research-index-algorithms",
         "references-repos"
       ],
       "title": "Improve the index model using the research and the reference implementations",
       "detail": "Read references/research/*.md and the cloned repos under references/repos/, then pick exactly ONE concrete, measurable improvement to our index model (candidates: document-side weights from the pack's entities/topics and summary rather than binary presence; candidate-limit sizing or pruning derived from the scan-cost attribution; a simpler first-pass query with expansions moved to rerank). Implement it, and measure before/after with the eval harness.",
-      "verify": "before/after p50 and nDCG@10 from the same 600-case set, with nDCG unchanged or better; tests pass."
+      "verify": "before/after p50 and nDCG@10 from the same 600-case set, with nDCG unchanged or better; tests pass.",
+      "reason": "no commit in /root/.hermes/cache/scratch/wt-index-model-improv (rc=0); worktree kept for inspection"
     },
     {
       "id": "crawl-throughput",
@@ -134,7 +135,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T08:32:49+0200: 83.9 docs/min, load1 4.46/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T08:52:58+0200: 82.9 docs/min, load1 2.91/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
@@ -158,7 +159,7 @@
       "kind": "code",
       "status": "todo",
       "title": "Raise CPU and RAM utilisation to the 80% target",
-      "detail": "MEASURED 2026-10-11T08:32:49+0200: CPU 13.1% and RAM 24.0% against an 80% target; crawl 83.9 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 22.88 s",
+      "detail": "MEASURED 2026-10-11T08:52:58+0200: CPU 19.5% and RAM 24.0% against an 80% target; crawl 82.9 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 23.16 s",
       "verify": "CPU and RAM both at or above 80% on a sustained window, with throughput up and no host hammered past its configured rate."
     }
   ]
