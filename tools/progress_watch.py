@@ -772,25 +772,36 @@ def verify_and_merge(plan: dict, item: dict, wt: Path, branch: str, rc: int) -> 
         crates = [c.strip() for c in out3.splitlines() if c.strip()]
     # Address each crate by MANIFEST PATH. Guessing package names produced a literal
     # `-p Syntax` and cargo refused to parse, which the pipeline below then reported as success.
-    args = []
+    # `--manifest-path` may be given only ONCE per cargo invocation, so a multi-crate change is
+    # tested as one invocation per crate — passing it twice made cargo exit 1 with
+    # "the argument '--manifest-path <PATH>' cannot be used multiple times", which parked every
+    # multi-crate item as a test failure it had never run.
+    targets = []
     for c in crates:
         man = wt / "crates" / c / "Cargo.toml"
-        args.append(f"--manifest-path {man}" if man.exists() else f"-p search-{c}")
-    if not args:
+        targets.append(f"--manifest-path {man}" if man.exists() else f"-p search-{c}")
+    if not targets:
         summary = "no crate touched: no tests to run"
         rc4, out4 = 0, "test result: nothing to run"
     else:
         # `set -o pipefail` is load-bearing: without it the pipeline returns TAIL's status (0), so
         # a cargo invocation that never ran its tests was recorded as a pass and the item as DONE.
-        rc4, out4 = sh(
-            f"cd {wt} && set -o pipefail && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 "
-            f"{CARGO} test {' '.join(args)} 2>&1 | tail -40",
-            timeout=1600,
-        )
-        summary = "; ".join(l.strip() for l in out4.splitlines() if "test result:" in l) or out4[-200:]
+        rc4, outs, summaries = 0, [], []
+        for target in targets:
+            rc, out = sh(
+                f"cd {wt} && set -o pipefail && PATH={os.path.dirname(CARGO)}:$PATH timeout 1500 "
+                f"{CARGO} test {target} 2>&1 | tail -40",
+                timeout=1600,
+            )
+            outs.append(out)
+            summaries += [l.strip() for l in out.splitlines() if "test result:" in l]
+            if rc != 0 or "test result: FAILED" in out:
+                rc4 = rc or 1
+        out4 = "\n".join(outs)
+        summary = "; ".join(summaries) or out4[-200:]
     # A run that emitted no test summary did not verify anything, whatever its exit code said.
     ran_something = "test result:" in out4
-    if args and (rc4 != 0 or "test result: FAILED" in out4 or not ran_something):
+    if targets and (rc4 != 0 or "test result: FAILED" in out4 or not ran_something):
         item["status"] = "blocked"
         item["reason"] = f"tests failed on {wt}: {summary[:400]}"
         save_plan(plan)
