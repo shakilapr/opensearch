@@ -131,7 +131,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T08:01:19+0200: 88.3 docs/min, load1 4.03/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T08:02:19+0200: 105.4 docs/min, load1 3.95/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
@@ -149,6 +149,14 @@
       "title": "Stop wasting the crawl on HTTP 429: back off per host and move on",
       "detail": "MEASURED: ~39,700 HTTP 429 responses across the four shards (10,412 shard 0, 10,187 shard 2, 9,736 shard 3, 9,358 shard 1) plus ~1,800 DNS failures - 76,349 error/timeout lines in total - while the box sits at load 3.8 of 16 cores and the fleet sustains only 52-94 docs/min. The crawler is spending its slots on hosts that are telling it to slow down. Fix in the fetcher/queue: honour Retry-After when present, back off exponentially per origin (not globally), and on a 429 move the slot to another origin instead of retrying the same one - host diversity is the resource we are not using. DNS failures must be counted and skipped, not retried forever. Keep the politeness guarantees: this must not become a way to hammer a host harder.",
       "verify": "after the change, a crawl window shows the 429 count falling as a share of responses and docs/min rising, with per-origin request rate never above the configured floor."
+    },
+    {
+      "id": "raise-resource-utilization",
+      "kind": "code",
+      "status": "todo",
+      "title": "Raise CPU and RAM utilisation to the 80% target",
+      "detail": "MEASURED 2026-10-11T08:02:19+0200: CPU 28.8% and RAM 24.2% against an 80% target; crawl 105.4 docs/min with 4 crawler process(es) on 16 cores; implied mean fetch latency 18.22 s. The box is idle while work is queued. Levers to evaluate and MEASURE, not assume: more crawl shards/processes (each shard owns its data root; host diversity is also what fixes the 429 storm), higher per-shard concurrency, more parallel structuring workers against the shared LLM cache, and running the embed/graph builds concurrently instead of one at a time. Nothing may push a host harder than its politeness floor.",
+      "verify": "CPU and RAM both at or above 80% on a sustained window, with throughput up and no host hammered past its configured rate."
     }
   ]
 }
