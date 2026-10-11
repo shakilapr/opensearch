@@ -1098,4 +1098,101 @@ mod tests {
             "the engine's per-lane breadth is the candidate limit the scan ran with"
         );
     }
+
+    /// Pins the §17 fast-mode graph-lane skip from commit 245d20a.
+    ///
+    /// The skip's discriminator is the lane's own expanding view, so the stub lane exposes one and
+    /// counts its `search` calls: the engine drives every injected lane once in round 1, so a
+    /// non-zero count means the lane ran. Fast must leave the count at zero; Auto and Deep must not.
+    /// The trace assertion pins the auditable skip line, so removing the skip fails the test on both
+    /// the behaviour and the record.
+    #[test]
+    fn fast_mode_skips_the_expanding_graph_lane_but_auto_and_deep_run_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ExpandingStubLane {
+            searches: AtomicUsize,
+        }
+        impl LaneSearcher for ExpandingStubLane {
+            fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _source_id: Option<&str>,
+            ) -> Result<Vec<Candidate>, RetrievalError> {
+                self.searches.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            fn as_expanding(&self) -> Option<&dyn search_retrieval::ExpandingLane> {
+                Some(self)
+            }
+        }
+        impl search_retrieval::ExpandingLane for ExpandingStubLane {
+            fn expanded_docs(&self, _query: &str, _limit: usize) -> Vec<String> {
+                Vec::new()
+            }
+        }
+
+        struct StubSearcher;
+        impl Searcher for StubSearcher {
+            fn search(
+                &self,
+                _q: &str,
+                _limit: usize,
+                _f: Option<&SearchFilters>,
+            ) -> AppResult<Vec<IndexHit>> {
+                Ok(Vec::new())
+            }
+            fn manifest(&self) -> AppResult<search_core::IndexManifest> {
+                Ok(search_core::IndexManifest {
+                    manifest_id: "gen-1".to_string(),
+                    generation: 1,
+                    doc_count: 0,
+                    base_segments: 1,
+                    watermark: 1,
+                    embedding_model_ids: Vec::new(),
+                    metadata_version: 1,
+                    created_at: 0,
+                    published_at: None,
+                })
+            }
+        }
+
+        let req = |mode: EngineMode| EngineSearchRequest {
+            base: SearchRequest {
+                query: "vLLM paged attention".to_string(),
+                limit: 10,
+                offset: 0,
+                timezone: "UTC".to_string(),
+                deadline_ms: None,
+                filters: None,
+            },
+            engine: true,
+            mode,
+        };
+
+        for (mode, should_run) in [
+            (EngineMode::Fast, false),
+            (EngineMode::Auto, true),
+            (EngineMode::Deep, true),
+        ] {
+            let lane = Arc::new(ExpandingStubLane { searches: AtomicUsize::new(0) });
+            let lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> =
+                vec![lane.clone()];
+            let resp = run_engine_search(&StubSearcher, req(mode), 0, None, None, &lanes)
+                .expect("engine run");
+            let ran = lane.searches.load(Ordering::SeqCst) > 0;
+            assert_eq!(
+                ran, should_run,
+                "{mode:?}: an expanding-view lane must run iff the mode is not fast; trace={:?}",
+                resp.trace
+            );
+            let skip_recorded =
+                resp.trace.iter().any(|line| line.contains("graph lane: skipped in fast mode"));
+            assert_eq!(
+                skip_recorded, !should_run,
+                "{mode:?}: the skip must be recorded exactly when the lane is skipped"
+            );
+        }
+    }
 }
