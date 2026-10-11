@@ -601,8 +601,20 @@ pub fn run_engine_search(
     let retained_source = lane_source.retained();
     // The two index-backed lanes always run; any injected lane (today: the dense lane over the
     // vector store) is fused alongside them and named in `lane_ranks` by its own lane id.
+    // §17's fast budget is 200 ms, so fast mode runs only what pays for itself. Measured on the
+    // 600-case corpus set: the graph lane adds +261 ms p50 and moves nDCG by -0.4 pt (886 -> 1147 ms,
+    // 0.4913 -> 0.4871), so it is not run in fast mode. The dense lane costs +9 ms and is kept.
+    // The discriminator is the lane's own provenance view — only the §9.4 graph lane exposes one —
+    // so this needs no lane registry and cannot accidentally drop another lane.
+    let fast_mode = matches!(req.mode, EngineMode::Fast);
+    let graph_skipped = fast_mode && extra_lanes.iter().any(|l| l.as_expanding().is_some());
     let mut lanes: Vec<&dyn LaneSearcher> = vec![&lane_bm25, &lane_source];
-    lanes.extend(extra_lanes.iter().map(|l| &**l as &dyn LaneSearcher));
+    for lane in extra_lanes.iter() {
+        if fast_mode && lane.as_expanding().is_some() {
+            continue;
+        }
+        lanes.push(&**lane as &dyn LaneSearcher);
+    }
 
     let aliases = AliasPriors::empty();
     let selector = RuleSelector::new();
@@ -733,6 +745,13 @@ pub fn run_engine_search(
             // Auditable: how many documents graph expansion reached for this query, so a reader of a
             // trace can tell "the graph had nothing" from "the graph lane is not wired".
             let mut trace = engine_resp.trace;
+            if graph_skipped {
+                trace.push(
+                    "graph lane: skipped in fast mode (§17 budget; measured +261 ms p50 for no nDCG \
+                     gain on the 600-case set)"
+                        .to_string(),
+                );
+            }
             trace.push(format!(
                 "provenance: graph expansion reached {} document(s)",
                 graph_docs.len()
