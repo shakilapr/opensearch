@@ -21,10 +21,11 @@
       "id": "fast-mode-graph-skip-test",
       "title": "Pin the fast-mode graph-lane skip with a test",
       "kind": "code",
-      "status": "todo",
+      "status": "blocked",
       "owner": "opencode",
       "detail": "Commit 245d20a makes fast mode skip the graph lane because it measured +261 ms p50 for -0.4 pt nDCG, but landed build-verified with no test. Add a test that a Fast-mode request does not run a lane exposing an expanding view, and that Auto/Deep still do.",
-      "verify": "cargo test -p search-api passes and the new test fails if the skip is removed."
+      "verify": "cargo test -p search-api passes and the new test fails if the skip is removed.",
+      "reason": "no commit in /root/.hermes/cache/scratch/wt-fast-mode-graph-sk (rc=0); worktree kept for inspection"
     },
     {
       "id": "fleet-structuring",
@@ -131,7 +132,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:42:22+0200: 107.5 docs/min, load1 14.68/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T06:46:55+0200: 113.2 docs/min, load1 13.9/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
