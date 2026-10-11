@@ -429,7 +429,9 @@ async fn run_export(args: &[String]) -> ExitCode {
         let llm_cfg = match search_organize::LlmConfig::from_env() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("{e} (set KITANI_API_KEY, or pass --raw to skip the model)");
+                eprintln!(
+                    "{e} (set SEARCH_LLM_API_KEY or KITANI_API_KEY, or pass --raw to skip the model)"
+                );
                 return ExitCode::from(1);
             }
         };

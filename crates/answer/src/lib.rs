@@ -7,9 +7,9 @@
 //!
 //! Design guarantees:
 //!
-//! * **Opt-in.** [`from_env`] returns `None` unless `SEARCH_ANSWER_ENABLED` is truthy *and*
-//!   `KITANI_API_KEY` is set. The caller then passes no answerer and search behaves exactly as
-//!   before.
+//! * **Opt-in.** [`from_env`] returns `None` unless `SEARCH_ANSWER_ENABLED` is truthy *and* an
+//!   API key (`SEARCH_LLM_API_KEY`, else `KITANI_API_KEY`) is set. The caller then passes no
+//!   answerer and search behaves exactly as before.
 //! * **Never blocks or fails a search.** `answer` returns a short `Err` on any transport/timeout/
 //!   content failure; the engine ignores it.
 //! * **Bounded.** The prompt has hard character caps; the HTTP request has a bounded timeout; the
@@ -42,9 +42,10 @@ pub use transport::Transport;
 
 /// Build the answerer from the environment, or `None` when it is disabled.
 ///
-/// Returns `None` when `SEARCH_ANSWER_ENABLED` is unset/0, when `KITANI_API_KEY` is absent, or if
-/// the HTTP client cannot be built — never panics, never blocks, never reads a credential from a
-/// file. Use [`disabled_reason`] for the single explanatory log line.
+/// Returns `None` when `SEARCH_ANSWER_ENABLED` is unset/0, when no API key (`SEARCH_LLM_API_KEY`
+/// or `KITANI_API_KEY`) is set, or if the HTTP client cannot be built — never panics, never
+/// blocks, never reads a credential from a file. Use [`disabled_reason`] for the single
+/// explanatory log line.
 pub fn from_env() -> Option<LlmAnswerer> {
     let cfg = AnswerConfig::from_env().ok()?;
     let key = api_key()?;

@@ -52,6 +52,27 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_CORS_ORIGIN` | unset | comma-separated origins allowed to call the API from a browser (see *Browser clients and CORS*) |
 | `SEARCH_PLANNER_ENABLED` | unset | opt-in §6/§8 LLM query planning (`search-planner`); needs `KITANI_API_KEY`. See `PLANNER.md` |
 
+### LLM gateway credentials
+
+Every component that calls the OpenAI-chat-compatible provider (`search-organize`, `search-answer`)
+accepts a vendor-neutral override. These take precedence over the vendor-specific variables, which
+keep working unchanged as fallbacks — so a gateway other than the default one needs only this set:
+
+| variable | overrides | meaning |
+| :--- | :--- | :--- |
+| `SEARCH_LLM_BASE_URL` | `KITANI_BASE_URL` (organize), `SEARCH_ANSWER_BASE_URL` (answer) | OpenAI-chat-compatible endpoint, no trailing `/chat/completions`. |
+| `SEARCH_LLM_API_KEY` | `KITANI_API_KEY` | Credential. |
+| `SEARCH_LLM_MODEL` | `KITANI_MODEL` (organize), `SEARCH_ANSWER_MODEL` (answer) | Primary model id. |
+
+Precedence is resolved **per variable**, so setting only `SEARCH_LLM_API_KEY` keeps the
+vendor-specific base URL/model. The escalation model (`KITANI_ESCALATE_MODEL`, `search-organize`)
+has no neutral override and is unchanged.
+
+The credential is read **from the environment only** — never from a file, never logged, never put
+in an error message. When neither key variable is set: `search-organize` (`LlmConfig::from_env`)
+fails with `missing environment variable KITANI_API_KEY`, and `search-answer` reports
+`Disabled::MissingKey` (answer generation is off).
+
 ## Browser clients and CORS
 
 The API binds loopback and carries no authentication, so **it sends no CORS headers by

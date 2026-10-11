@@ -1,7 +1,9 @@
 //! Answerer configuration.
 //!
-//! Every knob is optional and read from the environment. The credential is read **only** from
-//! `KITANI_API_KEY` and is never hardcoded, logged, or written anywhere.
+//! Every knob is optional and read from the environment. The credential is read **only** from the
+//! environment and is never hardcoded, logged, or written anywhere. The vendor-neutral
+//! `SEARCH_LLM_*` variables take precedence over the vendor-specific `SEARCH_ANSWER_*` /
+//! `KITANI_API_KEY` ones, which remain the fallback.
 //!
 //! Defaults are chosen for the search hot path: a short, bounded timeout (20 s) and a small
 //! token budget (1024). A reasoning model (id containing `thinking`/`reason`/`r1`/`o1`) needs a
@@ -30,7 +32,7 @@ pub const REASONING_TIMEOUT_MS: u64 = 120_000;
 pub enum Disabled {
     /// `SEARCH_ANSWER_ENABLED` is unset/0, so answer generation is opt-out.
     FeatureDisabled,
-    /// The feature is requested but `KITANI_API_KEY` is absent/empty.
+    /// The feature is requested but neither `SEARCH_LLM_API_KEY` nor `KITANI_API_KEY` is set.
     MissingKey,
 }
 
@@ -42,7 +44,7 @@ impl Disabled {
                 "answer generation disabled (SEARCH_ANSWER_ENABLED is unset or 0)"
             }
             Disabled::MissingKey => {
-                "answer generation disabled (KITANI_API_KEY is not set)"
+                "answer generation disabled (SEARCH_LLM_API_KEY / KITANI_API_KEY is not set)"
             }
         }
     }
@@ -80,9 +82,10 @@ pub fn is_enabled() -> bool {
     }
 }
 
-/// The API key, read only from `KITANI_API_KEY`. Never logged or persisted.
+/// The API key, read from `SEARCH_LLM_API_KEY` (preferred) or `KITANI_API_KEY`. Never logged or
+/// persisted, and never read from a file.
 pub fn api_key() -> Option<String> {
-    env_trim("KITANI_API_KEY")
+    env_trim("SEARCH_LLM_API_KEY").or_else(|| env_trim("KITANI_API_KEY"))
 }
 
 /// The reason the answerer is disabled. Only meaningful when [`AnswerConfig::from_env`] returns
@@ -114,8 +117,12 @@ fn is_reasoning_model(model: &str) -> bool {
 impl AnswerConfig {
     /// Build the configuration from the environment.
     ///
+    /// Each vendor-neutral `SEARCH_LLM_*` variable wins when set; the vendor-specific
+    /// `SEARCH_ANSWER_*` (and `KITANI_API_KEY`) variable is the fallback, so existing deployments
+    /// keep working unchanged.
+    ///
     /// Returns `Err(Disabled::FeatureDisabled)` when `SEARCH_ANSWER_ENABLED` is unset/0 and
-    /// `Err(Disabled::MissingKey)` when the feature is on but `KITANI_API_KEY` is absent.
+    /// `Err(Disabled::MissingKey)` when the feature is on but neither key is set.
     pub fn from_env() -> Result<AnswerConfig, Disabled> {
         if !is_enabled() {
             return Err(Disabled::FeatureDisabled);
@@ -124,11 +131,14 @@ impl AnswerConfig {
             return Err(Disabled::MissingKey);
         }
 
-        let base_url = env_trim("SEARCH_ANSWER_BASE_URL")
+        let base_url = env_trim("SEARCH_LLM_BASE_URL")
+            .or_else(|| env_trim("SEARCH_ANSWER_BASE_URL"))
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let model = env_trim("SEARCH_ANSWER_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model = env_trim("SEARCH_LLM_MODEL")
+            .or_else(|| env_trim("SEARCH_ANSWER_MODEL"))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
         let mut timeout_ms = env_trim("SEARCH_ANSWER_TIMEOUT_MS")
             .and_then(|v| v.parse::<u64>().ok())
@@ -160,5 +170,102 @@ impl AnswerConfig {
             concurrency,
             cache_dir: resolve_cache_dir(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Environment variables are process-global; serialize the tests that mutate them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const VARS: [&str; 7] = [
+        "SEARCH_ANSWER_ENABLED",
+        "SEARCH_LLM_BASE_URL",
+        "SEARCH_LLM_API_KEY",
+        "SEARCH_LLM_MODEL",
+        "SEARCH_ANSWER_BASE_URL",
+        "SEARCH_ANSWER_MODEL",
+        "KITANI_API_KEY",
+    ];
+
+    /// Clear every variable `from_env` reads and run `f`; restore afterwards even on panic.
+    fn with_clean_env<F: FnOnce()>(f: F) {
+        let saved: Vec<(&str, Option<String>)> =
+            VARS.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+        for n in VARS {
+            std::env::remove_var(n);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (n, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn search_llm_vars_take_precedence_over_answer_specific() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
+            std::env::set_var("SEARCH_LLM_BASE_URL", "https://neutral.example/v1");
+            std::env::set_var("SEARCH_LLM_API_KEY", "neutral-key");
+            std::env::set_var("SEARCH_LLM_MODEL", "neutral-model");
+            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://kitani.example/v1");
+            std::env::set_var("SEARCH_ANSWER_MODEL", "kitani-model");
+            std::env::set_var("KITANI_API_KEY", "kitani-key");
+
+            let cfg = AnswerConfig::from_env().expect("neutral config");
+            assert_eq!(cfg.base_url, "https://neutral.example/v1");
+            assert_eq!(cfg.model, "neutral-model");
+            assert_eq!(api_key().as_deref(), Some("neutral-key"));
+        });
+    }
+
+    #[test]
+    fn answer_and_kitani_vars_remain_the_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
+            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://kitani.example/v1/");
+            std::env::set_var("SEARCH_ANSWER_MODEL", "kitani-model");
+            std::env::set_var("KITANI_API_KEY", "kitani-key");
+
+            let cfg = AnswerConfig::from_env().expect("fallback config");
+            assert_eq!(
+                cfg.base_url, "https://kitani.example/v1",
+                "trailing slash trimmed"
+            );
+            assert_eq!(cfg.model, "kitani-model");
+            assert_eq!(api_key().as_deref(), Some("kitani-key"));
+        });
+    }
+
+    #[test]
+    fn neither_key_disables_with_missing_key() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
+            assert!(AnswerConfig::from_env().is_err());
+            assert_eq!(disabled_reason(), Disabled::MissingKey);
+        });
+    }
+
+    #[test]
+    fn feature_disabled_is_reported_first() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            assert_eq!(
+                AnswerConfig::from_env().expect_err("off by default"),
+                Disabled::FeatureDisabled
+            );
+        });
     }
 }
