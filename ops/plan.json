@@ -129,7 +129,16 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:16:23+0200: 52.3 docs/min, load1 2.09/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T06:30:10+0200: 68.8 docs/min, load1 3.77/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+    },
+    {
+      "id": "sidecar-refresh",
+      "kind": "auto",
+      "status": "in_progress",
+      "title": "Rebuild the graph and dense sidecars when the serving index generation changes",
+      "detail": "The engine's extra lanes read sidecars (graph/entities.bin, vectors.bin) that go stale whenever the index is rebuilt. Both are rebuildable from the index alone, so this is additive: when the serving generation changes, run embed build then graph build detached and collect the result on a later cycle. A graph build over 19k documents measured 495 s, so it must never run inside a cycle.",
+      "verify": "both sidecars exist and are newer than the generation they were built for; the generation is recorded in ops/state.json.",
+      "evidence": "rebuilding sidecars for generation 19254 (started 2026-10-11T06:30:10+0200)"
     }
   ]
 }
