@@ -212,3 +212,7 @@ ops/watch.lock
 ops/watch.log
 ops/dispatch-*.log
 ops/research-*.log
+
+# Regenerated every cycle by the watcher; updated in place, never committed.
+docs/PROGRESS.md
+ops/plan.json

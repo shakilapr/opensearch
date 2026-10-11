@@ -1023,10 +1023,9 @@ def main() -> int:
             for it in plan["items"]:
                 if it["kind"] == "ops":
                     gate_ops(plan, it)
+            # Just write the two files. They are regenerated every cycle, so committing them
+            # only produced a stream of 'progress-watch checkpoint' commits that said nothing.
             render(metrics, plan)
-            sh("git add ops/plan.json docs/PROGRESS.md && "
-               "git diff --cached --quiet || "
-               "git commit -q -m 'chore(ops): progress-watch checkpoint'")
             log(
                 f"cycle done: live_gen={metrics['index_generation_live']} local_gen={metrics['index_generation_local']} "
                 f"cache={metrics['llm_cache_entries']} export_running={metrics['export_running']}"
