@@ -7,7 +7,7 @@ use search_engine::{
     build_plan, variant_preserves_constraints, Budget, IndexStats, Intent, Mode, Predicate,
     PredicateKind, QueryAnalysis, StopReason, VariantOrigin,
 };
-use search_engine::plan::{mode_deadline_ms, MAX_QUERY_VARIANTS};
+use search_engine::plan::{mode_deadline_ms, size_first_pass_top_k, MAX_QUERY_VARIANTS};
 use search_engine::LaneId;
 
 fn stats() -> IndexStats {
@@ -306,4 +306,35 @@ fn remaining_ms_saturates_and_never_panics_before_start() {
 fn stop_no_action_names_the_reason() {
     let b = Budget::for_mode(Mode::Auto, mode_deadline_ms(Mode::Auto));
     assert_eq!(b.stop_no_action(), Some(StopReason::NoAdmissibleAction));
+}
+
+// ---------------------------------------------------------------------------
+// §8/§17 first-pass candidate-limit sizing (scan-cost attribution)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn first_pass_breadth_scales_with_the_requested_limit() {
+    // A request for `limit` results needs a small multiple of that per lane, floored per mode
+    // so fusion/rerank keeps a pool. `docs = 10_000` means the mode ceiling has no corpus bonus.
+    assert_eq!(size_first_pass_top_k(Mode::Auto, 10_000, 10), 30, "10 * 3");
+    assert_eq!(size_first_pass_top_k(Mode::Auto, 10_000, 50), 100, "clamped at the Auto ceiling");
+    assert_eq!(size_first_pass_top_k(Mode::Auto, 10_000, 1), 20, "floored at the Auto floor");
+    // Fast/Deep floors are ordered, so the modes stay monotone at a tiny limit.
+    assert_eq!(size_first_pass_top_k(Mode::Fast, 10_000, 1), 10);
+    assert_eq!(size_first_pass_top_k(Mode::Deep, 10_000, 1), 40);
+}
+
+#[test]
+fn first_pass_breadth_never_exceeds_the_plan_ceiling_and_is_monotone() {
+    let s = stats();
+    for mode in [Mode::Fast, Mode::Auto, Mode::Deep] {
+        let ceiling = build_plan(&conceptual_analysis(), &s, mode).per_lane_top_k;
+        let mut prev = 0usize;
+        for limit in [1usize, 5, 10, 25, 50, 100, 500] {
+            let got = size_first_pass_top_k(mode, s.docs, limit);
+            assert!(got <= ceiling, "{mode:?} limit={limit}: {got} > ceiling {ceiling}");
+            assert!(got >= prev, "{mode:?}: breadth must not shrink as limit grows");
+            prev = got;
+        }
+    }
 }

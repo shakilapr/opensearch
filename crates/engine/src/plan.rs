@@ -240,6 +240,25 @@ fn per_lane_top_k(mode: Mode, docs: u64) -> usize {
     base + bonus
 }
 
+/// §8/§17 first-pass candidate-limit sizing, derived from the scan-cost attribution.
+///
+/// [`Plan::per_lane_top_k`] is the mode's *ceiling* (100–300 hits per lane). The first pass
+/// does not need that depth: the eval attributes retrieval latency almost entirely to
+/// `index_scan_limit`, and the result set is bounded by the caller's `limit`. A request for
+/// `limit` results needs only a small multiple of that per lane — fusion and reranking work
+/// on the head, and the coordinator widens (2×) when coverage is insufficient, so a shallow
+/// first pass costs recall only on the queries that would have widened anyway. Floored per
+/// mode so fusion and reranking still have a pool, and never above the plan's ceiling.
+pub fn size_first_pass_top_k(mode: Mode, docs: u64, limit: usize) -> usize {
+    let floor = match mode {
+        Mode::Fast => 10,
+        Mode::Auto => 20,
+        Mode::Deep => 40,
+    };
+    let ceiling = per_lane_top_k(mode, docs);
+    limit.saturating_mul(3).max(floor).min(ceiling)
+}
+
 /// §8: reject a rewrite that drops negation, an identifier, a date, or a mandatory constraint.
 ///
 /// Concretely, the variant is rejected when it:
