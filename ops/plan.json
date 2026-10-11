@@ -104,11 +104,11 @@
     {
       "id": "references-repos",
       "kind": "auto",
-      "status": "in_progress",
+      "status": "done",
       "title": "Clone the reference repositories for analysis",
       "detail": "Clone depth-1 each repo listed in ops/references.json into references/repos/<name> (gitignored, never served). Skip what already exists, at most two per cycle so a cycle stays short, and record a per-repo failure honestly rather than retrying forever.",
       "verify": "references/repos/<name> exists for every entry of ops/references.json, or the failure is recorded per repo.",
-      "evidence": "cloned 4/6"
+      "evidence": "cloned 6/6: tantivy, seismic, pisa, pyserini, splade, faiss"
     },
     {
       "id": "index-model-improvement",
@@ -129,7 +129,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:08:29+0200: 124.6 docs/min, load1 6.42/16 cores, 13 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T06:08:56+0200: 132.7 docs/min, load1 6.4/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     }
   ]
 }
