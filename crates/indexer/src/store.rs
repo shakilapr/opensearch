@@ -540,7 +540,12 @@ impl Indexer {
             let mut cand = Candidate::from_doc(&searcher, addr, &self.fields, score, provenance)?;
             if let Some(g) = generator.as_mut() {
                 let stored: TantivyDocument = searcher.doc(addr).ix()?;
-                let fragment = g.snippet_from_doc(&stored).to_html();
+                // `.fragment()`, not `.to_html()`: the HTML form wraps every matched term in
+                // `<b>`/`</b>`, which is markup the snippet contract does not promise and a
+                // text-rendering client shows literally — a live result read
+                // "… DAST <b>winter</b> update 2025 …". Highlighting is a presentation decision, and
+                // this one is not made here: the snippet is plain text.
+                let fragment = g.snippet_from_doc(&stored).fragment().to_string();
                 if !fragment.trim().is_empty() {
                     cand.snippet = fragment;
                 }
@@ -878,6 +883,27 @@ mod tests {
     fn doc(id: &str, title: &str, body: &str) -> IndexDoc {
         IndexDoc::new(id, format!("res_{id}"), format!("https://example.com/{id}"), title, body)
             .with_version(1)
+    }
+
+    #[test]
+    fn a_snippet_carries_no_markup() {
+        // The snippet contract is plain text. Tantivy's `.to_html()` wraps matches in <b>, and a
+        // text-rendering client shows the tags literally — observed live as
+        // "… DAST <b>winter</b> update 2025 …".
+        let (_t, idx) = tmp();
+        idx.index_batch(vec![doc(
+            "d1",
+            "Winter update",
+            "the winter release notes describe the winter changes in detail",
+        )])
+        .unwrap();
+        let hits = idx.search("winter", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(!snippet.contains("<b>"), "no highlight markup: {snippet:?}");
+        assert!(!snippet.contains("</b>"), "no highlight markup: {snippet:?}");
+        assert!(!snippet.contains('<'), "no angle brackets at all: {snippet:?}");
+        assert!(snippet.to_lowercase().contains("winter"), "the text is still there: {snippet:?}");
     }
 
     #[test]

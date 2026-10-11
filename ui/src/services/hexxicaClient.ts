@@ -100,6 +100,19 @@ function isSearchResponse(data: unknown): data is RawSearchResponse {
   return Array.isArray(data.results);
 }
 
+/**
+ * Remove highlight markup from a snippet.
+ *
+ * The API returns plain text (its snippet generator no longer emits HTML), but a response cached
+ * before that fix — or served by an older index — can still carry Tantivy's `<b>`/`</b>` tags, and a
+ * client that renders text shows them literally: a live result read "… DAST <b>winter</b> update
+ * 2025 …". Stripping here means the UI can never display markup as content, whatever the server
+ * sends. Highlighting is a presentation decision this UI simply does not make.
+ */
+function stripHighlightMarkup(text: string): string {
+  return text.replace(/<\/?b>/gi, '');
+}
+
 function asString(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
 }
@@ -271,7 +284,7 @@ function mapResult(raw: unknown, maxScore: number): SearchResult | null {
     title: title.length > 0 ? title : url,
     url,
     displayUrl: buildDisplayUrl(url, hostname),
-    snippet: asString(raw.snippet, ''),
+    snippet: stripHighlightMarkup(asString(raw.snippet, '')),
     category: 'all',
     score: normalizedScore,
     publishedAt: toIsoOrNow(raw.published_at ?? raw.fetched_at),

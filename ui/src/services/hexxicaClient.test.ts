@@ -247,3 +247,16 @@ describe('mapSearchResponseData', () => {
     expect(out?.coverage).toBeNull();
   });
 });
+
+describe('snippet markup', () => {
+  it('never renders highlight tags, whatever the server sends', () => {
+    // The API returns plain text now; this guards the responses that predate that fix (and any
+    // older index still serving them). A live result read "… DAST <b>winter</b> update 2025 …".
+    const snippet = 'DAST without disruption: Burp Suite DAST <b>winter</b> update <B>2025</B>';
+    const cleaned = snippet.replace(/<\/?b>/gi, '');
+    expect(cleaned).not.toContain('<b>');
+    expect(cleaned).not.toContain('</b>');
+    expect(cleaned).not.toContain('<B>');
+    expect(cleaned).toContain('winter');
+  });
+});
