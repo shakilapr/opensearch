@@ -84,6 +84,7 @@
 //! is not rewired because doing so would require changing another crate.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -589,6 +590,11 @@ struct Drainer {
     /// Every URL enqueued-but-not-yet-logged (queued + in-flight); persisted to
     /// `frontier.json` so a kill loses nothing.
     remaining: BTreeSet<String>,
+    /// Last time the pending frontier was written. The frontier is rewritten in
+    /// full, so doing it after every completion is O(N) per document and O(N²)
+    /// over a run; it is only a resumability hint (the log is the source of
+    /// truth for done URLs), so it is throttled.
+    last_persist: Instant,
     counters: Counters,
 }
 
@@ -623,6 +629,7 @@ impl Drainer {
             attempts: 0,
             ingested: 0,
             remaining: BTreeSet::new(),
+            last_persist: Instant::now(),
             counters: Counters::default(),
         }
     }
@@ -704,7 +711,17 @@ impl Drainer {
         soonest.unwrap_or(Duration::ZERO)
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
+        // The frontier is a resumability hint, not a correctness boundary: every
+        // terminal URL is already in the log, and an un-logged URL that falls out
+        // of a stale frontier is simply rediscovered. Rewriting the whole set on
+        // every completion is O(N) per document and dominated the run, so cap it
+        // at one write every two seconds.
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_persist) < Duration::from_secs(2) {
+            return;
+        }
+        self.last_persist = now;
         persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
     }
 
@@ -955,7 +972,7 @@ impl Drainer {
             "outcome": per.outcome,
             "error": per.error,
         });
-        if let Err(e) = append_log_atomic(&self.log_path, &line.to_string()) {
+        if let Err(e) = append_log_line(&self.log_path, &line.to_string()) {
             eprintln!("failed to append crawl log line: {e}");
         }
     }
@@ -1469,11 +1486,22 @@ fn persist_frontier(path: &Path, urls: impl Iterator<Item = String>) {
     }
 }
 
-fn append_log_atomic(path: &Path, line: &str) -> std::io::Result<()> {
-    let mut buf = std::fs::read(path).unwrap_or_default();
+fn append_log_line(path: &Path, line: &str) -> std::io::Result<()> {
+    // A true append, not a read-whole-file + rewrite. The previous shape read the
+    // entire log, appended one line and rewrote it atomically, which made the k-th
+    // document O(k): a 250K-document shard re-wrote ~20 MB per line, hundreds of
+    // gigabytes of needless I/O over the run, all of it counted as idle CPU
+    // (iowait) while the box looked unused. The log is append-only JSONL and the
+    // resume reader already ignores an unparseable trailing line, so a plain
+    // O_APPEND write of one whole line is both correct and O(1).
+    let mut buf = Vec::with_capacity(line.len() + 1);
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
-    write_atomic(path, &buf)
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(&buf)
 }
 
 /// Write `bytes` to `path` atomically (temp file + rename).
@@ -1864,5 +1892,32 @@ mod tests {
         assert_eq!(resolve_concurrency(None, Some("nope".into())), DEFAULT_CONCURRENCY);
         // A zero bound is clamped to 1, never a wedged crawl.
         assert_eq!(resolve_concurrency(Some(0), None), 1);
+    }
+
+    /// The log must be appended in place (O(1)) and a torn final write must not
+    /// hide the lines before it, or a crash mid-run would lose the resume state.
+    #[test]
+    fn log_append_is_incremental_and_tolerates_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crawl-log.jsonl");
+        append_log_line(&path, r#"{"url":"https://a/","outcome":"ingested"}"#).unwrap();
+        append_log_line(&path, r#"{"url":"https://b/","outcome":"ingested"}"#).unwrap();
+        // A crash mid-write leaves a partial, unparseable final line.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"url\":\"https://c/\"").unwrap();
+        }
+        let seen = read_log_urls(&path).unwrap();
+        assert!(seen.contains("https://a/"), "first good line survives");
+        assert!(seen.contains("https://b/"), "second good line survives");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            3,
+            "each append grows the file by one line instead of rewriting it"
+        );
     }
 }

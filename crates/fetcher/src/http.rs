@@ -16,6 +16,21 @@ use crate::validators::{ValidatorStore, Validators};
 /// Default per-request timeout when the caller does not set one.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Default TCP connect timeout. A host that never completes the handshake (a
+/// blackhole, a SYN drop, a DNS answer with a dead address) would otherwise
+/// hold one of the crawl's concurrency slots for the full
+/// [`DEFAULT_TIMEOUT_MS`] — the measured mean fetch latency sat at ~25–29 s
+/// against a 30 s request timeout, i.e. most slots were parked on connections
+/// that never produced a byte. Bounding the handshake frees the slot in
+/// seconds and lets it go to an origin that actually answers.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+/// Default per-read (idle) timeout. This bounds a server that accepts the
+/// connection and then stalls mid-response without capping a legitimately
+/// large-but-progressing download (each read still has to arrive within the
+/// window). Without it a tarpit holds a slot until the total timeout.
+pub const DEFAULT_READ_TIMEOUT_MS: u64 = 15_000;
+
 /// Default accepted content types. A source's CrawlPolicy can override this via
 /// [`Fetcher::with_allowed_types`]; an empty list accepts everything.
 const DEFAULT_ALLOWED_TYPES: &[&str] = &["text/*", "application/xhtml+xml", "application/json"];
@@ -25,6 +40,10 @@ pub struct Fetcher {
     limits: Limits,
     user_agent: String,
     timeout: Duration,
+    /// Bounds the TCP/TLS handshake (see [`DEFAULT_CONNECT_TIMEOUT_MS`]).
+    connect_timeout: Duration,
+    /// Bounds each individual read (see [`DEFAULT_READ_TIMEOUT_MS`]).
+    read_timeout: Duration,
     /// Empty means "accept any content type".
     allowed_types: Vec<String>,
     /// TEST-ONLY: when set, loopback/private addresses are not rejected by the
@@ -93,18 +112,20 @@ impl Fetcher {
 
     fn build(limits: Limits, user_agent: String, timeout_ms: u64, allowed_types: Vec<String>) -> Self {
         let timeout = Duration::from_millis(timeout_ms);
-        let client = reqwest::Client::builder()
-            .user_agent(user_agent.clone())
-            // Redirects are handled manually so each hop is SSRF-validated.
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .build()
-            .expect("failed to build reqwest client");
+        let connect_timeout = Duration::from_millis(env_ms(
+            "SEARCH_HTTP_CONNECT_TIMEOUT_MS",
+            DEFAULT_CONNECT_TIMEOUT_MS,
+        ));
+        let read_timeout =
+            Duration::from_millis(env_ms("SEARCH_HTTP_READ_TIMEOUT_MS", DEFAULT_READ_TIMEOUT_MS));
+        let client = build_client(&user_agent, timeout, connect_timeout, read_timeout);
         Self {
             client,
             limits,
             user_agent,
             timeout,
+            connect_timeout,
+            read_timeout,
             allowed_types,
             allow_private_for_tests: false,
         }
@@ -129,7 +150,34 @@ impl Fetcher {
     /// Override the per-request timeout in milliseconds.
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout = Duration::from_millis(timeout_ms);
+        self.rebuild_client();
         self
+    }
+
+    /// Override the TCP/TLS connect timeout in milliseconds.
+    pub fn with_connect_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.connect_timeout = Duration::from_millis(timeout_ms);
+        self.rebuild_client();
+        self
+    }
+
+    /// Override the per-read (idle) timeout in milliseconds.
+    pub fn with_read_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.read_timeout = Duration::from_millis(timeout_ms);
+        self.rebuild_client();
+        self
+    }
+
+    /// Rebuild the HTTP client from the current timeout fields. Needed because
+    /// `reqwest::Client` is immutable once built, so the `with_*` overrides
+    /// above must construct a fresh one.
+    fn rebuild_client(&mut self) {
+        self.client = build_client(
+            &self.user_agent,
+            self.timeout,
+            self.connect_timeout,
+            self.read_timeout,
+        );
     }
 
     pub fn user_agent(&self) -> &str {
@@ -449,6 +497,35 @@ fn net_err(e: reqwest::Error) -> AppError {
     AppError::Network(e.to_string())
 }
 
+/// Build the shared HTTP client with the redirect, total, connect and read
+/// timeouts applied. Redirects are handled manually so each hop is
+/// SSRF-validated.
+fn build_client(
+    user_agent: &str,
+    timeout: Duration,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(user_agent.to_string())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .expect("failed to build reqwest client")
+}
+
+/// Read a millisecond timeout from the environment, falling back to `default`
+/// when it is absent, non-numeric or zero.
+fn env_ms(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 fn allowed_from(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
@@ -467,5 +544,43 @@ mod tests {
         let f = Fetcher::new(Limits::default(), "TestBot/0.1".into());
         assert_eq!(f.user_agent(), "TestBot/0.1");
         assert_eq!(f.limits().max_response_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn env_ms_reads_a_positive_override_and_rejects_junk() {
+        let var = "SEARCH_TEST_ENV_MS";
+        std::env::set_var(var, "250");
+        assert_eq!(env_ms(var, 1), 250);
+        std::env::set_var(var, "0");
+        assert_eq!(env_ms(var, 7), 7, "zero falls back to the default");
+        std::env::set_var(var, "nope");
+        assert_eq!(env_ms(var, 7), 7, "junk falls back to the default");
+        std::env::remove_var(var);
+    }
+
+    /// A server that accepts the connection and then never writes must not hold
+    /// the caller for the full request timeout: the read timeout has to cut it
+    /// loose, otherwise a single tarpit parks a crawl concurrency slot.
+    #[tokio::test]
+    async fn read_timeout_bounds_a_stalled_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let f = Fetcher::new(Limits::default(), "TestBot/0.1".into())
+            .allow_private_addresses_for_tests(true)
+            .with_read_timeout_ms(200);
+        let started = std::time::Instant::now();
+        let res = f.fetch(&format!("http://{addr}/"), None, None).await;
+        assert!(res.is_err(), "a stalled server must error, not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by the read timeout, took {:?}",
+            started.elapsed()
+        );
     }
 }
