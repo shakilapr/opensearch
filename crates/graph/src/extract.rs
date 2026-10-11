@@ -265,7 +265,7 @@ pub fn extract_mentions(text: &str, min_count: usize, limit: usize) -> Vec<Menti
         while end + 1 < words.len()
             && words[end + 1].2
             && is_mentionish(&words[end + 1].1.text)
-            && end + 1 - k + 1 <= MAX_PHRASE_WORDS
+            && end + 1 - k < MAX_PHRASE_WORDS
         {
             end += 1;
         }
@@ -274,7 +274,7 @@ pub fn extract_mentions(text: &str, min_count: usize, limit: usize) -> Vec<Menti
             start += 1;
         }
         let mut last = end;
-        while last >= start + 1 && is_stopword(&words[last].1.text) {
+        while last > start && is_stopword(&words[last].1.text) {
             last -= 1;
         }
         if start <= last {
