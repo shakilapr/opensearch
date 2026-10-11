@@ -129,7 +129,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "2026-10-11T06:08:56+0200: 132.7 docs/min, load1 6.4/16 cores, 4 crawler process(es), 0 shard(s) stopped"
+      "evidence": "2026-10-11T06:16:22+0200: 55.1 docs/min, load1 2.09/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     }
   ]
 }
