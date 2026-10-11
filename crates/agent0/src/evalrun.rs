@@ -259,8 +259,9 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
         }
     }
     // The attribution line: the candidate limit the scan actually ran with, and the index
-    // layout it ran against. `index_scan_limit` is 10 for the legacy path and the engine's
-    // per-lane breadth (up to 200) for the engine path — the cause of the scan-cost gap.
+    // layout it ran against. `index_scan_limit` is 10 for the legacy path; for the engine path
+    // it is the first-pass per-lane breadth, now sized to the requested limit (see
+    // `search_engine::plan::size_first_pass_top_k`) rather than the mode ceiling of up to 200.
     if !stage_gauge.is_empty() {
         println!("  scan config (per query):");
         for (name, mut v) in stage_gauge {

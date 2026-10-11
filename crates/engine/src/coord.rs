@@ -16,7 +16,7 @@ use crate::budget::{Budget, StopReason};
 use crate::diversify::{diversify, DiversityConfig, Scored};
 use crate::evidence::{evidence_coverage, EvidenceRecord, EvidenceVerifier, Support};
 use crate::fuse::{fuse, fuse_families, run_cascade, CascadeInput, FusionPolicy, LaneHits};
-use crate::plan::{build_plan, IndexStats, Mode, Plan};
+use crate::plan::{build_plan, size_first_pass_top_k, IndexStats, Mode, Plan};
 use crate::planner::QueryPlanner;
 use crate::timing;
 use crate::units::QueryUnit;
@@ -211,7 +211,12 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         None => analysis.concepts.clear(),
     }
 
-    let plan = build_plan(&analysis, &deps.stats, req.mode);
+    let mut plan = build_plan(&analysis, &deps.stats, req.mode);
+    // The plan's `per_lane_top_k` is the mode ceiling; size the actual first-pass scan to the
+    // request. The scan cost the eval attributes to retrieval is `index_scan_limit`, and the
+    // caller's `limit` bounds what the scan has to feed — see `size_first_pass_top_k`.
+    plan.per_lane_top_k =
+        plan.per_lane_top_k.min(size_first_pass_top_k(req.mode, deps.stats.docs, req.limit));
     timing::record("planning", t_planning);
     let mut budget = Budget::for_mode(req.mode, req.deadline_ms);
     budget.start(0);

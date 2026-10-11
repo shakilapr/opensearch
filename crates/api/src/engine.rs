@@ -1091,11 +1091,12 @@ mod tests {
         let value = |name: &str| gauges.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
         assert_eq!(value("base_segments"), Some(1), "segment count is attributed");
         assert_eq!(value("index_docs"), Some(235_204));
-        // Auto: base 100 + one per 100k docs (room 100) = 102 on this corpus.
+        // Auto with limit 10: the first-pass scan is sized to the request (10 * 3 = 30),
+        // bounded by the mode ceiling (base 100 + one per 100k docs = 102 on this corpus).
         assert_eq!(
             value("index_scan_limit"),
-            Some(102),
-            "the engine's per-lane breadth is the candidate limit the scan ran with"
+            Some(30),
+            "the first-pass scan is sized to the requested limit, not the mode ceiling"
         );
     }
 
