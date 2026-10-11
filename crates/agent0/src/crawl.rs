@@ -32,20 +32,25 @@
 //!
 //! ## Discovery + draining
 //!
-//! Seeds are discovered in concurrent chunks: every unseen seed in a chunk is
+//! Seeds are discovered in a continuously-refilled window: every unseen seed is
 //! expanded with the existing discovery path ([`Pipeline::discover`]: robots.txt
 //! `Sitemap:` lines, sitemap indexes, feeds advertised by the seed HTML) **and**
 //! by re-fetching the advertised sitemap/feed bodies and re-parsing them with
 //! `search_discovery::{parse_sitemap, parse_feed, sitemaps_in_robots,
-//! sitemap_index_urls}`. One task per seed means a chunk touches many origins at
-//! once (never two simultaneous requests to the same host), and the next chunk's
-//! discovery is started before the current chunk is drained so the network-bound
-//! discovery overlaps the CPU-bound drain. The queue therefore holds many
-//! origins at once and the cross-origin concurrency bound is actually filled —
-//! discovering and draining one seed at a time parked the whole run inside a
-//! single origin and left the box idle with work queued. Every discovered URL
-//! enters the same queue (`frontier.json`) after dedup against the log and the
-//! queue.
+//! sitemap_index_urls}`. One task per seed means the window touches many origins
+//! at once (never two simultaneous requests to the same host).
+//!
+//! Discovery results are **streamed**: the moment a seed's discovery task
+//! finishes, its URL set is enqueued and the seed is drained while the other
+//! discovery tasks are still in flight, and the freed window slot is refilled
+//! with the next seed. The drain therefore never waits for the slowest chain in
+//! a batch. An earlier shape joined the *whole* chunk before draining anything,
+//! so one slow origin (or a widened window) left every concurrency slot idle —
+//! the box read a fraction of its cores with work queued. Because each seed is a
+//! distinct origin and its discovered URLs are same-origin, a seed's drain can
+//! overlap another seed's discovery without ever hitting one host twice. Every
+//! discovered URL enters the same queue (`frontier.json`) after dedup against the
+//! log and the queue.
 //!
 //! ## Link following
 //!
@@ -112,29 +117,29 @@ const DEFAULT_MAX_DOCS: usize = 10_000;
 ///
 /// The crawl is network-I/O bound: at concurrency 8 a 16-core box sat at ~30%
 /// CPU and ~66 docs/min, while the implied fetch latency (concurrency /
-/// throughput ≈ 29 s) showed the fetches were simply not overlapped. 64 slots
+/// throughput ≈ 29 s) showed the fetches were simply not overlapped. 128 slots
 /// per process keeps the core's parse/index work busy without touching the
 /// per-origin politeness floor (one request in flight per origin, plus the
-/// configured interval), so no host is ever hammered.
-const DEFAULT_CONCURRENCY: usize = 64;
+/// configured interval), so no host is ever hammered. It is the *global* fetch
+/// bound, not a per-host one: with the discovery window feeding many distinct
+/// origins, more slots mean more origins resolving, parsing and indexing at once.
+const DEFAULT_CONCURRENCY: usize = 128;
 /// Default per-origin minimum interval between requests (milliseconds).
 const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 
-/// Seeds discovered in parallel per discovery chunk, as a multiple of
-/// `--concurrency`.
+/// Seeds discovered concurrently, as a multiple of `--concurrency`.
 ///
 /// Discovery is a *chain* of network round-trips per seed (robots.txt →
-/// sitemaps → feeds → the seed page), so parking one chunk of `concurrency`
-/// seeds only ever keeps `concurrency` requests in flight; the drain then sits
-/// idle waiting for the chunk to finish and the box reads a fraction of its
-/// cores while work is queued. The drain's in-flight bound stays `concurrency`
-/// (still one request in flight per origin, plus the configured interval), but
-/// the discovery fan-out is decoupled from it and widened here: a chunk keeps
-/// many more distinct hosts resolving and parsing at once, which is what fills
-/// the CPU between fetches. Host politeness is unchanged — every seed in a
-/// chunk is a distinct origin, so no host is hit by two discovery tasks at
-/// once. Override the absolute window with `SEARCH_CRAWL_DISCOVERY_WINDOW`.
-const DISCOVERY_WINDOW_FACTOR: usize = 8;
+/// sitemaps → feeds → the seed page). A wide window keeps many distinct hosts
+/// resolving and parsing at once, which is what fills the CPU between fetches.
+/// It is deliberately decoupled from the drain's own `--concurrency` bound: the
+/// drain still respects `--concurrency` (one request in flight per origin, plus
+/// the configured interval), while discovery runs wider. Each discovery task
+/// holds at most one socket, so the window is sized to stay inside the usual
+/// 1024 fd budget alongside the drain's in-flight fetches (4× concurrency =
+/// 512 at the default, +128 drain slots ≈ 640). Override the absolute window
+/// with `SEARCH_CRAWL_DISCOVERY_WINDOW`.
+const DISCOVERY_WINDOW_FACTOR: usize = 4;
 
 /// Base delay applied to an origin after its first HTTP 429. Consecutive 429s
 /// from the same origin double this (`1s`, `2s`, `4s`, ...) up to
@@ -452,17 +457,15 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
 
     let seeds = parse_seeds(&opts.seeds_file)?;
 
-    // Discovery and draining run together, in chunks of seeds.
+    // Discovery and draining run together, streamed seed by seed.
     //
-    // The old shape discovered ONE seed and then drained its (single-origin)
-    // queue to empty before touching the next, so at most one host was ever in
-    // flight: the concurrency slots sat idle, the box read ~16% CPU with work
-    // queued, and every origin took its turn being hammered. Here a whole chunk
-    // of seeds is discovered concurrently — each task owns a distinct origin, so
-    // no host is hit twice at once, and that host diversity is also what defuses
-    // a 429 storm — and the next chunk's discovery is spawned BEFORE the current
-    // chunk is drained, so the network-bound discovery overlaps the CPU-bound
-    // drain. The drain then sees many origins and fills its slots.
+    // The old shape discovered a whole chunk and only drained it once every task
+    // in the chunk had finished, so the drain sat idle behind the slowest of
+    // hundreds of discovery chains (and widening the window made that tail
+    // longer, not shorter). Here each seed's discovery result is enqueued the
+    // moment its task completes and the freed window slot is immediately refilled
+    // with the next seed, so the network-bound discovery and the CPU-bound drain
+    // overlap continuously and the concurrency slots stay full.
     //
     // This runs BEFORE the resumed backlog on purpose. The pending frontier
     // left by a previous run can be dominated by one host's sitemap (a live
@@ -471,22 +474,21 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // seeds listed below were never even discovered. Seeds first makes a
     // resumed crawl breadth-first; the stale backlog goes last, and the
     // document bound normally stops the run before reaching it.
-    let chunk_size = discovery_window(
+    let window = discovery_window(
         opts.concurrency,
         std::env::var("SEARCH_CRAWL_DISCOVERY_WINDOW").ok(),
     );
     let follow_links = opts.follow_links;
     let mut next_seed = 0usize;
-    let mut chunk: Vec<String> = Vec::new();
-    let mut discovery: JoinSet<Vec<String>> = JoinSet::new();
+    let mut discovery: JoinSet<(String, Vec<String>)> = JoinSet::new();
+    let mut drain_set: JoinSet<PerUrl> = JoinSet::new();
 
-    // Prime the first chunk; its tasks discover while this task waits on them.
-    spawn_discovery_chunk(
+    // Prime the window; the tasks discover while this task reaps and drains.
+    fill_discovery(
         &mut discovery,
-        &mut chunk,
         &seeds,
         &mut next_seed,
-        chunk_size,
+        window,
         &pipeline,
         &fetcher,
         follow_links,
@@ -494,42 +496,83 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     );
 
     loop {
-        // Collect the in-flight chunk (spawned last iteration or above) and
-        // enqueue everything it found. Joining here is also what lets the
-        // previous `drain.run()` overlap this discovery.
-        while let Some(res) = discovery.join_next().await {
-            for u in res.unwrap_or_default() {
-                drain.enqueue(u);
+        // Stream every completed discovery task: enqueue its URLs and seed, then
+        // refill the window so discovery never ramps down between batches.
+        while let Some(res) = discovery.try_join_next() {
+            if let Ok((seed, urls)) = res {
+                for u in urls {
+                    drain.enqueue(u);
+                }
+                drain.enqueue_seed(seed);
             }
         }
-        for seed in chunk.drain(..) {
-            drain.enqueue_seed(seed);
-        }
-        drain.persist();
-
-        // The seed list is exhausted and everything it produced has drained.
-        if next_seed >= seeds.len() && drain.queues_empty() {
-            break;
-        }
-        if drain.bound_reached() {
-            break;
-        }
-
-        // Start the next chunk discovering before draining this one so the two
-        // overlap.
-        spawn_discovery_chunk(
+        fill_discovery(
             &mut discovery,
-            &mut chunk,
             &seeds,
             &mut next_seed,
-            chunk_size,
+            window,
             &pipeline,
             &fetcher,
             follow_links,
             &drain.seen,
         );
 
-        drain.run().await;
+        // Reap finished fetches and dispatch new ones (never blocks).
+        drain.pump(&mut drain_set);
+
+        // The seed list is exhausted, discovery has quiesced and everything it
+        // produced has drained.
+        if next_seed >= seeds.len()
+            && discovery.is_empty()
+            && drain.queues_empty()
+            && drain_set.is_empty()
+        {
+            break;
+        }
+        if drain.bound_reached() {
+            break;
+        }
+
+        // Block until the next event so neither discovery nor the drain can idle
+        // the task while the other has work.
+        if !discovery.is_empty() {
+            tokio::select! {
+                Some(res) = discovery.join_next() => {
+                    if let Ok((seed, urls)) = res {
+                        for u in urls {
+                            drain.enqueue(u);
+                        }
+                        drain.enqueue_seed(seed);
+                    }
+                }
+                Some(res) = drain_set.join_next(), if !drain_set.is_empty() => {
+                    drain.handle(res);
+                    drain.persist();
+                }
+            }
+        } else if !drain_set.is_empty() {
+            if let Some(res) = drain_set.join_next().await {
+                drain.handle(res);
+                drain.persist();
+            }
+        } else {
+            // Nothing in flight: queued URLs are waiting out the per-origin
+            // interval or a 429 backoff, or the remaining seeds were all seen.
+            // Nap briefly rather than spin; the next pass reaps or dispatches.
+            let d = drain.next_ready_delay();
+            let nap = if d.is_zero() {
+                Duration::from_millis(5)
+            } else {
+                d.min(Duration::from_millis(250))
+            };
+            tokio::time::sleep(nap).await;
+        }
+    }
+
+    // Reap any fetch still in flight when a bound ended the run, so its log line
+    // is written rather than dropped with the task set.
+    while let Some(res) = drain_set.join_next().await {
+        drain.handle(res);
     }
 
     // The pending frontier from a previous run, drained last: everything in it
@@ -773,47 +816,45 @@ impl Drainer {
         }
     }
 
+    /// One non-blocking scheduler pass: reap every completed fetch, then
+    /// dispatch as many new ones as the concurrency + per-origin politeness
+    /// allow. Returns how many completions were handled. Never awaits, so a
+    /// caller driving discovery and draining together can interleave the two.
+    fn pump(&mut self, joinset: &mut JoinSet<PerUrl>) -> usize {
+        let mut handled = 0;
+        while let Some(res) = joinset.try_join_next() {
+            self.handle(res);
+            self.persist();
+            handled += 1;
+        }
+        if !self.bound_reached() {
+            self.dispatch(joinset);
+        }
+        handled
+    }
+
     /// Drain the queue until it is empty or a bound is reached.
     async fn run(&mut self) {
         let mut joinset: JoinSet<PerUrl> = JoinSet::new();
         loop {
-            if self.in_flight == 0 {
+            self.pump(&mut joinset);
+            if joinset.is_empty() {
                 if self.queues_empty() || self.bound_reached() {
                     break;
                 }
-                let n = self.dispatch(&mut joinset);
-                if n == 0 {
-                    // Nothing dispatchable right now: the per-origin interval has
-                    // not elapsed, or every eligible origin is in 429 backoff.
-                    // Sleep until the earliest backoff lifts (bounded) rather
-                    // than spinning.
-                    let d = self.next_ready_delay();
-                    let nap = if d.is_zero() {
-                        Duration::from_millis(5)
-                    } else {
-                        d.min(Duration::from_millis(250))
-                    };
-                    tokio::time::sleep(nap).await;
+                // Nothing dispatchable right now: the per-origin interval has
+                // not elapsed, or every eligible origin is in 429 backoff.
+                // Sleep until the earliest backoff lifts (bounded) rather
+                // than spinning.
+                let d = self.next_ready_delay();
+                let nap = if d.is_zero() {
+                    Duration::from_millis(5)
                 } else {
-                    self.persist();
-                }
+                    d.min(Duration::from_millis(250))
+                };
+                tokio::time::sleep(nap).await;
                 continue;
             }
-
-            if let Some(res) = joinset.try_join_next() {
-                self.handle(res);
-                self.persist();
-                continue;
-            }
-
-            if !self.bound_reached() {
-                let n = self.dispatch(&mut joinset);
-                if n > 0 {
-                    self.persist();
-                    continue;
-                }
-            }
-
             if let Some(res) = joinset.join_next().await {
                 self.handle(res);
                 self.persist();
@@ -1126,25 +1167,26 @@ pub fn read_pipeline_bytes(cfg: &Config, content_id: &str) -> Option<Vec<u8>> {
 // Discovery
 // ---------------------------------------------------------------------------
 
-/// Start discovery for up to `chunk_size` not-yet-seen seeds from
-/// `seeds[*next..]`, spawning one task per seed into `discovery`.
+/// Top up the discovery window: start discovery for unseen seeds until
+/// `window` tasks are in flight (or the seed list is exhausted).
 ///
-/// Each task owns a distinct origin, so a chunk discovers many hosts
+/// Each task owns a distinct origin, so the window discovers many hosts
 /// concurrently without ever making two simultaneous requests to the same host.
-/// The returned URLs are enqueued by the caller once the chunk's tasks complete.
+/// A task returns `(seed, urls)`; the caller enqueues both the moment the task
+/// completes, so discovery and draining overlap continuously instead of the
+/// drain waiting for a whole batch.
 #[allow(clippy::too_many_arguments)]
-fn spawn_discovery_chunk(
-    discovery: &mut JoinSet<Vec<String>>,
-    chunk: &mut Vec<String>,
+fn fill_discovery(
+    discovery: &mut JoinSet<(String, Vec<String>)>,
     seeds: &[String],
     next: &mut usize,
-    chunk_size: usize,
+    window: usize,
     pipeline: &Arc<Pipeline>,
     fetcher: &Arc<Fetcher>,
     follow_links: bool,
     seen: &HashSet<String>,
 ) {
-    while *next < seeds.len() && chunk.len() < chunk_size {
+    while *next < seeds.len() && discovery.len() < window {
         let seed = seeds[*next].clone();
         *next += 1;
         if seen.contains(&seed) {
@@ -1153,9 +1195,10 @@ fn spawn_discovery_chunk(
         let pl = pipeline.clone();
         let ft = fetcher.clone();
         let seed_for_task = seed.clone();
-        discovery
-            .spawn(async move { discover_seed_urls(&pl, &ft, &seed_for_task, follow_links).await });
-        chunk.push(seed);
+        discovery.spawn(async move {
+            let urls = discover_seed_urls(&pl, &ft, &seed_for_task, follow_links).await;
+            (seed_for_task, urls)
+        });
     }
 }
 
