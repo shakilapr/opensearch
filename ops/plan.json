@@ -84,17 +84,18 @@
     {
       "id": "research-index-algorithms",
       "kind": "research",
-      "status": "todo",
+      "status": "done",
       "model": "apizio/t/sonar",
       "title": "Research the state of the art for fast sparse retrieval, early termination and candidate pruning",
       "detail": "Question: for a LOCAL index of 19k-231k documents sitting on one box, what are the current (2024-2026) best techniques to make a top-k lexical or learned-sparse query fast: early termination (WAND/BlockMax-WAND and successors), block-max and superblock pruning, candidate-limit sizing, segment layouts and query parallelism, and doc-side weighting (learned sparse) instead of query-side expansion. For each: how it works in one paragraph, what it costs, what it buys, and whether it applies to a Tantivy-backed engine. Cite every claim with a link to the paper or repo.",
       "output": "references/research/index-algorithms.md",
-      "verify": "references/research/index-algorithms.md exists, is at least 1500 characters, cites sources with links, and ends with a ranked list of techniques applicable to our engine."
+      "verify": "references/research/index-algorithms.md exists, is at least 1500 characters, cites sources with links, and ends with a ranked list of techniques applicable to our engine.",
+      "evidence": "references/research/index-algorithms.md (9,078 chars) - captured from the session transcript"
     },
     {
       "id": "research-search-engine-choice",
       "kind": "research",
-      "status": "todo",
+      "status": "in_progress",
       "model": "apizio/t/sonar",
       "title": "Research why people choose particular search engines, and what that means for ours",
       "detail": "Question: why do people choose and stay with particular search engines (Google, Bing, Brave, DuckDuckGo, Kagi, Perplexity, Marginalia, and agent-native tools), and what makes them switch? Separate the factors: result quality, latency, privacy/trust, transparency and control, familiarity, price and lock-in, and the ability to verify or cite. For each factor, evidence and sources. Then the actionable half: which of these can a LOCAL, agent-native engine with real crawled data and honest empty states actually win on, and what concrete features would it take? Cite sources with links.",
@@ -113,7 +114,7 @@
     {
       "id": "index-model-improvement",
       "kind": "code",
-      "status": "blocked",
+      "status": "todo",
       "deps": [
         "research-index-algorithms",
         "references-repos"
@@ -129,7 +130,7 @@
       "title": "Watch crawl throughput against the resources actually available, and act",
       "detail": "MEASURED ISSUE: the crawl is slow while the host is idle. Each cycle records documents/minute per shard, core count, load average and how many crawler processes are alive, then acts: restart a stopped shard when load is low, and report a measured concurrency recommendation (never raise concurrency on a guess - a first attempt at 16-way was measured slower than the serial version).",
       "verify": "docs/min, cores and load1 recorded every cycle; underuse stated with a number; a stopped shard restarted when the host is idle.",
-      "evidence": "MEASURED 2026-10-11: 76,349 error/timeout lines across the shard logs, dominated by ~39,700 HTTP 429s (10,412/10,187/9,736/9,358 per shard) plus ~1,800 DNS failures; 94 docs/min at load 3.77-12.7 on 16 cores."
+      "evidence": "2026-10-11T06:37:26+0200: 73.6 docs/min, load1 14.6/16 cores, 4 crawler process(es), 0 shard(s) stopped"
     },
     {
       "id": "sidecar-refresh",
