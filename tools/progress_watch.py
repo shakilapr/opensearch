@@ -287,6 +287,12 @@ def collect() -> dict:
         # was ALWAYS True: the watcher could not see a stopped shard, never restarted one, and
         # reported a dead-but-present process as healthy. Shard 3 sat deadlocked for five hours
         # behind that one expression.
+        #
+        # Staleness alone is NOT enough to call a shard dead: a healthy crawler can go minutes
+        # between ingested documents while it works through slow hosts (shard 2 was observed quiet
+        # for 6.5 minutes with six open sockets and a live WAL). The deadlocked shard's signature
+        # was stale AND socketless: 33 threads parked on futex_wait_queue, ZERO open sockets, no
+        # index writes. So require both: nothing written for SHARD_STALL_S and no sockets open.
         logf = FLEET / f"shard-{s}.log"
         proc = sh(f"pgrep -f 'crawl /var/lib/search-fleet/work/shard-{s}' | head -1")[1].strip()
         age = None
@@ -295,13 +301,21 @@ def collect() -> dict:
                 age = int(time.time() - logf.stat().st_mtime)
             except OSError:
                 age = None
-        stalled = age is not None and age > SHARD_STALL_S
+        sockets = None
+        if proc:
+            rc, out = sh(f"ls -l /proc/{proc}/fd 2>/dev/null | grep -c socket")
+            try:
+                sockets = int(out.strip().splitlines()[0])
+            except (ValueError, IndexError):
+                sockets = None
+        stalled = age is not None and age > SHARD_STALL_S and sockets == 0
         entry = {
             "docs": docs,
             "raw_bytes": dir_bytes(REPO / "raw-dataset" / f"shard-{s}"),
             "pack_records": pack_records(s),
             "pid": proc or None,
             "log_age_s": age,
+            "sockets": sockets,
             "stalled": stalled,
             "running": bool(proc) and not stalled,
         }
