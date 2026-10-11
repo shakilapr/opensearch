@@ -14,6 +14,7 @@ pub mod evidence;
 pub mod fuse;
 pub mod plan;
 pub mod planner;
+pub mod timing;
 pub mod units;
 
 pub use analyze::{

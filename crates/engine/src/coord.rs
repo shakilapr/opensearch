@@ -18,6 +18,7 @@ use crate::evidence::{evidence_coverage, EvidenceRecord, EvidenceVerifier, Suppo
 use crate::fuse::{fuse, fuse_families, run_cascade, CascadeInput, FusionPolicy, LaneHits};
 use crate::plan::{build_plan, IndexStats, Mode, Plan};
 use crate::planner::QueryPlanner;
+use crate::timing;
 use crate::units::QueryUnit;
 use crate::LaneId;
 
@@ -182,7 +183,10 @@ impl Selector for RuleSelector {
 /// The §18 loop. Never blocks past the deadline; a request with no neural lane still returns
 /// its best eligible lexical results.
 pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
+    // Diagnostic timers (no-op unless the caller enabled `crate::timing`).
+    let t_analysis = timing::start();
     let mut analysis = analyze_query(&req.query, deps.now, req.tz_offset_min);
+    timing::record("analysis", t_analysis);
     let mut trace: Vec<String> = Vec::new();
 
     // §6/§8 — expansion probes come from the injected planner, never from splitting the query.
@@ -190,6 +194,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     // re-searching them as separate probes adds nothing the original lane did not already
     // return and dilutes precision. So with no planner they are cleared rather than launched;
     // with one, its expansions replace them and §8 caps and constraint-checks them.
+    let t_planning = timing::start();
     match deps.planner {
         Some(p) => {
             let planned = p.plan(&req.query, &analysis);
@@ -207,6 +212,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     }
 
     let plan = build_plan(&analysis, &deps.stats, req.mode);
+    timing::record("planning", t_planning);
     let mut budget = Budget::for_mode(req.mode, req.deadline_ms);
     budget.start(0);
 
@@ -241,6 +247,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         // §8: "Search the original query in its own lane" — the original is the first variant,
         // family 0 — then each capped, constraint-preserving expansion, tagged with its family so
         // §10's family cap keeps a cluster of rewrites from outvoting the original.
+        let t_retrieval = timing::start();
         let mut launched = 0usize;
         for variant in &plan.query_variants {
             if variant.text.trim().is_empty() {
@@ -258,10 +265,13 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                 }
             }
         }
+        timing::record("retrieval", t_retrieval);
         state.candidates = launched;
+        let t_evidence = timing::start();
         refresh_evidence(
             &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
         );
+        timing::record("evidence", t_evidence);
         trace.push(evidence_line(&records));
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     } else {
@@ -327,6 +337,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         round = round.saturating_add(1);
         state.completed_rounds = round;
 
+        let t_retrieval = timing::start();
         match &action {
             Action::Widen { lane } => {
                 state.widened.push(*lane);
@@ -387,11 +398,14 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             }
             Action::Abstain => {}
         }
+        timing::record("retrieval", t_retrieval);
 
         state.candidates = raw_hits.iter().map(|(_, h)| h.ranked.len()).sum();
+        let t_evidence = timing::start();
         refresh_evidence(
             &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
         );
+        timing::record("evidence", t_evidence);
         trace.push(evidence_line(&records));
         plateau = note_coverage(&mut prev_coverage, coverage.coverage, plateau);
     }
@@ -401,6 +415,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     let mut stop_reason = state.stop_reason.unwrap_or(StopReason::BudgetExhausted);
 
     // ---- Finalize: fuse, cascade, diversify, emit rows (§18 tail). ----
+    let t_fusion = timing::start();
     let collapsed = collapse_lane_hits(&raw_hits);
     // §10: fuse within each variant family, then cap every rewrite family's combined weight
     // against the original's, so a handful of expansions cannot outvote the query the user
@@ -437,7 +452,9 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         })
         .collect();
     let diversified = diversify(scored, req.limit, &DiversityConfig::default());
+    timing::record("fusion", t_fusion);
 
+    let t_assembly = timing::start();
     let results: Vec<ResultRow> = diversified
         .into_iter()
         .map(|s| {
@@ -488,6 +505,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         }
     }
 
+    timing::record("engine_assembly", t_assembly);
     SearchResponse { results, coverage, stop_reason, trace, answer }
 }
 
@@ -663,6 +681,7 @@ fn call_searcher(
     seen_sources: &mut Vec<String>,
     family: u8,
 ) -> Result<usize, String> {
+    timing::count("searcher_calls");
     let cands = searcher.search(query, limit, source).map_err(|e| e.to_string())?;
     let mut lane_order: Vec<LaneId> = Vec::new();
     let mut groups: Vec<Vec<String>> = Vec::new();

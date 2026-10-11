@@ -163,19 +163,44 @@ pub fn stop_reason_name(reason: StopReason) -> &'static str {
 /// Every returned hit is retained in a shared `doc_id -> IndexHit` map so the
 /// caller can re-hydrate the engine's doc ids into full results (see
 /// [`run_engine_search`]).
+///
+/// The two index-backed lanes (bm25 and source_first) wrap the *same* [`Searcher`] and,
+/// absent source routing, are handed the same `(query, limit, source)` on every
+/// coordinator round. Left uncached, each round therefore issues the identical index scan
+/// twice — measured as the dominant cost of the whole request. A request-scoped cache
+/// keyed on the exact arguments makes the second lane reuse the first lane's hits. The
+/// candidates each lane returns are unchanged (the lane stamp is applied after the cache),
+/// so fusion, provenance, and ranking are byte-identical.
 pub struct SearcherLane<'a, S: Searcher + ?Sized> {
     searcher: &'a S,
     lane: Lane,
     retained: Arc<Mutex<HashMap<String, IndexHit>>>,
+    cache: SearchCache,
 }
 
+/// Cache key: the exact arguments that determine the underlying index result.
+type SearchKey = (String, usize, Option<String>);
+/// Request-scoped memo of successful `Searcher::search` calls, shared by the lanes.
+pub type SearchCache = Arc<Mutex<HashMap<SearchKey, Arc<Vec<IndexHit>>>>>;
+
 impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
-    /// A lane adapter stamping every candidate with `lane`.
+    /// A lane adapter stamping every candidate with `lane`, with its own (unshared) cache.
     pub fn new(searcher: &'a S, lane: Lane) -> Self {
         Self {
             searcher,
             lane,
             retained: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A lane adapter sharing `cache` with the other lanes of the same request.
+    pub fn with_cache(searcher: &'a S, lane: Lane, cache: SearchCache) -> Self {
+        Self {
+            searcher,
+            lane,
+            retained: Arc::new(Mutex::new(HashMap::new())),
+            cache,
         }
     }
 
@@ -188,6 +213,37 @@ impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
     pub fn retained(&self) -> Arc<Mutex<HashMap<String, IndexHit>>> {
         Arc::clone(&self.retained)
     }
+
+    /// The underlying hits for `(query, limit, source)`, reusing a prior lane's result when
+    /// the same scan has already run this request. Errors are not cached.
+    fn cached_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        source_id: Option<&str>,
+    ) -> Result<Arc<Vec<IndexHit>>, RetrievalError> {
+        let key: SearchKey = (query.to_string(), limit, source_id.map(str::to_string));
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(hits) = guard.get(&key) {
+                search_engine::timing::count("cache_hits");
+                return Ok(Arc::clone(hits));
+            }
+        }
+        search_engine::timing::count("index_scans");
+        let filters = source_id.map(|s| SearchFilters {
+            source_id: Some(s.to_string()),
+            ..Default::default()
+        });
+        let hits = self
+            .searcher
+            .search(query, limit, filters.as_ref())
+            .map_err(RetrievalError::index)?;
+        let arc = Arc::new(hits);
+        if let Ok(mut guard) = self.cache.lock() {
+            guard.entry(key).or_insert_with(|| Arc::clone(&arc));
+        }
+        Ok(arc)
+    }
 }
 
 impl<S: Searcher + ?Sized> LaneSearcher for SearcherLane<'_, S> {
@@ -197,36 +253,29 @@ impl<S: Searcher + ?Sized> LaneSearcher for SearcherLane<'_, S> {
         limit: usize,
         source_id: Option<&str>,
     ) -> Result<Vec<Candidate>, RetrievalError> {
-        let filters = source_id.map(|s| SearchFilters {
-            source_id: Some(s.to_string()),
-            ..Default::default()
-        });
-        let hits = self
-            .searcher
-            .search(query, limit, filters.as_ref())
-            .map_err(RetrievalError::index)?;
+        let hits = self.cached_hits(query, limit, source_id)?;
 
         let mut out: Vec<Candidate> = Vec::with_capacity(hits.len());
         // Retain every returned hit so the caller can hydrate results, even the
         // ones dropped by the source backstop below (a superset is harmless).
         if let Ok(mut map) = self.retained.lock() {
-            for h in &hits {
+            for h in hits.iter() {
                 map.entry(h.doc_id.clone()).or_insert_with(|| h.clone());
             }
         }
-        for h in hits {
+        for h in hits.iter() {
             if let Some(src) = source_id {
                 if h.source_id.as_deref() != Some(src) {
                     continue;
                 }
             }
             out.push(Candidate {
-                doc_id: h.doc_id,
+                doc_id: h.doc_id.clone(),
                 score: h.score,
                 lane: self.lane,
-                source_id: h.source_id,
-                title: Some(h.title),
-                url: Some(h.url),
+                source_id: h.source_id.clone(),
+                title: Some(h.title.clone()),
+                url: Some(h.url.clone()),
             });
         }
         Ok(out)
@@ -567,6 +616,8 @@ pub fn run_engine_search(
     extra_lanes: &ExtraLanes,
 ) -> AppResult<EngineSearchResponse> {
     let started = Instant::now();
+    // Diagnostic timer: everything before the engine loop (graph probe, manifest, lane wiring).
+    let t_api_pre = search_engine::timing::start();
 
     let query = req.base.query.trim().to_string();
     if query.is_empty() {
@@ -594,9 +645,13 @@ pub fn run_engine_search(
     };
 
     // Two lane adapters: the global lexical lane and the source-first
-    // accelerator (both stamped so per-result `lane_ranks` is meaningful).
-    let lane_bm25 = SearcherLane::new(searcher, Lane::Bm25);
-    let lane_source = SearcherLane::new(searcher, Lane::SourceFirst);
+    // accelerator (both stamped so per-result `lane_ranks` is meaningful). They wrap the
+    // same searcher and are issued the same query each round, so they share one
+    // request-scoped cache: the second lane reuses the first's hits instead of
+    // repeating the index scan (see `SearcherLane`).
+    let search_cache: SearchCache = Arc::new(Mutex::new(HashMap::new()));
+    let lane_bm25 = SearcherLane::with_cache(searcher, Lane::Bm25, Arc::clone(&search_cache));
+    let lane_source = SearcherLane::with_cache(searcher, Lane::SourceFirst, Arc::clone(&search_cache));
     let retained_bm25 = lane_bm25.retained();
     let retained_source = lane_source.retained();
     // The two index-backed lanes always run; any injected lane (today: the dense lane over the
@@ -645,7 +700,10 @@ pub fn run_engine_search(
         planner,
     };
 
+    search_engine::timing::record("api_pre", t_api_pre);
     let engine_resp = search_engine::run_search(core_req, &deps);
+    // Diagnostic timer: hydrating doc ids, re-analysing for signals, and assembling the response.
+    let t_api_assembly = search_engine::timing::start();
 
     // ---- Hydrate the engine's doc ids back onto real hits. ----
     let mut docmap: HashMap<String, IndexHit> = HashMap::new();
@@ -714,6 +772,7 @@ pub fn run_engine_search(
         contradicted_units: cov.contradicted_units.clone(),
     };
 
+    search_engine::timing::record("api_assembly", t_api_assembly);
     Ok(EngineSearchResponse {
         query_analysis: analysis,
         results,
@@ -836,5 +895,70 @@ mod tests {
         assert_eq!(a.len(), VERIFY_SCAN_TOKENS);
         let b = doc_tokens(&cache, &long, "d1");
         assert!(Arc::ptr_eq(&a, &b), "second call must reuse the cached tokens");
+    }
+
+    #[test]
+    fn identical_lane_searches_share_one_index_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSearcher {
+            calls: AtomicUsize,
+        }
+        impl Searcher for CountingSearcher {
+            fn search(
+                &self,
+                _q: &str,
+                limit: usize,
+                _f: Option<&SearchFilters>,
+            ) -> AppResult<Vec<IndexHit>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = limit;
+                Ok(vec![IndexHit {
+                    doc_id: "d1".to_string(),
+                    version: 1,
+                    resource_id: "r1".to_string(),
+                    work_id: None,
+                    content_id: None,
+                    url: "https://example.test/d1".to_string(),
+                    title: "Doc One".to_string(),
+                    snippet: "snippet".to_string(),
+                    source_id: Some("news".to_string()),
+                    doc_type: None,
+                    language: None,
+                    published_at: None,
+                    modified_at: None,
+                    fetched_at: 0,
+                    lane: "lexical_base".to_string(),
+                    provenance: search_core::Provenance::Snapshot,
+                    score: 1.0,
+                    signals: Vec::new(),
+                }])
+            }
+        }
+
+        let s = CountingSearcher { calls: AtomicUsize::new(0) };
+        let cache: SearchCache = Arc::new(Mutex::new(HashMap::new()));
+        let bm25 = SearcherLane::with_cache(&s, Lane::Bm25, Arc::clone(&cache));
+        let source = SearcherLane::with_cache(&s, Lane::SourceFirst, Arc::clone(&cache));
+
+        let a = bm25.search("rust async", 5, None).unwrap();
+        // The second lane issues the identical scan: it must reuse the first's hits.
+        let b = source.search("rust async", 5, None).unwrap();
+
+        assert_eq!(s.calls.load(Ordering::SeqCst), 1, "identical scan runs once");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].doc_id, b[0].doc_id);
+        // Each lane still stamps its own lane id, so per-result provenance is preserved.
+        assert_eq!(a[0].lane, Lane::Bm25);
+        assert_eq!(b[0].lane, Lane::SourceFirst);
+
+        // A different limit is a different scan.
+        let _ = bm25.search("rust async", 6, None).unwrap();
+        assert_eq!(s.calls.load(Ordering::SeqCst), 2);
+
+        // Same query and limit but a source filter is a different scan.
+        let _ = bm25.search("rust async", 5, Some("news")).unwrap();
+        assert_eq!(s.calls.load(Ordering::SeqCst), 3);
     }
 }
