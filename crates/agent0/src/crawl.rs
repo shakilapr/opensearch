@@ -120,6 +120,22 @@ const DEFAULT_CONCURRENCY: usize = 64;
 /// Default per-origin minimum interval between requests (milliseconds).
 const DEFAULT_ORIGIN_INTERVAL_MS: u64 = 1000;
 
+/// Seeds discovered in parallel per discovery chunk, as a multiple of
+/// `--concurrency`.
+///
+/// Discovery is a *chain* of network round-trips per seed (robots.txt →
+/// sitemaps → feeds → the seed page), so parking one chunk of `concurrency`
+/// seeds only ever keeps `concurrency` requests in flight; the drain then sits
+/// idle waiting for the chunk to finish and the box reads a fraction of its
+/// cores while work is queued. The drain's in-flight bound stays `concurrency`
+/// (still one request in flight per origin, plus the configured interval), but
+/// the discovery fan-out is decoupled from it and widened here: a chunk keeps
+/// many more distinct hosts resolving and parsing at once, which is what fills
+/// the CPU between fetches. Host politeness is unchanged — every seed in a
+/// chunk is a distinct origin, so no host is hit by two discovery tasks at
+/// once. Override the absolute window with `SEARCH_CRAWL_DISCOVERY_WINDOW`.
+const DISCOVERY_WINDOW_FACTOR: usize = 8;
+
 /// Base delay applied to an origin after its first HTTP 429. Consecutive 429s
 /// from the same origin double this (`1s`, `2s`, `4s`, ...) up to
 /// [`MAX_RATE_LIMIT_BACKOFF_MS`]. A server-supplied `Retry-After` overrides the
@@ -369,6 +385,18 @@ fn resolve_concurrency(flag: Option<usize>, env: Option<String>) -> usize {
         .max(1)
 }
 
+/// Seeds to discover in parallel for one chunk.
+///
+/// `SEARCH_CRAWL_DISCOVERY_WINDOW` sets the absolute window; otherwise the
+/// fetch concurrency is widened by [`DISCOVERY_WINDOW_FACTOR`]. Never below 1,
+/// so a crawl always makes progress.
+fn discovery_window(concurrency: usize, env: Option<String>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| concurrency.max(1).saturating_mul(DISCOVERY_WINDOW_FACTOR))
+        .max(1)
+}
+
 // ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
@@ -443,7 +471,10 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // seeds listed below were never even discovered. Seeds first makes a
     // resumed crawl breadth-first; the stale backlog goes last, and the
     // document bound normally stops the run before reaching it.
-    let chunk_size = opts.concurrency.max(1);
+    let chunk_size = discovery_window(
+        opts.concurrency,
+        std::env::var("SEARCH_CRAWL_DISCOVERY_WINDOW").ok(),
+    );
     let follow_links = opts.follow_links;
     let mut next_seed = 0usize;
     let mut chunk: Vec<String> = Vec::new();
@@ -1892,6 +1923,22 @@ mod tests {
         assert_eq!(resolve_concurrency(None, Some("nope".into())), DEFAULT_CONCURRENCY);
         // A zero bound is clamped to 1, never a wedged crawl.
         assert_eq!(resolve_concurrency(Some(0), None), 1);
+    }
+
+    #[test]
+    fn discovery_window_widens_concurrency_and_honours_override() {
+        // The window is the fetch concurrency widened by the factor, so a chunk
+        // parks many more hosts in flight than the drain's own bound.
+        assert_eq!(discovery_window(32, None), 32 * DISCOVERY_WINDOW_FACTOR);
+        assert_eq!(discovery_window(64, None), 64 * DISCOVERY_WINDOW_FACTOR);
+        // A zero concurrency is clamped to 1 before widening: never zero work.
+        assert_eq!(discovery_window(0, None), DISCOVERY_WINDOW_FACTOR);
+        // An absolute override wins, whitespace tolerated.
+        assert_eq!(discovery_window(8, Some("256".into())), 256);
+        assert_eq!(discovery_window(8, Some("  512 ".into())), 512);
+        // A zero/invalid/non-positive override falls back to the widened default.
+        assert_eq!(discovery_window(8, Some("0".into())), 8 * DISCOVERY_WINDOW_FACTOR);
+        assert_eq!(discovery_window(8, Some("nope".into())), 8 * DISCOVERY_WINDOW_FACTOR);
     }
 
     /// The log must be appended in place (O(1)) and a torn final write must not
