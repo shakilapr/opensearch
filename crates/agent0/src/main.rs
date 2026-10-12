@@ -423,10 +423,46 @@ async fn run_export(args: &[String]) -> ExitCode {
     // The index is the source of truth: its STOREd fields carry url/title/body.
     let (pages, skipped) = search_agent0::portable::pages_from_docs(&docs, limit);
 
-    let mut failed_pages = 0usize;
-    let (records, mode): (Vec<search_dataset::Record>, &str) = if raw {
-        let recs = pages.iter().map(search_agent0::portable::raw_record).collect();
-        (recs, "raw")
+    // Incremental, resumable export. Each chunk of pages is organised, written to disk and
+    // checkpointed (a shard + the manifest), so a kill — `timeout`, a reboot, a crash — keeps
+    // everything written so far and the next run *continues* instead of starting from zero.
+    // Before this, the whole record set was buffered and written once at the end: a 6-hour export
+    // of ~87k pages produced an empty directory every time and could never finish.
+    const CHUNK: usize = 500;
+    let mut writer = match search_dataset::PackWriter::open(&out_dir, &name, &version, CHUNK) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("failed to open the pack at {}: {e}", out_dir.display());
+            return ExitCode::from(1);
+        }
+    };
+    let already = match writer.existing_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("failed to read the existing pack: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let resumed = !already.is_empty();
+    // Resume by content: a page whose record id is already on disk is not exported twice.
+    let pending: Vec<search_organize::RawPage> = pages
+        .into_iter()
+        .filter(|p| !already.contains(&search_organize::id_from_url(&p.url)))
+        .collect();
+
+    let mode = if raw { "raw" } else { "organized" };
+    if resumed {
+        println!(
+            "resuming: {} record(s) already in {}, {} page(s) left to do",
+            writer.records(),
+            out_dir.display(),
+            pending.len()
+        );
+    }
+
+    // The organize client is built once, and only when the model is actually needed.
+    let client = if raw {
+        None
     } else {
         let llm_cfg = match search_organize::LlmConfig::from_env() {
             Ok(c) => c,
@@ -444,43 +480,80 @@ async fn run_export(args: &[String]) -> ExitCode {
         let cache_dir = std::env::var("SEARCH_LLM_CACHE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| cfg.data_dir.join("llm-cache"));
-        let client = match search_organize::LlmClient::new(llm_cfg, cache_dir, concurrency) {
-            Ok(c) => c,
+        match search_organize::LlmClient::new(llm_cfg, cache_dir, concurrency) {
+            Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("failed to build the organize client: {e}");
                 return ExitCode::from(1);
             }
-        };
-        println!(
-            "organizing {} page(s) with the cheap model (concurrency {concurrency}); \
-             cached completions are free re-runs",
-            pages.len()
-        );
-        match search_organize::organize_all_lenient(&client, pages).await {
-            (r, failures) => {
-                let stats = client.cache_stats();
-                eprintln!(
-                    "cache: {} hit(s), {} miss(es), {} entr(ies)",
-                    stats.hits, stats.misses, stats.entries
-                );
-                for f in &failures {
-                    eprintln!("organize: page failed ({}): {}", f.url, f.error);
-                }
-                failed_pages = failures.len();
-                if r.is_empty() {
-                    eprintln!("organize: no page could be organized; refusing to write an empty pack");
-                    return ExitCode::from(1);
-                }
-                (r, "organized")
-            }
         }
     };
 
-    let count = records.len();
-    let manifest = match search_dataset::write_pack(&out_dir, &name, &version, records, 500) {
+    let total_chunks = pending.len().div_ceil(CHUNK);
+    let mut failed_pages = 0usize;
+    if !pending.is_empty() {
+        println!(
+            "organizing {} page(s) with the cheap model ({} chunk(s) of {CHUNK}); \
+             cached completions are free re-runs",
+            pending.len(),
+            total_chunks
+        );
+    }
+
+    for (i, chunk) in pending.chunks(CHUNK).enumerate() {
+        let records: Vec<search_dataset::Record> = match client.as_ref() {
+            // `--raw`: the crawler's own fields, no model.
+            None => chunk.iter().map(search_agent0::portable::raw_record).collect(),
+            Some(client) => {
+                let (records, failures) =
+                    search_organize::organize_all_lenient(client, chunk.to_vec()).await;
+                for f in &failures {
+                    eprintln!("organize: page failed ({}): {}", f.url, f.error);
+                }
+                failed_pages += failures.len();
+                records
+            }
+        };
+
+        for record in records {
+            if let Err(e) = writer.push(record) {
+                eprintln!("failed to write a record: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        // Checkpoint: the shard and its manifest entry are on disk before the next chunk starts.
+        match writer.flush() {
+            Ok(m) => println!(
+                "checkpoint {}/{}: {} page(s) exported, {} record(s) on disk in {}",
+                i + 1,
+                total_chunks,
+                ((i + 1) * CHUNK).min(pending.len()),
+                m.records,
+                out_dir.display()
+            ),
+            Err(e) => {
+                eprintln!("failed to flush the pack: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    if let Some(client) = client.as_ref() {
+        let stats = client.cache_stats();
+        eprintln!(
+            "cache: {} hit(s), {} miss(es), {} entr(ies)",
+            stats.hits, stats.misses, stats.entries
+        );
+    }
+
+    if writer.records() == 0 {
+        eprintln!("no record could be written; refusing to report an empty pack");
+        return ExitCode::from(1);
+    }
+    let manifest = match writer.finish() {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("failed to write the pack to {}: {e}", out_dir.display());
+            eprintln!("failed to finalise the pack at {}: {e}", out_dir.display());
             return ExitCode::from(1);
         }
     };
@@ -491,9 +564,10 @@ async fn run_export(args: &[String]) -> ExitCode {
             "name": name,
             "version": version,
             "mode": mode,
-            "records": count,
+            "records": manifest.records,
             "pages_skipped": skipped,
             "pages_failed": failed_pages,
+            "resumed": resumed,
             "manifest": manifest,
         }))
         .unwrap()

@@ -61,6 +61,13 @@ the record text. Design points that matter in practice:
   measured at ~48 s.
 * **Partial batches survive.** One page failing does not discard the batch; failures are reported
   per URL and counted in the export summary.
+* **Incremental and resumable (`PackWriter`).** Records are written to disk as they are produced —
+  a shard every 500, with the manifest rewritten atomically after each one — so a killed export
+  keeps everything written so far. A re-run reads the record ids already in the pack and skips
+  those pages, continuing the same shards. Before this the record set was buffered and written
+  once at the end, so a 6-hour export of ~87k pages left an **empty** directory every time and
+  could never finish inside its timeout. Resume is by content (record id), not by count, so it
+  needs no bookkeeping file. A manifest that fails validation is an error, never a silent restart.
 
 Environment: `KITANI_API_KEY` (required; never hardcoded), `KITANI_BASE_URL`,
 `KITANI_MODEL` (default `deepseek/deepseek-v4.1-flash`),

@@ -1,5 +1,6 @@
 //! Release packs: JSONL shards + a checksummed manifest, and the write/validate round-trip.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -303,4 +304,165 @@ fn now_epoch() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// An **incremental, resumable** pack writer.
+///
+/// [`write_pack`] takes the whole record set and is all-or-nothing: an export that organises
+/// 87 000 pages through a slow model and is then killed (a `timeout`, a reboot) leaves **nothing**
+/// on disk, so every re-run starts from zero and a long export can never finish. This writer
+/// closes records to disk as they arrive — a shard per `shard_size` records, with the manifest
+/// rewritten atomically after each one — so an interrupted run keeps everything written so far and
+/// the next run continues it.
+///
+/// Resume is by content, not by count: [`existing_ids`](PackWriter::existing_ids) returns the
+/// record ids already on disk so the caller can skip pages it has already exported. The on-disk
+/// shape is exactly the one [`validate_pack`] checks (shards + checksummed manifest), so a pack
+/// written incrementally is a normal pack.
+pub struct PackWriter {
+    dir: PathBuf,
+    name: String,
+    version: String,
+    shard_size: usize,
+    shards: Vec<ShardInfo>,
+    total: u64,
+    buf: Vec<Record>,
+}
+
+impl PackWriter {
+    /// Open a pack directory for incremental writing, **resuming** one that already exists.
+    ///
+    /// With no `manifest.json` this starts a fresh pack. With one, the pack is validated first and
+    /// its shards are adopted, so new shards continue the same pack instead of overwriting it. A
+    /// manifest that does **not** validate is an error rather than a silent restart: starting over
+    /// would leave stale shards behind and could collide with their file names.
+    pub fn open(
+        dir: &Path,
+        name: &str,
+        version: &str,
+        shard_size: usize,
+    ) -> Result<Self, DatasetError> {
+        if shard_size == 0 {
+            return Err(DatasetError::Parse("shard_size must be greater than zero".into()));
+        }
+        if name.trim().is_empty() {
+            return Err(DatasetError::Parse("pack name must not be empty".into()));
+        }
+        std::fs::create_dir_all(dir)?;
+
+        let (shards, total) = if dir.join(MANIFEST_FILE).exists() {
+            let existing = validate_pack(dir)?;
+            (existing.shards, existing.records)
+        } else {
+            (Vec::new(), 0)
+        };
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            name: name.to_string(),
+            version: version.to_string(),
+            shard_size,
+            shards,
+            total,
+            buf: Vec::new(),
+        })
+    }
+
+    /// The record ids already present in the pack — the resume key set.
+    ///
+    /// Read from the shards themselves (after validating the pack), so a multi-record page and a
+    /// single-record page resume identically and no separate bookkeeping file can drift.
+    pub fn existing_ids(&self) -> Result<HashSet<String>, DatasetError> {
+        let mut ids = HashSet::new();
+        for shard in &self.shards {
+            let file = BufReader::new(std::fs::File::open(self.dir.join(&shard.path))?);
+            for line in file.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: Record = serde_json::from_str(&line)?;
+                ids.insert(record.id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// How many records are durably on disk.
+    pub fn records(&self) -> u64 {
+        self.total
+    }
+
+    /// Buffer a record. A full shard is written (and the manifest updated) immediately, so at most
+    /// `shard_size - 1` records are ever at risk.
+    pub fn push(&mut self, record: Record) -> Result<(), DatasetError> {
+        self.buf.push(record);
+        if self.buf.len() >= self.shard_size {
+            self.write_shard()?;
+        }
+        Ok(())
+    }
+
+    /// Write the buffered records as a shard and rewrite the manifest atomically. Cheap to call
+    /// often — call it at every natural checkpoint (a chunk of pages) so a kill loses one chunk.
+    pub fn flush(&mut self) -> Result<PackManifest, DatasetError> {
+        if !self.buf.is_empty() {
+            self.write_shard()?;
+        }
+        self.write_manifest()?;
+        Ok(self.manifest())
+    }
+
+    /// Flush and return the final manifest.
+    pub fn finish(mut self) -> Result<PackManifest, DatasetError> {
+        self.flush()?;
+        Ok(self.manifest())
+    }
+
+    /// The manifest as it would be written right now.
+    pub fn manifest(&self) -> PackManifest {
+        PackManifest {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            records: self.total,
+            shards: self.shards.clone(),
+            created_at: now_epoch(),
+            schema: PACK_SCHEMA,
+        }
+    }
+
+    fn write_shard(&mut self) -> Result<(), DatasetError> {
+        let mut bytes: Vec<u8> = Vec::new();
+        for record in &self.buf {
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
+        }
+
+        let path = format!("{}-{:05}.jsonl", self.name, self.shards.len());
+        let mut file = std::fs::File::create(self.dir.join(&path))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+
+        self.shards.push(ShardInfo {
+            path,
+            records: self.buf.len() as u64,
+            checksum: checksum_hex(&bytes),
+        });
+        self.total += self.buf.len() as u64;
+        self.buf.clear();
+        // The shard must be in the manifest as soon as it exists: an unlisted shard would be
+        // skipped by `validate_pack` and then overwritten by the next run's shard of the same
+        // index.
+        self.write_manifest()
+    }
+
+    /// Write the manifest through a temp file + rename so a kill mid-write cannot leave a
+    /// truncated manifest (which would make the pack unresumable).
+    fn write_manifest(&self) -> Result<(), DatasetError> {
+        let bytes = serde_json::to_vec_pretty(&self.manifest())?;
+        let tmp = self.dir.join(format!("{MANIFEST_FILE}.tmp"));
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, self.dir.join(MANIFEST_FILE))?;
+        Ok(())
+    }
 }

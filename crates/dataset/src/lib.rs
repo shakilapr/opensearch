@@ -19,7 +19,8 @@ mod time;
 
 pub use adapters::{CommonCrawlAdapter, OaiPmhAdapter, OpenAlexAdapter, WikidataAdapter};
 pub use pack::{
-    build_from_adapter, read_pack, validate_pack, write_pack, PackManifest, PackReader, ShardInfo,
+    build_from_adapter, read_pack, validate_pack, write_pack, PackManifest, PackReader, PackWriter,
+    ShardInfo,
 };
 
 /// Hard cap on `Record::text` (spec bound: 8 MiB per record).
