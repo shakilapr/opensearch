@@ -10,7 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use crate::cache::{cache_key_hash, count_entries, read_cache, write_cache_atomic};
 use crate::config::LlmConfig;
 use crate::error::OrganizeError;
-use crate::transport::{HttpTransport, Transport};
+use crate::transport::{FallbackTransport, HttpTransport, Transport};
 
 /// A snapshot of cache activity. `hits`/`misses` count `complete*` calls that were served from,
 /// or had to populate, the on-disk cache. `entries` is the number of `*.json` files on disk.
@@ -49,8 +49,25 @@ impl LlmClient {
             .api_key
             .clone()
             .ok_or_else(|| OrganizeError::MissingEnv("KITANI_API_KEY".to_string()))?;
-        let transport = HttpTransport::new(&cfg, api_key)?;
-        Self::with_transport(cfg, cache_dir, concurrency, Arc::new(transport))
+        let primary: Arc<dyn Transport> = Arc::new(HttpTransport::new(&cfg, api_key)?);
+        // kitani is the primary provider; cun.ai is the fallback, tried only when a primary call
+        // fails. With no fallback credential configured the primary is the only transport, so a
+        // single-provider deployment behaves exactly as before.
+        let transport: Arc<dyn Transport> = match crate::config::fallback_api_key() {
+            Some(fallback_key) => {
+                let mut fb = cfg.clone();
+                fb.base_url = crate::config::fallback_base_url();
+                fb.api_key = Some(fallback_key.clone());
+                let fallback = Arc::new(HttpTransport::new(&fb, fallback_key)?);
+                Arc::new(FallbackTransport::new(
+                    primary,
+                    fallback,
+                    crate::config::fallback_model(),
+                ))
+            }
+            None => primary,
+        };
+        Self::with_transport(cfg, cache_dir, concurrency, transport)
     }
 
     /// Hermetic-test constructor: identical cache/single-flight/concurrency semantics, with a

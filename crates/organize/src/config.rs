@@ -20,6 +20,38 @@ pub const DEFAULT_ESCALATE_MODEL: &str = "deepseek/deepseek-v4.1-flash-thinking"
 /// and the thinking model takes longer still. A short timeout turns those into hard failures.
 pub const DEFAULT_TIMEOUT_S: u64 = 180;
 
+/// Default base URL of the **fallback** provider (cun.ai), tried only when a primary call fails.
+pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://www.cun.ai/v1";
+/// Default **fallback** model id (cun.ai's DeepSeek-V4.1-Flash).
+pub const DEFAULT_FALLBACK_MODEL: &str = "DeepSeek-V4.1-Flash";
+
+fn env_trim(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
+/// [`DEFAULT_FALLBACK_BASE_URL`].
+pub fn fallback_base_url() -> String {
+    env_trim("SEARCH_LLM_FALLBACK_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_FALLBACK_BASE_URL.to_string())
+}
+
+/// The fallback provider's model id: `SEARCH_LLM_FALLBACK_MODEL`, else [`DEFAULT_FALLBACK_MODEL`].
+pub fn fallback_model() -> String {
+    env_trim("SEARCH_LLM_FALLBACK_MODEL").unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
+}
+
+/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CUN_API_KEY`.
+///
+/// `None` **disables** the fallback entirely — the primary provider is then the only one tried.
+/// A credential is read from the environment only, never from a file, never logged.
+pub fn fallback_api_key() -> Option<String> {
+    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
+}
+
 /// Resolved LLM configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmConfig {

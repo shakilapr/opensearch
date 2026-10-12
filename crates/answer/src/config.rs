@@ -26,6 +26,10 @@ pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const REASONING_MIN_TOKENS: u32 = 8192;
 /// Minimum timeout (ms) for a reasoning model.
 pub const REASONING_TIMEOUT_MS: u64 = 120_000;
+/// Default base URL of the **fallback** provider (cun.ai), tried only when a primary call fails.
+pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://www.cun.ai/v1";
+/// Default **fallback** model id (cun.ai's DeepSeek-V4.1-Flash).
+pub const DEFAULT_FALLBACK_MODEL: &str = "DeepSeek-V4.1-Flash";
 
 /// Why the answerer is disabled. Reported once by the serve wiring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +90,26 @@ pub fn is_enabled() -> bool {
 /// persisted, and never read from a file.
 pub fn api_key() -> Option<String> {
     env_trim("SEARCH_LLM_API_KEY").or_else(|| env_trim("KITANI_API_KEY"))
+}
+
+/// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
+/// [`DEFAULT_FALLBACK_BASE_URL`].
+pub fn fallback_base_url() -> String {
+    env_trim("SEARCH_LLM_FALLBACK_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_FALLBACK_BASE_URL.to_string())
+}
+
+/// The fallback provider's model id: `SEARCH_LLM_FALLBACK_MODEL`, else [`DEFAULT_FALLBACK_MODEL`].
+pub fn fallback_model() -> String {
+    env_trim("SEARCH_LLM_FALLBACK_MODEL").unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
+}
+
+/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CUN_API_KEY`.
+///
+/// `None` **disables** the fallback: the primary provider is then the only one tried. Read from
+/// the environment only, never from a file, never logged.
+pub fn fallback_api_key() -> Option<String> {
+    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
 }
 
 /// The reason the answerer is disabled. Only meaningful when [`AnswerConfig::from_env`] returns

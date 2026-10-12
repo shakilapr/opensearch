@@ -31,12 +31,14 @@ mod transport;
 
 pub use client::{CacheStats, LlmClient};
 pub use config::{
-    LlmConfig, DEFAULT_BASE_URL, DEFAULT_ESCALATE_MODEL, DEFAULT_MODEL, DEFAULT_TIMEOUT_S,
+    fallback_api_key, fallback_base_url, fallback_model, LlmConfig, DEFAULT_BASE_URL,
+    DEFAULT_ESCALATE_MODEL, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL, DEFAULT_MODEL,
+    DEFAULT_TIMEOUT_S,
 };
 pub use error::OrganizeError;
 pub use prompt::{build_prompt, parse_response, Organized};
 pub use queryplan::{build_query_prompt, parse_plan, QueryPlan};
-pub use transport::Transport;
+pub use transport::{FallbackTransport, Transport};
 
 /// Re-exported verbatim: the organizer emits the dataset pack record, not a look-alike.
 pub use search_dataset::Record;

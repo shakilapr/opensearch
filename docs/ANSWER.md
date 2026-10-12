@@ -28,6 +28,20 @@ caller injects no answerer. `agent0 serve` logs exactly one info line naming the
 | `SEARCH_ANSWER_MAX_TOKENS` | `1024` | Completion token budget. |
 | `SEARCH_ANSWER_CONCURRENCY` | `4` | Bound on simultaneous in-flight requests. |
 | `SEARCH_LLM_CACHE` | `$SEARCH_DATA_DIR/llm-cache` (else `/var/lib/search/llm-cache`) | Cache directory (same convention as `search-organize`). |
+| `SEARCH_LLM_FALLBACK_BASE_URL` | `https://www.cun.ai/v1` | **Fallback** provider, used only when a primary call fails. |
+| `SEARCH_LLM_FALLBACK_MODEL` | `DeepSeek-V4.1-Flash` | Model id asked of the fallback provider. |
+| `SEARCH_LLM_FALLBACK_API_KEY` / `CUN_API_KEY` | — | Fallback credential. **Unset = no fallback** (primary only). |
+
+## Fallback provider
+
+The primary provider is kitani. When a primary call **fails** — connection refused, timeout, or a
+non-2xx response — the request is retried **once** against the fallback provider (cun.ai) with the
+fallback's own model id, and a `WARN` names both causes if that fails too. A successful primary
+call never touches the fallback, so the fallback costs nothing in the normal case. The policy
+lives in `search_answer::FallbackTransport` (a decorator over two `Transport`s) and is exercised
+by hermetic fakes. `search-organize` implements the same policy for the organizer and the query
+planner, so structuring and planning fall over identically. No fallback credential configured ⇒
+the primary is the only provider, exactly as before.
 
 A reasoning model (id containing `thinking`/`reason`/`r1`/`o1`, e.g.
 `deepseek/deepseek-v4.1-flash-thinking`) spends part of its budget on a hidden trace, so

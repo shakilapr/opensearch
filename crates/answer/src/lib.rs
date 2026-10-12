@@ -29,8 +29,9 @@ mod transport;
 pub use cache::{cache_key_hash, entry_path, read_cache, write_cache_temp_only};
 pub use client::{CacheStats, LlmAnswerer};
 pub use config::{
-    api_key, disabled_reason, is_enabled, AnswerConfig, Disabled, DEFAULT_BASE_URL,
-    DEFAULT_CONCURRENCY, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS,
+    api_key, disabled_reason, fallback_api_key, fallback_base_url, fallback_model, is_enabled,
+    AnswerConfig, Disabled, DEFAULT_BASE_URL, DEFAULT_CONCURRENCY, DEFAULT_FALLBACK_BASE_URL,
+    DEFAULT_FALLBACK_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS,
     REASONING_MIN_TOKENS, REASONING_TIMEOUT_MS,
 };
 pub use error::AnswerError;
@@ -38,7 +39,7 @@ pub use prompt::{
     build_prompt, parse_chat_response, MAX_CHARS_PER_PASSAGE, MAX_EVIDENCE_RECORDS, MAX_PASSAGES,
     MAX_PROMPT_CHARS, PROMPT_VERSION,
 };
-pub use transport::Transport;
+pub use transport::{FallbackTransport, Transport};
 
 /// Build the answerer from the environment, or `None` when it is disabled.
 ///
@@ -49,8 +50,23 @@ pub use transport::Transport;
 pub fn from_env() -> Option<LlmAnswerer> {
     let cfg = AnswerConfig::from_env().ok()?;
     let key = api_key()?;
-    let transport = transport::HttpTransport::new(&cfg, key).ok()?;
-    LlmAnswerer::with_transport(cfg, Arc::new(transport)).ok()
+    let primary: Arc<dyn Transport> = Arc::new(transport::HttpTransport::new(&cfg, key).ok()?);
+    // kitani is the primary provider; cun.ai is the fallback, tried only when a primary call
+    // fails. With no fallback credential configured the primary is the only transport.
+    let transport: Arc<dyn Transport> = match config::fallback_api_key() {
+        Some(fallback_key) => {
+            let mut fb = cfg.clone();
+            fb.base_url = config::fallback_base_url();
+            let fallback = Arc::new(transport::HttpTransport::new(&fb, fallback_key).ok()?);
+            Arc::new(FallbackTransport::new(
+                primary,
+                fallback,
+                config::fallback_model(),
+            ))
+        }
+        None => primary,
+    };
+    LlmAnswerer::with_transport(cfg, transport).ok()
 }
 
 /// Test/injection variant of [`from_env`]: identical env gating, with a caller-supplied
