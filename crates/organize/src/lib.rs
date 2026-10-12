@@ -31,9 +31,9 @@ mod transport;
 
 pub use client::{CacheStats, LlmClient};
 pub use config::{
-    fallback_api_key, fallback_base_url, fallback_model, LlmConfig, DEFAULT_BASE_URL,
-    DEFAULT_ESCALATE_MODEL, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL, DEFAULT_MODEL,
-    DEFAULT_TIMEOUT_S,
+    fallback_api_key, fallback_base_url, fallback_model, llm_user_agent, LlmConfig,
+    DEFAULT_BASE_URL, DEFAULT_ESCALATE_MODEL, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL,
+    DEFAULT_LLM_USER_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_S,
 };
 pub use error::OrganizeError;
 pub use prompt::{build_prompt, parse_response, Organized};

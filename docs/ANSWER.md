@@ -31,6 +31,7 @@ caller injects no answerer. `agent0 serve` logs exactly one info line naming the
 | `SEARCH_LLM_FALLBACK_BASE_URL` | `https://www.cun.ai/v1` | **Fallback** provider, used only when a primary call fails. |
 | `SEARCH_LLM_FALLBACK_MODEL` | `DeepSeek-V4.1-Flash` | Model id asked of the fallback provider. |
 | `SEARCH_LLM_FALLBACK_API_KEY` / `CUN_API_KEY` | — | Fallback credential. **Unset = no fallback** (primary only). |
+| `SEARCH_LLM_USER_AGENT` | `search-engine/0.1 (+https://github.com/agent-native-search)` | Sent with every request. **Load-bearing**: cun.ai 403s (Cloudflare 1010) on a request with no `User-Agent`. |
 
 ## Fallback provider
 

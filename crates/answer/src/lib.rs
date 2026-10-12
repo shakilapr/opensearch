@@ -30,9 +30,9 @@ pub use cache::{cache_key_hash, entry_path, read_cache, write_cache_temp_only};
 pub use client::{CacheStats, LlmAnswerer};
 pub use config::{
     api_key, disabled_reason, fallback_api_key, fallback_base_url, fallback_model, is_enabled,
-    AnswerConfig, Disabled, DEFAULT_BASE_URL, DEFAULT_CONCURRENCY, DEFAULT_FALLBACK_BASE_URL,
-    DEFAULT_FALLBACK_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_TIMEOUT_MS,
-    REASONING_MIN_TOKENS, REASONING_TIMEOUT_MS,
+    llm_user_agent, AnswerConfig, Disabled, DEFAULT_BASE_URL, DEFAULT_CONCURRENCY,
+    DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL, DEFAULT_LLM_USER_AGENT, DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, REASONING_MIN_TOKENS, REASONING_TIMEOUT_MS,
 };
 pub use error::AnswerError;
 pub use prompt::{

@@ -32,6 +32,19 @@ fn env_trim(name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The `User-Agent` sent with every completion request.
+///
+/// Required, not cosmetic: cun.ai (the fallback provider) answers a request that carries **no**
+/// `User-Agent` with HTTP 403 (`error code: 1010`, a Cloudflare signature block), while any
+/// non-empty UA is accepted (measured 2026-10-12: none → 403 in 0.1 s; three different UA strings
+/// → 200 in ~2.8 s). Without this header the fallback would be silently unreachable.
+pub const DEFAULT_LLM_USER_AGENT: &str = "search-engine/0.1 (+https://github.com/agent-native-search)";
+
+/// The `User-Agent` for LLM requests: `SEARCH_LLM_USER_AGENT`, else [`DEFAULT_LLM_USER_AGENT`].
+pub fn llm_user_agent() -> String {
+    env_trim("SEARCH_LLM_USER_AGENT").unwrap_or_else(|| DEFAULT_LLM_USER_AGENT.to_string())
+}
+
 /// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
 /// [`DEFAULT_FALLBACK_BASE_URL`].
 pub fn fallback_base_url() -> String {

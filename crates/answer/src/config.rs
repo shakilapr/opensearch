@@ -30,6 +30,14 @@ pub const REASONING_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://www.cun.ai/v1";
 /// Default **fallback** model id (cun.ai's DeepSeek-V4.1-Flash).
 pub const DEFAULT_FALLBACK_MODEL: &str = "DeepSeek-V4.1-Flash";
+/// The `User-Agent` sent with every completion request.
+///
+/// Required, not cosmetic: cun.ai (the fallback provider) answers a request that carries **no**
+/// `User-Agent` with HTTP 403 (`error code: 1010`, a Cloudflare signature block), while any
+/// non-empty UA is accepted (measured 2026-10-12: none → 403 in 0.1 s; several UA strings → 200 in
+/// ~2.8 s). Without this header the fallback would be silently unreachable.
+pub const DEFAULT_LLM_USER_AGENT: &str =
+    "search-engine/0.1 (+https://github.com/agent-native-search)";
 
 /// Why the answerer is disabled. Reported once by the serve wiring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +118,11 @@ pub fn fallback_model() -> String {
 /// the environment only, never from a file, never logged.
 pub fn fallback_api_key() -> Option<String> {
     env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
+}
+
+/// The `User-Agent` for LLM requests: `SEARCH_LLM_USER_AGENT`, else [`DEFAULT_LLM_USER_AGENT`].
+pub fn llm_user_agent() -> String {
+    env_trim("SEARCH_LLM_USER_AGENT").unwrap_or_else(|| DEFAULT_LLM_USER_AGENT.to_string())
 }
 
 /// The reason the answerer is disabled. Only meaningful when [`AnswerConfig::from_env`] returns

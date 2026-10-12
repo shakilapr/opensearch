@@ -171,6 +171,9 @@ impl HttpTransport {
     pub(crate) fn new(cfg: &LlmConfig, api_key: String) -> Result<Self, OrganizeError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_s.max(1)))
+            // A User-Agent is load-bearing: the cun.ai fallback 403s (Cloudflare 1010) on a request
+            // that carries none. See `config::DEFAULT_LLM_USER_AGENT`.
+            .user_agent(crate::config::llm_user_agent())
             .build()
             .map_err(|e| OrganizeError::Http(e.to_string()))?;
         Ok(Self {
