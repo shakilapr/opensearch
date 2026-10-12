@@ -72,13 +72,17 @@ These are real, current limitations — none is a hidden TODO:
    dense lane. *Remaining:* the lane cannot honour a source scope (it returns empty for a scoped
    search rather than leaking), and its weight in the fused ranking is untuned and unmeasured
    against the eval set.
-4. **The semantic embedder is opt-in, not the default.** Real BGE-small-en-v1.5 weights now
-   work (`feature = "bge"` in `crates/embed`, via `fastembed`; weights fetched on first use
-   into `<workspace>/models/fastembed`). The **default** build still uses the deterministic
-   `HashEmbedder`, which is a lexical bag-of-words model, **not a semantic one** — so the
-   default `benchmarks/results.json` still reports a lexical dense lane, honestly labelled.
-   Rebuild with `--features bge -- --embedder bge` to measure the semantic lane; on the
-   paraphrase query set it moves nDCG@10 0.4238 → 0.5842 (see `benchmarks/README.md`).
+4. **The embedder default is *split by crate*, and the docs long said otherwise.** In
+   `crates/embed` the `bge` feature is **off** by default, so the *library* needs no model
+   download; in `crates/bench` the default is likewise the lexical `HashEmbedder`, which is why
+   the committed `benchmarks/results.json` is a lexical dense lane (honestly labelled as **not** a
+   semantic model). But **`crates/agent0` enables `bge` by default** (`default = ["bge"]`), so the
+   *serving* binary runs real BGE-small-en-v1.5 (384-d) — that is what the live deployment does
+   (weights in `/var/lib/search/fastembed`), and `agent0 embed build` defaults to `--embedder
+   bge`. If the weights cannot be loaded the server serves **no dense lane** (with a warning),
+   never a lexical stand-in. Rebuild with `--features bge -- --embedder bge` to measure the
+   semantic lane; on the paraphrase query set it moves nDCG@10 0.4238 → 0.5842 (see
+   `benchmarks/README.md`).
 5. **No real SPLADE weights.** `SparseExpander` (`crates/retrieval/src/sparse.rs`) is a
    deterministic co-occurrence expander built from a committed fixture — a stand-in for a
    learned sparse model, not one.

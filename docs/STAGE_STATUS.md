@@ -72,9 +72,17 @@ multi-week architecture work, gated by the plan on proven quality.
      (a `LaneSearcher` over it, brute-force cosine, refusing a store whose dimension does not
      match its embedder), `agent0 embed build` (backfill, opens the index **read-only** so it runs
      beside a crawl), and API wiring (`AppState::with_extra_lanes`; the engine fuses any injected
-     lane by rank, naming it in `lane_ranks`). BGE is **opt-in** (`--features bge`); the default
-     build uses the lexical `HashEmbedder`, so it needs no model download.
-     Live: `dense lane enabled docs=12486`, and every result for "what is retrieval augmented
+     lane by rank, naming it in `lane_ranks`). The `bge` feature is **off by default in
+     `crates/embed`** (the library needs no model download), but the **`agent0` binary enables it
+     by default** (`crates/agent0/Cargo.toml`: `default = ["bge"]`): the server builds a real
+     BGE-small-en-v1.5 lane (384-d, weights under `<data_dir>/fastembed`), `agent0 embed build`
+     defaults to `--embedder bge`, and when the weights are unavailable the server serves **no
+     dense lane** (with a warning) — it does not fall back to a lexical stand-in. `crates/bench`
+     is the exception that defaults to the lexical `HashEmbedder`, so the committed
+     `benchmarks/results.json` measures a lexical dense lane, honestly labelled; add
+     `--features bge -- --embedder bge` to measure the semantic one.
+     Live: the serving binary runs BGE — `embedder bge (384 dimensions)`, sidecar `docs=19255`
+     after the 2026-10-11 rebuild — and every result for "what is retrieval augmented
      generation" carries `{"bm25": n, "dense": m, "source_first": k}` with dense ordering
      genuinely different from BM25. Remaining refinement: brute force does not scale past ~100K
      documents (`crates/ann` exists for that), and the fixture benchmark has not been re-run to
