@@ -105,6 +105,9 @@ def call(query):
         return None, time.time() - t0, f"{type(e).__name__}: {e}"
 
 rows, failures, warnings = [], [], []
+# Answer-expectation violations are collected separately: with the answerer off on the server they
+# are not *measurable*, and must not be reported as failures (see the classification below).
+answer_expect_failures = []
 for query, expect, why in QUERIES:
     resp, secs, err = call(query)
     if err:
@@ -135,7 +138,7 @@ for query, expect, why in QUERIES:
     rows.append(row)
 
     if expect == "answer" and kind != "answer":
-        failures.append(
+        answer_expect_failures.append(
             f"{query!r}: expected a grounded answer, got kind={kind} coverage={coverage} "
             f"markers={markers} resolvable={resolvable} answer_chars={len(answer)} "
             f"stop_reason={row['stop_reason']} -- a refusal here is a corpus gap"
@@ -158,9 +161,6 @@ for query, expect, why in QUERIES:
     if kind == "unattributed":
         failures.append(f"{query!r}: answer with no resolvable citation: {answer[:120]!r}")
 
-report = {"base": base, "mode": mode, "queries": len(rows), "rows": rows,
-          "failures": failures, "warnings": warnings, "ok": not failures}
-
 print(f"engine eval  base={base} mode={mode} limit={limit}")
 print(f"{'query':46} {'kind':11} {'stop_reason':16} {'cov':>5} {'res':>4} {'ans':>5} {'mk':>4} {'s':>6}  verdict")
 for r in rows:
@@ -176,29 +176,59 @@ for r in rows:
     print(f"{r['query'][:46]:46} {r['kind']:11} {str(r['stop_reason'])[:16]:16} {r['coverage']!s:>5} "
           f"{r['results']:>4} {r['answer_chars']:>5} {len(r['markers']):>4} {r['seconds']:>6}  {verdict}")
 
-if out:
-    with open(out, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\nwrote {out}")
+# Classification, done BEFORE the report is written so the JSON cannot disagree with the table.
+#
+# With no answer text anywhere, the answerer is simply off on this server (it is opt-in:
+# SEARCH_ANSWER_ENABLED=1 plus a key). No answer can exist whatever retrieval does, so the answer
+# expectations are *unmeasurable*, not failed -- and the engine is not "broken". The older
+# version reported a disabled answerer as "the retrieval or verification path is broken", a
+# misdiagnosis that made a known-off feature look like a regression.
+#
+# Only rows that actually got a response count: a run where every call failed at the transport is
+# a connectivity failure, not an off answerer, and says nothing about either path.
+answered_rows = [r for r in rows if not r.get("error")]
+answerer_off = bool(answered_rows) and all(not r.get("answer_chars") for r in answered_rows)
+not_measured = list(answer_expect_failures) if answerer_off else []
+if not answerer_off:
+    failures.extend(answer_expect_failures)
 
-# A harness that cannot fail proves nothing: the engine must be able to answer at least
-# one query from the index, otherwise a broken retrieval path would look like uniform
-# honesty.
-if rows and not any(r.get("kind") == "answer" for r in rows):
+# A harness that cannot fail proves nothing: with the answerer actually running, the engine must
+# answer at least one query from the index, otherwise a broken retrieval path would look like
+# uniform honesty. With the answerer off — or with no response at all — there is nothing to
+# conclude about either path.
+if not answerer_off and answered_rows and not any(r.get("kind") == "answer" for r in answered_rows):
     failures.append(
         "no query produced a grounded answer: the retrieval or verification path is broken, "
         "not merely the corpus"
     )
 
-if rows and all(not r.get("answer_chars") for r in rows):
-    print("\nnote: no query produced an answer — the answerer is opt-in on the server. "
-          "Start it with SEARCH_ANSWER_ENABLED=1 and KITANI_API_KEY set, or only the "
-          "'refuse' expectations are meaningful.")
-
 if warnings:
     print("\nWARNINGS:")
     for w in warnings:
         print(" ~", w)
+
+if not_measured:
+    print("\nNOT MEASURED — the answerer is off on this server (SEARCH_ANSWER_ENABLED unset), so "
+          "answer expectations cannot be judged:")
+    for f in not_measured:
+        print(" ~", f)
+    print("  Start it with SEARCH_ANSWER_ENABLED=1 and KITANI_API_KEY set to measure these.")
+
+report = {
+    "base": base,
+    "mode": mode,
+    "queries": len(rows),
+    "rows": rows,
+    "failures": failures,
+    "not_measured": not_measured,
+    "warnings": warnings,
+    "answerer_off": answerer_off,
+    "ok": not failures,
+}
+if out:
+    with open(out, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\nwrote {out}")
 
 if failures:
     print("\nFAILURES:")
