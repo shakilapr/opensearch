@@ -35,26 +35,6 @@ use search_core::config::Config;
 /// * unset / `auto` — writer if possible, read-only otherwise.
 mod evalrun;
 
-fn open_for_serve(cfg: &search_core::config::Config) -> search_core::error::AppResult<Pipeline> {
-    let mode = std::env::var("SEARCH_READ_ONLY").unwrap_or_default().trim().to_ascii_lowercase();
-    match mode.as_str() {
-        "1" | "true" | "yes" => {
-            tracing::info!("SEARCH_READ_ONLY=1: serving read-only (no index lock, refresh off)");
-            Pipeline::open_read_only(cfg, false)
-        }
-        "0" | "false" | "no" => Pipeline::open(cfg),
-        _ => match Pipeline::open(cfg) {
-            Ok(p) => Ok(p),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "index is locked (a crawl is running?): serving READ-ONLY — queries work, query-time refresh is off"
-                );
-                Pipeline::open_read_only(cfg, false)
-            }
-        },
-    }
-}
 
 /// Build the dense lane over the vector sidecar, when one exists.
 ///
@@ -251,7 +231,10 @@ async fn run_ingest(url: &str) -> ExitCode {
 
 async fn run_search(query: &str, limit: usize) -> ExitCode {
     let cfg = config();
-    let pipeline = match Pipeline::open(&cfg) {
+    // Honour `SEARCH_READ_ONLY`. A running server (or a crawl) holds the index writer, so a
+    // query must still be answerable beside it: before this, `agent0 search` failed outright
+    // with `Failed to acquire Lockfile: LockBusy` while `agent0 serve` was up.
+    let pipeline = match search_agent0::open_honouring_read_only(&cfg) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to open pipeline: {e}");
@@ -264,14 +247,28 @@ async fn run_search(query: &str, limit: usize) -> ExitCode {
         std::env::var("SEARCH_QUERY_REFRESH").as_deref(),
         Ok("1") | Ok("true") | Ok("on")
     );
-    let result = if fresh {
+    // A read-only pipeline cannot write the index, so the refresh would be a silent no-op.
+    // Do not let a caller asking for freshness read a stale result as fresh: say it, and mark
+    // the response incomplete with a named degradation.
+    let refresh_skipped = fresh && pipeline.is_read_only();
+    if refresh_skipped {
+        eprintln!(
+            "note: index opened read-only (a writer holds the lock): query-time refresh is off; \
+             results come from the published generation"
+        );
+    }
+    let result = if fresh && !refresh_skipped {
         let now = search_core::time::now_unix_s();
         pipeline.search_with_refresh(query, limit, now).await
     } else {
         pipeline.search(query, limit).await
     };
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            if refresh_skipped {
+                resp.degradations.push("query_refresh_read_only".to_string());
+                resp.complete = false;
+            }
             println!("{}", serde_json::to_string_pretty(&resp).unwrap());
             ExitCode::SUCCESS
         }
@@ -320,7 +317,7 @@ async fn run_refresh() -> ExitCode {
 
 async fn run_serve() -> ExitCode {
     let cfg = config();
-    let pipeline = match open_for_serve(&cfg) {
+    let pipeline = match search_agent0::open_honouring_read_only(&cfg) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to open pipeline: {e}");

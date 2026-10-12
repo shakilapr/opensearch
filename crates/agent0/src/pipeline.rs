@@ -310,6 +310,44 @@ pub struct ImportRecord {
     pub extras: std::collections::BTreeMap<String, String>,
 }
 
+/// Open a pipeline honouring `SEARCH_READ_ONLY`, falling back to a read-only open when the index
+/// writer lock is held (by a crawl or a running server).
+///
+/// The crawler holds the index writer for the whole of a run, and so does `agent0 serve`, so a
+/// process that insists on its own writer cannot come up beside one — which is why serving and
+/// crawling used to be mutually exclusive, and why `agent0 search` used to die with
+/// `Failed to acquire Lockfile: LockBusy` while the server was up. `auto` (the default) tries the
+/// writer and, on a locked index, opens **read-only**: queries work, query-time refresh does not,
+/// and the log says so.
+///
+/// * `SEARCH_READ_ONLY=1` — always read-only (never fails on the lock).
+/// * `SEARCH_READ_ONLY=0` — always take the writer; fail if the index is locked.
+/// * unset / `auto` — writer if possible, read-only otherwise.
+pub fn open_honouring_read_only(cfg: &Config) -> AppResult<Pipeline> {
+    let mode = std::env::var("SEARCH_READ_ONLY")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "1" | "true" | "yes" => {
+            tracing::info!("SEARCH_READ_ONLY=1: opening read-only (no index lock, refresh off)");
+            Pipeline::open_read_only(cfg, false)
+        }
+        "0" | "false" | "no" => Pipeline::open(cfg),
+        _ => match Pipeline::open(cfg) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "index is locked (a crawl or server is running?): opening READ-ONLY — queries \
+                     work, query-time refresh is off"
+                );
+                Pipeline::open_read_only(cfg, false)
+            }
+        },
+    }
+}
+
 impl Pipeline {
     /// Open the pipeline in production mode: the SSRF guard blocks loopback.
     pub fn open(cfg: &Config) -> AppResult<Self> {
