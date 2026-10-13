@@ -117,7 +117,7 @@ impl Transport for ChainTransport {
 
 /// A transport that retries on a **second provider** when the primary fails.
 ///
-/// The project's primary provider is kitani; cun.ai is the fallback. Only a *failure* falls over
+/// The project's primary provider is crowbot; crowbot is the fallback. Only a *failure* falls over
 /// — a successful primary call is returned untouched, so the fallback costs nothing in the normal
 /// case. The fallback is asked with its **own** model id (the vendors do not share model names).
 /// Observed: an unset fallback credential disables this entirely, so a single-provider deployment
@@ -258,7 +258,7 @@ mod fallback_tests {
     fn provider_label_reads_the_host_without_the_scheme_or_path() {
         assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
         assert_eq!(provider_label("https://openrouter.ai/api/v1"), "openrouter");
-        assert_eq!(provider_label("https://www.cun.ai/v1"), "cun");
+        assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
     }
 
     #[tokio::test]
@@ -337,7 +337,7 @@ impl HttpTransport {
     pub(crate) fn new(cfg: &LlmConfig, api_key: String) -> Result<Self, OrganizeError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_s.max(1)))
-            // A User-Agent is load-bearing: the cun.ai fallback 403s (Cloudflare 1010) on a request
+            // A User-Agent is load-bearing: the crowbot fallback 403s (Cloudflare 1010) on a request
             // that carries none. See `config::DEFAULT_LLM_USER_AGENT`.
             .user_agent(crate::config::llm_user_agent())
             .build()
@@ -353,7 +353,7 @@ impl HttpTransport {
 
 /// Token budget for `model`.
 ///
-/// Reasoning models (e.g. `deepseek/deepseek-v4.1-flash-thinking`) spend part of the budget on a
+/// Reasoning models (id containing `thinking`, `reason`, `r1` or `o1`) spend part of the budget on a
 /// hidden reasoning trace *before* the answer. With a small budget they finish with
 /// `finish_reason=length` and `content: null` — observed live. Give them room for both.
 fn token_budget(model: &str, default: u32) -> u32 {
@@ -373,6 +373,10 @@ impl Transport for HttpTransport {
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "max_tokens": token_budget(model, self.max_tokens),
+            // Explicit, not the default: a relay may stream unless told otherwise, and a streamed
+            // body is SSE text, not the JSON this transport parses. The apizio relay streams by
+            // default — omitting this returned a body that failed to parse with a JSON error.
+            "stream": false,
         });
         // The workspace's reqwest is built without the `json` feature, so encode by hand.
         let body_bytes = serde_json::to_vec(&body)?;
@@ -446,11 +450,15 @@ mod tests {
 
     #[test]
     fn plain_models_keep_the_default_budget() {
-        assert_eq!(token_budget("deepseek/deepseek-v4.1-flash", 1024), 1024);
+        assert_eq!(token_budget("deepseek-v4.1-flash", 1024), 1024);
     }
 
     #[test]
     fn reasoning_models_get_room_for_the_hidden_trace() {
-        assert!(token_budget("deepseek/deepseek-v4.1-flash-thinking", 1024) >= 8192);
+        // A synthetic id: the point is the mechanism (the marker substring), not any one vendor's
+        // model. None of the configured providers serves a reasoning model, so naming a real id
+        // here would pin the test to a name that does not detect.
+        assert!(token_budget("some-model-thinking", 1024) >= 8192);
+        assert!(token_budget("some-model-r1", 1024) >= 8192);
     }
 }

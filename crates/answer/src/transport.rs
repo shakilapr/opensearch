@@ -25,7 +25,7 @@ pub trait Transport: Send + Sync {
 
 /// A transport that retries on a **second provider** when the primary fails.
 ///
-/// The project's primary provider is kitani; cun.ai is the fallback. Only a *failure* falls over
+/// The project's primary provider is crowbot; crowbot is the fallback. Only a *failure* falls over
 /// — a successful primary call is returned untouched, so the fallback costs nothing in the normal
 /// case. The fallback is asked with its **own** model id (the vendors do not share model names).
 /// With no fallback credential configured the primary is the only transport, so a single-provider
@@ -218,7 +218,7 @@ impl HttpTransport {
     pub(crate) fn new(cfg: &AnswerConfig, api_key: String) -> Result<Self, AnswerError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
-            // Load-bearing: cun.ai (the fallback) 403s with no User-Agent (Cloudflare 1010).
+            // Load-bearing: crowbot (the fallback) 403s with no User-Agent (Cloudflare 1010).
             .user_agent(crate::config::llm_user_agent())
             .build()
             .map_err(|e| AnswerError::Http(e.to_string()))?;
@@ -250,6 +250,10 @@ impl Transport for HttpTransport {
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "max_tokens": token_budget(model, self.max_tokens),
+            // Explicit, not the default: a relay may stream unless told otherwise, and a streamed
+            // body is SSE text, not the JSON this transport parses. The apizio relay streams by
+            // default — omitting this returned a body that failed to parse with a JSON error.
+            "stream": false,
         });
         // The workspace's reqwest is built without the `json` feature, so encode by hand.
         let body_bytes = serde_json::to_vec(&body)?;
@@ -370,7 +374,7 @@ mod fallback_tests {
     fn provider_label_reads_the_host_without_the_scheme_or_path() {
         assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
         assert_eq!(provider_label("https://openrouter.ai/api/v1"), "openrouter");
-        assert_eq!(provider_label("https://www.cun.ai/v1"), "cun");
+        assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
     }
 
     #[tokio::test]
