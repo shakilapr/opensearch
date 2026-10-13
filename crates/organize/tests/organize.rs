@@ -250,18 +250,28 @@ async fn organize_all_is_stable_and_bounds_concurrency() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn from_env_errors_without_api_key() {
-    let saved = std::env::var("KITANI_API_KEY").ok();
-    std::env::remove_var("KITANI_API_KEY");
+    // Any of the three key sources would satisfy `from_env`, so all of them must be cleared for
+    // this test to be meaningful (and hermetic against the developer's own environment).
+    let saved: Vec<(&str, Option<String>)> = ["KITANI_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"]
+        .iter()
+        .map(|n| (*n, std::env::var(n).ok()))
+        .collect();
+    for (n, _) in &saved {
+        std::env::remove_var(n);
+    }
 
-    let err = LlmConfig::from_env().expect_err("must fail without KITANI_API_KEY");
+    let err = LlmConfig::from_env().expect_err("must fail without any API key");
     let msg = err.to_string();
-    assert!(
-        msg.contains("KITANI_API_KEY"),
-        "error must name the variable, got: {msg}"
-    );
-    assert!(matches!(err, OrganizeError::MissingEnv(ref v) if v == "KITANI_API_KEY"));
+    // The error must name every accepted source, so an operator with any one of them set knows why
+    // the process refused to start.
+    for name in ["KITANI_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"] {
+        assert!(msg.contains(name), "error must name {name}, got: {msg}");
+    }
+    assert!(matches!(err, OrganizeError::MissingEnv(_)));
 
-    if let Some(v) = saved {
-        std::env::set_var("KITANI_API_KEY", v);
+    for (n, v) in saved {
+        if let Some(v) = v {
+            std::env::set_var(n, v);
+        }
     }
 }

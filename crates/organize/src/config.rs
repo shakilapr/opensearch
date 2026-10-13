@@ -107,9 +107,16 @@ impl LlmConfig {
 
         let api_key = match std::env::var("SEARCH_LLM_API_KEY") {
             Ok(v) if !v.trim().is_empty() => v,
-            _ => match std::env::var("KITANI_API_KEY") {
+            _ => match std::env::var("OPENROUTER_API_KEY") {
                 Ok(v) if !v.trim().is_empty() => v,
-                _ => return Err(OrganizeError::MissingEnv("KITANI_API_KEY".to_string())),
+                _ => match std::env::var("KITANI_API_KEY") {
+                    Ok(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        return Err(OrganizeError::MissingEnv(
+                            "KITANI_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
+                        ))
+                    }
+                },
             },
         };
 
@@ -125,10 +132,16 @@ impl LlmConfig {
             })
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        let escalate_model = std::env::var("KITANI_ESCALATE_MODEL")
+        let escalate_model = std::env::var("SEARCH_LLM_ESCALATE_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("KITANI_ESCALATE_MODEL")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| DEFAULT_ESCALATE_MODEL.to_string());
 
         let timeout_s = std::env::var("KITANI_TIMEOUT_S")
@@ -155,10 +168,12 @@ mod tests {
     // Environment variables are process-global; serialize the tests that mutate them.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const VARS: [&str; 7] = [
+    const VARS: [&str; 9] = [
         "SEARCH_LLM_BASE_URL",
         "SEARCH_LLM_API_KEY",
         "SEARCH_LLM_MODEL",
+        "SEARCH_LLM_ESCALATE_MODEL",
+        "OPENROUTER_API_KEY",
         "KITANI_BASE_URL",
         "KITANI_API_KEY",
         "KITANI_MODEL",
@@ -233,12 +248,47 @@ mod tests {
     }
 
     #[test]
-    fn neither_key_keeps_the_existing_error() {
+    fn no_key_reports_every_accepted_source() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
             let err = LlmConfig::from_env().expect_err("key is required");
-            assert!(matches!(err, OrganizeError::MissingEnv(ref v) if v == "KITANI_API_KEY"));
-            assert!(err.to_string().contains("KITANI_API_KEY"));
+            // The message must name the sources, so an operator with any one of them set knows why
+            // the process refused to start.
+            assert!(matches!(err, OrganizeError::MissingEnv(_)));
+            let msg = err.to_string();
+            assert!(msg.contains("SEARCH_LLM_API_KEY"), "{msg}");
+            assert!(msg.contains("OPENROUTER_API_KEY"), "{msg}");
+            assert!(msg.contains("KITANI_API_KEY"), "{msg}");
+        });
+    }
+
+    /// The OpenRouter key is accepted on its own (kitani is dead; OpenRouter is the search path's
+    /// provider), and the neutral `SEARCH_LLM_*` names still win when both are present.
+    #[test]
+    fn openrouter_key_is_accepted() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            std::env::set_var("OPENROUTER_API_KEY", "or-key");
+            std::env::set_var("SEARCH_LLM_BASE_URL", "https://openrouter.ai/api/v1");
+            std::env::set_var("SEARCH_LLM_MODEL", "google/gemma-4-31b-it:free");
+
+            let cfg = LlmConfig::from_env().expect("openrouter config");
+            assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
+            assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
+        });
+    }
+
+    /// The escalate model has a vendor-neutral override, so an OpenRouter deployment is not stuck
+    /// with kitani's thinking-model id.
+    #[test]
+    fn neutral_escalate_model_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        with_clean_env(|| {
+            std::env::set_var("KITANI_API_KEY", "k");
+            std::env::set_var("SEARCH_LLM_ESCALATE_MODEL", "google/gemma-4-31b-it:free");
+
+            let cfg = LlmConfig::from_env().expect("config");
+            assert_eq!(cfg.escalate_model, "google/gemma-4-31b-it:free");
         });
     }
 }
