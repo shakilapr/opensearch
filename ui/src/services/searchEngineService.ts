@@ -13,11 +13,13 @@ import {
   EngineCoverage,
   EngineMode,
   IsoQualityAudit,
+  LlmAttemptView,
   SearchCategory,
   SearchExecutionMetrics,
   SearchHistoryEntry,
   SearchResult,
   TimeFilter,
+  TokenUsageView,
 } from '../domain/models';
 import { DEFAULT_SUGGESTIONS } from '../domain/suggestions';
 import { hexxicaClientInstance } from './hexxicaClient';
@@ -46,6 +48,16 @@ export interface SearchExecutionResponse {
   readonly stopReason: string | null;
   readonly trace: readonly string[];
   readonly answer: string | null;
+  /** Token counts of the answer's model call, `null` when the server reported none. */
+  readonly usage: TokenUsageView | null;
+  /** The models tried for the answer, in order: which failed and which answered. */
+  readonly llmAttempts: readonly LlmAttemptView[];
+  /**
+   * Distinct documents the engine matched, before its display limit — the honest "N results".
+   * `null` on a server that does not report it, in which case the caller falls back to the
+   * returned count.
+   */
+  readonly engineTotalMatches: number | null;
 }
 
 export class SearchEngineService {
@@ -134,6 +146,9 @@ export class SearchEngineService {
       stopReason: engineResponse.stopReason,
       trace: engineResponse.trace,
       answer: engineResponse.answer,
+      usage: engineResponse.usage,
+      llmAttempts: engineResponse.llmAttempts,
+      engineTotalMatches: engineResponse.totalMatches,
     };
   }
 

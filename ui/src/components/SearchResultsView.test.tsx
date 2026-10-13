@@ -41,6 +41,8 @@ const BASE_PROPS: ViewProps = {
   coverage: null,
   stopReason: null,
   answer: null,
+  llmAttempts: [],
+  trace: [],
   onRetry: () => undefined,
 };
 
@@ -101,5 +103,34 @@ describe('SearchResultsView', () => {
     expect(html).toContain('A real indexed document');
     expect(html).not.toContain('Why this result?');
     expect(html).not.toContain('Generated answer');
+  });
+
+  it('names every model tried, with the error of the failed ones and the one that answered', () => {
+    const html = render({
+      results: [resultOf()],
+      engine: true,
+      llmAttempts: [
+        {
+          provider: 'openrouter',
+          model: 'google/gemma-4-31b-it:free',
+          ok: false,
+          error: 'HTTP 401 Unauthorized',
+        },
+        { provider: 'crowbot', model: 'deepseek-v4.1-flash', ok: true, error: null },
+      ],
+      trace: ['plan: mode=Fast lanes=[Bm25] top_k=10 variants=2 rerank=30 refresh=0'],
+    });
+
+    // What failed, and why — not just "no answer".
+    expect(html).toContain('models tried:');
+    expect(html).toContain('openrouter/google/gemma-4-31b-it:free (failed: HTTP 401 Unauthorized)');
+    expect(html).toContain('crowbot/deepseek-v4.1-flash (answered)');
+    // The search's own plan data.
+    expect(html).toContain('plan: mode=Fast');
+  });
+
+  it('shows no model line when nothing was tried', () => {
+    const html = render({ results: [resultOf()], engine: true, llmAttempts: [] });
+    expect(html).not.toContain('models tried:');
   });
 });

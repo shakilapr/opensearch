@@ -10,11 +10,13 @@ import {
   EngineCoverage,
   EngineMode,
   IsoQualityAudit,
+  LlmAttemptView,
   SearchCategory,
   SearchExecutionMetrics,
   SearchHistoryEntry,
   SearchResult,
   TimeFilter,
+  TokenUsageView,
 } from '../domain/models';
 import { hexxicaClientInstance } from '../services/hexxicaClient';
 import { SearchUnavailableError } from '../services/searchErrors';
@@ -64,6 +66,9 @@ export function useSearchEngine() {
   const [trace, setTrace] = useState<readonly string[]>([]);
   const [answer, setAnswer] = useState<string | null>(null);
   const [engineActive, setEngineActive] = useState<boolean>(false);
+  const [usage, setUsage] = useState<TokenUsageView | null>(null);
+  const [llmAttempts, setLlmAttempts] = useState<readonly LlmAttemptView[]>([]);
+  const [engineTotalMatches, setEngineTotalMatches] = useState<number | null>(null);
   const [searchError, setSearchError] = useState<SearchUnavailableError | null>(null);
 
   const syncUrlParams = useCallback((newQuery: string, newCategory: SearchCategory) => {
@@ -107,6 +112,9 @@ export function useSearchEngine() {
         setTrace(response.trace);
         setAnswer(response.answer);
         setEngineActive(response.engine);
+        setUsage(response.usage);
+        setLlmAttempts(response.llmAttempts);
+        setEngineTotalMatches(response.engineTotalMatches);
         setHistory(searchEngineServiceInstance.getHistory());
         setPage(targetPage);
         syncUrlParams(cleanTarget, targetCategory);
@@ -119,6 +127,9 @@ export function useSearchEngine() {
         setTrace([]);
         setAnswer(null);
         setEngineActive(false);
+        setUsage(null);
+        setLlmAttempts([]);
+        setEngineTotalMatches(null);
         setSearchError(
           err instanceof SearchUnavailableError
             ? err
@@ -197,6 +208,9 @@ export function useSearchEngine() {
     trace,
     answer,
     engineActive,
+    usage,
+    llmAttempts,
+    engineTotalMatches,
     searchError,
     baseUrl: hexxicaClientInstance.getBaseUrl(),
     setQuery: handleQueryChange,

@@ -128,6 +128,9 @@ pub struct EngineSearchResponse {
     /// The models tried for this answer, in order: which failed (with the provider's error) and
     /// which answered. Empty when no model was called.
     pub llm_attempts: Vec<search_core::LlmAttempt>,
+    /// Distinct documents that matched before the display limit — see
+    /// [`search_engine::SearchResponse::total_matches`].
+    pub total_matches: usize,
 }
 
 /// Stable lowercase wire name for a lane (§9). Used for `lane_ranks` keys —
@@ -872,6 +875,7 @@ pub fn run_engine_search(
         answer: engine_resp.answer,
         usage: engine_resp.usage,
         llm_attempts: engine_resp.llm_attempts,
+        total_matches: engine_resp.total_matches,
     })
 }
 

@@ -25,6 +25,28 @@ export interface EngineCoverage {
   readonly coverage: number | null;
 }
 
+/**
+ * What the answer's model call cost, as reported by the engine. All three are token counts; a
+ * cached answer reports zeros because nothing was sent to a model.
+ */
+export interface TokenUsageView {
+  readonly input: number;
+  readonly output: number;
+  readonly cached: number;
+}
+
+/**
+ * One model the engine tried for the answer, in order. `ok` marks the one that answered; a failed
+ * attempt carries the provider's own error, so a reader can see what was tried and why it failed
+ * rather than only that no answer arrived.
+ */
+export interface LlmAttemptView {
+  readonly provider: string;
+  readonly model: string;
+  readonly ok: boolean;
+  readonly error: string | null;
+}
+
 export interface SearchSitelink {
   readonly title: string;
   readonly url: string;

@@ -6,7 +6,7 @@
  */
 
 import React from 'react';
-import { EngineCoverage, SearchCategory, SearchResult } from '../domain/models';
+import { EngineCoverage, LlmAttemptView, SearchCategory, SearchResult } from '../domain/models';
 import { describeSearchFailure, SearchUnavailableError } from '../services/searchErrors';
 import { AnswerPanel } from './AnswerPanel';
 import { EngineStatusStrip } from './EngineStatusStrip';
@@ -24,6 +24,10 @@ interface SearchResultsViewProps {
   readonly coverage: EngineCoverage | null;
   readonly stopReason: string | null;
   readonly answer: string | null;
+  /** The models tried for the answer, in order: which failed and which answered. */
+  readonly llmAttempts: readonly LlmAttemptView[];
+  /** The engine's own trace, used for the plan summary in the status strip. */
+  readonly trace: readonly string[];
   readonly onRetry: () => void;
 }
 
@@ -38,6 +42,8 @@ export const SearchResultsView: React.FC<SearchResultsViewProps> = ({
   coverage,
   stopReason,
   answer,
+  llmAttempts,
+  trace,
   onRetry,
 }) => {
   if (isLoading) {
@@ -70,7 +76,13 @@ export const SearchResultsView: React.FC<SearchResultsViewProps> = ({
 
   return (
     <div className="hx-results-view">
-      <EngineStatusStrip engine={engine} coverage={coverage} stopReason={stopReason} />
+      <EngineStatusStrip
+        engine={engine}
+        coverage={coverage}
+        stopReason={stopReason}
+        llmAttempts={llmAttempts}
+        trace={trace}
+      />
 
       {answer !== null && answer.length > 0 && <AnswerPanel answer={answer} />}
 

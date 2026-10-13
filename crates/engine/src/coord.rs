@@ -132,6 +132,10 @@ pub struct SearchResponse {
     /// The model attempts behind `answer`, in order: which models were tried, which failed and
     /// which answered. Empty when nothing was tried.
     pub llm_attempts: Vec<search_core::LlmAttempt>,
+    /// The number of distinct documents the lanes found and fusion kept, **before** the request's
+    /// `limit` cuts the display list — so a reader can tell "3 results because 3 matched" from
+    /// "3 results because the limit is 3".
+    pub total_matches: usize,
 }
 
 /// Coordinator state (§6 `SearchState`, reduced to what the loop here needs).
@@ -457,6 +461,9 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             collapsed.iter().map(|(f, l)| (*f, l.as_slice())).collect();
         fuse_families(&families, &FusionPolicy::default())
     };
+    // Counted before the cascade and the display limit: the honest answer to "how many documents
+    // matched?", which the result list alone cannot give (it is capped at `limit`).
+    let total_matches = fused.len();
     let cap = plan.rerank_count.max(req.limit);
     let cascaded = run_cascade(CascadeInput {
         fused,
@@ -557,6 +564,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         answer,
         usage,
         llm_attempts,
+        total_matches,
     }
 }
 

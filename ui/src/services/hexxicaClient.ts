@@ -12,16 +12,27 @@ import { assertBoundedString, assertNonNull } from '../core/assertions';
 import {
   EngineCoverage,
   EngineMode,
+  LlmAttemptView,
   NodeHealthTelemetry,
   NodeStatusType,
   SearchResult,
   SearchSignal,
+  TokenUsageView,
 } from '../domain/models';
 import { SearchUnavailableError } from './searchErrors';
 
 /** Default API base URL; override with the `VITE_API_BASE` env var. */
 export const HEXXICA_DEFAULT_ENDPOINT = 'http://127.0.0.1:8080';
-const NETWORK_TIMEOUT_MS = 6000;
+/**
+ * How long to wait for `POST /search` before reporting the server unreachable.
+ *
+ * The engine's answer path calls a language model, so a request with `engine: true` is
+ * model-bound: retrieval answers in ~0.1 s, the generated answer in ~3-20 s (and the server caps
+ * the answer at its own timeout, returning the results regardless). A 6 s abort here reported
+ * "Search unavailable" for a server that was working and about to answer, so the budget must
+ * exceed the server's answer timeout.
+ */
+const NETWORK_TIMEOUT_MS = 30000;
 const MAX_RESULTS = 100;
 
 /** Resolve the configured API base URL from the Vite env, else the default. */
@@ -66,6 +77,12 @@ interface RawSearchResponse {
   readonly stop_reason?: unknown;
   readonly trace?: unknown;
   readonly answer?: unknown;
+  /** Token counts of the answer's model call. */
+  readonly usage?: unknown;
+  /** The models tried for the answer, in order. */
+  readonly llm_attempts?: unknown;
+  /** Distinct documents matched before the display limit. */
+  readonly total_matches?: unknown;
 }
 
 /** A mapped, engine-aware search response consumed by the service/UI. */
@@ -76,6 +93,12 @@ export interface SearchResponseData {
   readonly stopReason: string | null;
   readonly trace: readonly string[];
   readonly answer: string | null;
+  /** Token counts of the answer's model call, `null` when the server reported none. */
+  readonly usage: TokenUsageView | null;
+  /** The models tried for the answer, in order. Empty when none was tried. */
+  readonly llmAttempts: readonly LlmAttemptView[];
+  /** Distinct documents matched before the display limit, `null` on an older server. */
+  readonly totalMatches: number | null;
 }
 
 /** An empty but successful response (no network call, no invented rows). */
@@ -86,6 +109,9 @@ export const EMPTY_SEARCH_RESPONSE: SearchResponseData = Object.freeze({
   stopReason: null,
   trace: Object.freeze([]),
   answer: null,
+  usage: null,
+  llmAttempts: Object.freeze([]),
+  totalMatches: null,
 });
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -162,6 +188,50 @@ function readLaneRanks(value: unknown): Readonly<Record<string, number>> | undef
 function readUnitSupport(value: unknown): readonly string[] | undefined {
   const items = readStringArray(value);
   return items.length > 0 ? Object.freeze(items) : undefined;
+}
+
+/**
+ * Read the optional `usage` object: the answer's token counts. Returns `null` when the server
+ * reported none, so an older server renders no token line rather than zeros.
+ */
+function readUsage(value: unknown): TokenUsageView | null {
+  if (!isObject(value)) {
+    return null;
+  }
+  const input = asFiniteNumber(value.input, -1);
+  const output = asFiniteNumber(value.output, -1);
+  const cached = asFiniteNumber(value.cached, -1);
+  if (input < 0 || output < 0 || cached < 0) {
+    return null;
+  }
+  return Object.freeze({ input, output, cached });
+}
+
+/**
+ * Read the optional `llm_attempts` array: which models were tried, which failed and which
+ * answered. Entries missing a provider or model are dropped rather than rendered as blanks.
+ */
+function readAttempts(value: unknown): readonly LlmAttemptView[] {
+  if (!Array.isArray(value)) {
+    return Object.freeze([]);
+  }
+  const attempts: LlmAttemptView[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    const raw = value[i];
+    if (!isObject(raw)) {
+      continue;
+    }
+    const provider = typeof raw.provider === 'string' ? raw.provider : '';
+    const model = typeof raw.model === 'string' ? raw.model : '';
+    if (provider.length === 0 || model.length === 0) {
+      continue;
+    }
+    const error = typeof raw.error === 'string' && raw.error.length > 0 ? raw.error : null;
+    attempts.push(
+      Object.freeze({ provider, model, ok: raw.ok === true, error })
+    );
+  }
+  return Object.freeze(attempts);
 }
 
 /**
@@ -340,6 +410,12 @@ export function mapSearchResponseData(data: unknown): SearchResponseData | null 
     stopReason: typeof stopReasonRaw === 'string' ? stopReasonRaw : null,
     trace: Object.freeze(readStringArray(data.trace)),
     answer,
+    usage: readUsage(data.usage),
+    llmAttempts: readAttempts(data.llm_attempts),
+    totalMatches:
+      typeof data.total_matches === 'number' && Number.isFinite(data.total_matches)
+        ? data.total_matches
+        : null,
   };
 }
 

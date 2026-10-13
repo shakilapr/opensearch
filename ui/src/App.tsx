@@ -36,6 +36,10 @@ export const App: React.FC = () => {
     stopReason,
     answer,
     engineActive,
+    usage,
+    llmAttempts,
+    engineTotalMatches,
+    trace,
     searchError,
     baseUrl,
     setQuery,
@@ -58,6 +62,40 @@ export const App: React.FC = () => {
 
   const isHome = !hasSubmitted;
   const showPagination = !isLoading && searchError === null && results.length > 0;
+
+  /**
+   * Compact token counts: 1981 -> "2.0k", 402 -> "402". Reported figures only — the server
+   * measures them, this only shortens them for the header.
+   */
+  const formatTokens = (n: number): string => {
+    if (n >= 1_000_000) {
+      return `${(n / 1_000_000).toFixed(1)}M`;
+    }
+    if (n >= 1_000) {
+      return `${(n / 1_000).toFixed(1)}k`;
+    }
+    return `${n}`;
+  };
+
+  // The stats line answers three questions at once: how many documents matched, which model
+  // answered, and what that cost. Each part comes from the server; nothing is estimated, and a
+  // part the server did not report is simply absent.
+  const statsParts: string[] = [];
+  if (metrics !== null) {
+    const total = engineTotalMatches ?? metrics.totalMatches;
+    statsParts.push(`${total} result${total === 1 ? '' : 's'} (${metrics.executionTimeMs}ms)`);
+  }
+  const answering = llmAttempts.find((attempt) => attempt.ok) ?? null;
+  if (answering !== null) {
+    statsParts.push(`model: ${answering.provider}/${answering.model}`);
+  }
+  if (usage !== null) {
+    statsParts.push(
+      `tokens in: ${formatTokens(usage.input)}, out: ${formatTokens(usage.output)}, cached: ${formatTokens(usage.cached)}`
+    );
+  }
+  statsParts.push(`Node: ${baseUrl}`);
+  const statsText = statsParts.join(' • ');
 
   return (
     <div className="hx-app" data-theme={isDarkMode ? 'dark' : 'light'}>
@@ -96,11 +134,7 @@ export const App: React.FC = () => {
 
           <main className="hx-results-layout">
             <section className="hx-results-stream">
-              <div className="hx-stats-bar">
-                {metrics !== null
-                  ? `${metrics.totalMatches} results (${metrics.executionTimeMs}ms) • Node: ${baseUrl}`
-                  : `Node: ${baseUrl}`}
-              </div>
+              <div className="hx-stats-bar">{statsText}</div>
 
               <SearchResultsView
                 results={results}
@@ -113,6 +147,8 @@ export const App: React.FC = () => {
                 coverage={coverage}
                 stopReason={stopReason}
                 answer={answer}
+                llmAttempts={llmAttempts}
+                trace={trace}
                 onRetry={retry}
               />
 
