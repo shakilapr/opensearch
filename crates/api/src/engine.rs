@@ -121,6 +121,13 @@ pub struct EngineSearchResponse {
     pub stop_reason: String,
     pub trace: Vec<String>,
     pub answer: Option<String>,
+    /// What the answer call cost the provider: input, output and cached tokens. `None` when no
+    /// answer was requested or the answerer cannot report usage; `0 in / 0 out` means the answer
+    /// came from the cache and no model was called.
+    pub usage: Option<search_core::TokenUsage>,
+    /// The models tried for this answer, in order: which failed (with the provider's error) and
+    /// which answered. Empty when no model was called.
+    pub llm_attempts: Vec<search_core::LlmAttempt>,
 }
 
 /// Stable lowercase wire name for a lane (§9). Used for `lane_ranks` keys —
@@ -446,6 +453,17 @@ impl<A: Answerer + ?Sized> Answerer for SnippetAnswerer<'_, A> {
         let terms = search_core::text::content_tokens(query);
         let resolved: Vec<String> = passages.iter().map(|id| self.passage(id, &terms)).collect();
         self.inner.answer(query, evidence, &resolved)
+    }
+
+    /// Pass through what the wrapped answerer spent — the wrapper must not hide it, or the
+    /// response would report no model usage for an answer a model did produce.
+    fn last_usage(&self) -> Option<search_core::TokenUsage> {
+        self.inner.last_usage()
+    }
+
+    /// Pass through the wrapped answerer's model attempts, for the same reason.
+    fn last_attempts(&self) -> Vec<search_core::LlmAttempt> {
+        self.inner.last_attempts()
     }
 }
 
@@ -852,6 +870,8 @@ pub fn run_engine_search(
             trace
         },
         answer: engine_resp.answer,
+        usage: engine_resp.usage,
+        llm_attempts: engine_resp.llm_attempts,
     })
 }
 

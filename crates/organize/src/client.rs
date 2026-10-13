@@ -10,7 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use crate::cache::{cache_key_hash, count_entries, read_cache, write_cache_atomic};
 use crate::config::LlmConfig;
 use crate::error::OrganizeError;
-use crate::transport::{FallbackTransport, HttpTransport, Transport};
+use crate::transport::{ChainEntry, ChainTransport, HttpTransport, Transport};
 
 /// A snapshot of cache activity. `hits`/`misses` count `complete*` calls that were served from,
 /// or had to populate, the on-disk cache. `entries` is the number of `*.json` files on disk.
@@ -45,28 +45,38 @@ impl LlmClient {
         cache_dir: PathBuf,
         concurrency: usize,
     ) -> Result<Self, OrganizeError> {
-        let api_key = cfg
-            .api_key
-            .clone()
-            .ok_or_else(|| OrganizeError::MissingEnv("KITANI_API_KEY".to_string()))?;
-        let primary: Arc<dyn Transport> = Arc::new(HttpTransport::new(&cfg, api_key)?);
-        // kitani is the primary provider; cun.ai is the fallback, tried only when a primary call
-        // fails. With no fallback credential configured the primary is the only transport, so a
-        // single-provider deployment behaves exactly as before.
-        let transport: Arc<dyn Transport> = match crate::config::fallback_api_key() {
-            Some(fallback_key) => {
-                let mut fb = cfg.clone();
-                fb.base_url = crate::config::fallback_base_url();
-                fb.api_key = Some(fallback_key.clone());
-                let fallback = Arc::new(HttpTransport::new(&fb, fallback_key)?);
-                Arc::new(FallbackTransport::new(
-                    primary,
-                    fallback,
-                    crate::config::fallback_model(),
-                ))
-            }
-            None => primary,
+        let api_key = cfg.api_key.clone().ok_or_else(|| {
+            OrganizeError::MissingEnv(
+                "KITANI_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
+            )
+        })?;
+        // Free models first, on the primary provider, then the fallback provider as the last
+        // resort. A model that fails moves to the next entry: today a dead primary provider means
+        // the planner loses the plan entirely, which shows up as zero expansion probes.
+        let primary_label = crate::transport::provider_label(&cfg.base_url);
+        let listed = crate::config::model_chain();
+        let models = if listed.is_empty() {
+            vec![cfg.model.clone()]
+        } else {
+            listed
         };
+        let mut entries: Vec<ChainEntry> = Vec::with_capacity(models.len() + 1);
+        for model in models {
+            let http = HttpTransport::new(&cfg, api_key.clone())?;
+            entries.push(ChainEntry::new(primary_label.clone(), model, Arc::new(http)));
+        }
+        if let Some(fallback_key) = crate::config::fallback_api_key() {
+            let mut fb = cfg.clone();
+            fb.base_url = crate::config::fallback_base_url();
+            fb.api_key = Some(fallback_key.clone());
+            let http = HttpTransport::new(&fb, fallback_key)?;
+            entries.push(ChainEntry::new(
+                crate::transport::provider_label(&fb.base_url),
+                crate::config::fallback_model(),
+                Arc::new(http),
+            ));
+        }
+        let transport: Arc<dyn Transport> = Arc::new(ChainTransport::new(entries));
         Self::with_transport(cfg, cache_dir, concurrency, transport)
     }
 

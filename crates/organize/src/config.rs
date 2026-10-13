@@ -45,6 +45,22 @@ pub fn llm_user_agent() -> String {
     env_trim("SEARCH_LLM_USER_AGENT").unwrap_or_else(|| DEFAULT_LLM_USER_AGENT.to_string())
 }
 
+/// The ordered model list for the planner: `SEARCH_LLM_MODELS` (comma-separated), else empty (the
+/// caller then uses the single configured model).
+///
+/// Free models first: a model that fails moves to the next entry rather than losing the plan.
+pub fn model_chain() -> Vec<String> {
+    env_trim("SEARCH_LLM_MODELS")
+        .map(|listed| {
+            listed
+                .split(',')
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
 /// [`DEFAULT_FALLBACK_BASE_URL`].
 pub fn fallback_base_url() -> String {

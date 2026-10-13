@@ -56,6 +56,23 @@ pub enum Action {
 pub trait Answerer: Send + Sync {
     fn answer(&self, query: &str, evidence: &[EvidenceRecord], passages: &[String])
         -> Result<String, String>;
+
+    /// What the most recent [`answer`](Answerer::answer) call cost the provider, when the
+    /// implementation can report it.
+    ///
+    /// Defaulted to `None` so a fake answerer stays a fake: the engine treats `None` as "not
+    /// reported" and omits usage from the response rather than inventing zeros.
+    fn last_usage(&self) -> Option<search_core::TokenUsage> {
+        None
+    }
+
+    /// The model attempts of the most recent [`answer`](Answerer::answer) call, in order — which
+    /// models were tried, which failed and which answered.
+    ///
+    /// Defaulted to empty, for the same reason as [`last_usage`](Answerer::last_usage).
+    fn last_attempts(&self) -> Vec<search_core::LlmAttempt> {
+        Vec::new()
+    }
 }
 
 /// Everything the loop needs, injected so the crate stays hermetic.
@@ -109,6 +126,12 @@ pub struct SearchResponse {
     /// §16/§22.1 — the optional generated answer. `None` when no `Answerer` is injected, when
     /// the answerer errors, or when a lexical-only request is made. It never changes `results`.
     pub answer: Option<String>,
+    /// What the answer call cost, when the answerer reports it (`None` when no answer was asked
+    /// for, or the implementation cannot report usage).
+    pub usage: Option<search_core::TokenUsage>,
+    /// The model attempts behind `answer`, in order: which models were tried, which failed and
+    /// which answered. Empty when nothing was tried.
+    pub llm_attempts: Vec<search_core::LlmAttempt>,
 }
 
 /// Coordinator state (§6 `SearchState`, reduced to what the loop here needs).
@@ -499,6 +522,8 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
 
     // ---- Answer generation (§16/§22.1): strictly after selection; must not alter eligibility. ----
     let mut answer: Option<String> = None;
+    let mut usage: Option<search_core::TokenUsage> = None;
+    let mut llm_attempts: Vec<search_core::LlmAttempt> = Vec::new();
     if let Some(a) = deps.answerer {
         let passages: Vec<String> = results.iter().map(|r| r.doc_id.clone()).collect();
         match a.answer(&req.query, &records, &passages) {
@@ -508,10 +533,31 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             }
             Err(e) => trace.push(format!("answer failed: {e}")),
         }
+        // Read back what the call cost and which models it took — after the call, so a model that
+        // failed before a later one succeeded is still reported.
+        usage = a.last_usage();
+        llm_attempts = a.last_attempts();
+        for attempt in &llm_attempts {
+            trace.push(format!("llm: {}", attempt.summary()));
+        }
+        if let Some(u) = usage {
+            trace.push(format!(
+                "llm: tokens in={} out={} cached={}",
+                u.input, u.output, u.cached
+            ));
+        }
     }
 
     timing::record("engine_assembly", t_assembly);
-    SearchResponse { results, coverage, stop_reason, trace, answer }
+    SearchResponse {
+        results,
+        coverage,
+        stop_reason,
+        trace,
+        answer,
+        usage,
+        llm_attempts,
+    }
 }
 
 /// One trace line naming the document that satisfied each unit.

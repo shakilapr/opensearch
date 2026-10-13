@@ -38,7 +38,7 @@ pub use config::{
 pub use error::OrganizeError;
 pub use prompt::{build_prompt, parse_response, Organized};
 pub use queryplan::{build_query_prompt, parse_plan, QueryPlan};
-pub use transport::{FallbackTransport, Transport};
+pub use transport::{ChainEntry, ChainTransport, FallbackTransport, Transport};
 
 /// Re-exported verbatim: the organizer emits the dataset pack record, not a look-alike.
 pub use search_dataset::Record;

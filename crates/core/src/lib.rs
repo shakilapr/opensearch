@@ -9,9 +9,11 @@ pub mod contract;
 pub mod error;
 pub mod ids;
 pub mod limits;
+pub mod llm;
 pub mod manifest;
 pub mod text;
 pub mod time;
+pub mod usage;
 
 pub use contract::{
     Intent, QueryAnalysis, SearchFilters, SearchRequest, SearchResponse, SearchResult,
@@ -21,4 +23,6 @@ pub use ids::{
     ContentId, DocId, DocVerId, DomainId, ManifestId, OpKey, ResourceId, SourceId, WorkId,
 };
 pub use limits::Limits;
+pub use llm::LlmAttempt;
 pub use manifest::{IndexManifest, Provenance};
+pub use usage::TokenUsage;

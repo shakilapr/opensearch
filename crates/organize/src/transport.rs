@@ -19,6 +19,102 @@ pub trait Transport: Send + Sync {
     async fn chat(&self, model: &str, prompt: &str) -> Result<String, OrganizeError>;
 }
 
+/// One model to try: a provider label for reporting, the model id, and the transport reaching it.
+pub struct ChainEntry {
+    /// Short provider label for reporting (e.g. `openrouter`, `crowbot`). Never a credential.
+    pub provider: String,
+    /// The model id this entry asks for.
+    pub model: String,
+    transport: Arc<dyn Transport>,
+}
+
+impl ChainEntry {
+    /// Build an entry. `provider` is the reporting label derived from the base URL.
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        transport: Arc<dyn Transport>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            transport,
+        }
+    }
+}
+
+/// Derive a short, credential-free provider label from a base URL (`https://api.crowbot.sh/v1` →
+/// `crowbot`).
+pub fn provider_label(base_url: &str) -> String {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or(base_url);
+    let host = host.trim_start_matches("www.").trim_start_matches("api.");
+    host.split('.').next().unwrap_or(host).to_string()
+}
+
+/// Tries each entry **in order** and returns the first completion that works.
+///
+/// The planner's "free models first, and if one fails try another" policy: a model that fails —
+/// rate limit, capacity, timeout — moves to the next entry instead of losing the whole plan (which
+/// today means zero expansion probes and a visibly worse search). Every attempt is logged (`WARN`
+/// naming the provider, model and the provider's own error; `INFO` for the one that answered).
+pub struct ChainTransport {
+    entries: Vec<ChainEntry>,
+}
+
+impl ChainTransport {
+    /// Build a chain over `entries`, tried in the order given.
+    pub fn new(entries: Vec<ChainEntry>) -> Self {
+        Self { entries }
+    }
+}
+
+#[async_trait]
+impl Transport for ChainTransport {
+    /// `model` is ignored: each entry answers with **its own** model id (entries may live on
+    /// different providers, which do not share model names).
+    async fn chat(&self, _model: &str, prompt: &str) -> Result<String, OrganizeError> {
+        if self.entries.is_empty() {
+            return Err(OrganizeError::Config("the model chain is empty".to_string()));
+        }
+
+        let mut tried: Vec<String> = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            match entry.transport.chat(&entry.model, prompt).await {
+                Ok(body) => {
+                    tracing::info!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        tried = tried.len() + 1,
+                        "planner llm: answered"
+                    );
+                    return Ok(body);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        error = %err,
+                        "planner llm: model failed; trying the next one"
+                    );
+                    tried.push(format!("{} {} failed ({err})", entry.provider, entry.model));
+                }
+            }
+        }
+
+        Err(OrganizeError::Http(format!(
+            "all {} model(s) failed: {}",
+            tried.len(),
+            tried.join("; ")
+        )))
+    }
+}
+
 /// A transport that retries on a **second provider** when the primary fails.
 ///
 /// The project's primary provider is kitani; cun.ai is the fallback. Only a *failure* falls over
@@ -154,6 +250,76 @@ mod fallback_tests {
         let msg = err.to_string();
         assert!(msg.contains("primary provider failed"), "{msg}");
         assert!(msg.contains("fallback provider failed"), "{msg}");
+    }
+
+    // ---- the model chain (free models first, next one on failure) ----
+
+    #[test]
+    fn provider_label_reads_the_host_without_the_scheme_or_path() {
+        assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
+        assert_eq!(provider_label("https://openrouter.ai/api/v1"), "openrouter");
+        assert_eq!(provider_label("https://www.cun.ai/v1"), "cun");
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_moves_to_the_next_one() {
+        let first = Fake::new(true);
+        let second = Fake::new(false);
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", first.clone()),
+            ChainEntry::new("crowbot", "deepseek-v4.1-flash", second.clone()),
+        ]);
+
+        let out = chain.chat("ignored", "p").await.expect("the second answers");
+
+        assert_eq!(out, "ok:deepseek-v4.1-flash");
+        assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.seen.lock().unwrap().as_slice(), ["deepseek-v4.1-flash"]);
+    }
+
+    #[tokio::test]
+    async fn a_working_first_model_stops_the_chain() {
+        let first = Fake::new(false);
+        let second = Fake::new(false);
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", first.clone()),
+            ChainEntry::new("crowbot", "deepseek-v4.1-flash", second.clone()),
+        ]);
+
+        let out = chain.chat("ignored", "p").await.expect("the first answers");
+
+        assert_eq!(out, "ok:free-a:free");
+        assert_eq!(
+            second.calls.load(Ordering::SeqCst),
+            0,
+            "a working free model must not spend a call on the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_model_failing_reports_each_one_by_name() {
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", Fake::new(true)),
+            ChainEntry::new("openrouter", "free-b:free", Fake::new(true)),
+            ChainEntry::new("crowbot", "deepseek-v4.1-flash", Fake::new(true)),
+        ]);
+
+        let err = chain.chat("ignored", "p").await.expect_err("all fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("all 3 model(s) failed"), "{msg}");
+        for model in ["free-a:free", "free-b:free", "deepseek-v4.1-flash"] {
+            assert!(msg.contains(model), "the error must name {model}: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_chain_is_a_config_error_not_a_silent_empty_plan() {
+        let chain = ChainTransport::new(Vec::new());
+
+        let err = chain.chat("ignored", "p").await.expect_err("no entries");
+
+        assert!(matches!(err, OrganizeError::Config(_)), "{err:?}");
     }
 }
 /// Real HTTP transport: `POST {base_url}/chat/completions` with a bearer token.

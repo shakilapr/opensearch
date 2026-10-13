@@ -94,10 +94,12 @@ pub fn is_enabled() -> bool {
     }
 }
 
-/// The API key, read from `SEARCH_LLM_API_KEY` (preferred) or `KITANI_API_KEY`. Never logged or
-/// persisted, and never read from a file.
+/// The API key, read from `SEARCH_LLM_API_KEY` (preferred), else `OPENROUTER_API_KEY`, else
+/// `KITANI_API_KEY`. Never logged or persisted, and never read from a file.
 pub fn api_key() -> Option<String> {
-    env_trim("SEARCH_LLM_API_KEY").or_else(|| env_trim("KITANI_API_KEY"))
+    env_trim("SEARCH_LLM_API_KEY")
+        .or_else(|| env_trim("OPENROUTER_API_KEY"))
+        .or_else(|| env_trim("KITANI_API_KEY"))
 }
 
 /// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
@@ -118,6 +120,24 @@ pub fn fallback_model() -> String {
 /// the environment only, never from a file, never logged.
 pub fn fallback_api_key() -> Option<String> {
     env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
+}
+
+/// The ordered model list for the answer path: `SEARCH_LLM_MODELS` (comma-separated), else empty
+/// (the caller then uses the single configured model).
+///
+/// This is the "free models first, and if one fails try another" list. Order is the order tried;
+/// the first model that answers wins, so the cheapest/most reliable free model should come first
+/// and a paid or self-hosted model last.
+pub fn model_chain() -> Vec<String> {
+    env_trim("SEARCH_LLM_MODELS")
+        .map(|listed| {
+            listed
+                .split(',')
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The `User-Agent` for LLM requests: `SEARCH_LLM_USER_AGENT`, else [`DEFAULT_LLM_USER_AGENT`].

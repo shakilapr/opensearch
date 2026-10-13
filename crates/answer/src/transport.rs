@@ -79,6 +79,130 @@ impl Transport for FallbackTransport {
     }
 }
 
+/// One model to try on the search path: a provider label for reporting, the model id, and the
+/// transport that reaches it.
+pub struct ChainEntry {
+    /// Short provider label for reporting (e.g. `openrouter`, `crowbot`). Never a credential.
+    pub provider: String,
+    /// The model id this entry asks for.
+    pub model: String,
+    transport: Arc<dyn Transport>,
+}
+
+impl ChainEntry {
+    /// Build an entry. `provider` is the reporting label derived from the base URL.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>, transport: Arc<dyn Transport>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            transport,
+        }
+    }
+}
+
+/// Derive a short, credential-free provider label from a base URL (`https://api.crowbot.sh/v1` →
+/// `crowbot`).
+pub fn provider_label(base_url: &str) -> String {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or(base_url);
+    let host = host.trim_start_matches("www.").trim_start_matches("api.");
+    host.split('.').next().unwrap_or(host).to_string()
+}
+
+/// Tries each entry **in order** and returns the first completion that works.
+///
+/// This is the "if the free model fails, try another free model" policy made visible: every
+/// attempt is logged (`WARN` naming the provider, model and the provider's own error; `INFO` for
+/// the one that answered) and recorded, so the caller can report which models were tried, which
+/// failed and which was used. A chain of one entry behaves exactly like a single transport.
+pub struct ChainTransport {
+    entries: Vec<ChainEntry>,
+    attempts: std::sync::Mutex<Vec<search_core::LlmAttempt>>,
+}
+
+impl ChainTransport {
+    /// Build a chain over `entries`, tried in the order given.
+    pub fn new(entries: Vec<ChainEntry>) -> Self {
+        Self {
+            entries,
+            attempts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The attempts of the most recent [`chat`](Transport::chat) call, in order.
+    pub fn last_attempts(&self) -> Vec<search_core::LlmAttempt> {
+        self.attempts
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn record(&self, attempts: Vec<search_core::LlmAttempt>) {
+        if let Ok(mut guard) = self.attempts.lock() {
+            *guard = attempts;
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for ChainTransport {
+    /// `model` is ignored: each entry answers with **its own** model id (the entries may live on
+    /// different providers, which do not share model names).
+    async fn chat(&self, _model: &str, prompt: &str) -> Result<String, AnswerError> {
+        // A chain with no entries cannot answer; make the misconfiguration explicit rather than
+        // returning an empty body.
+        if self.entries.is_empty() {
+            return Err(AnswerError::Config("the model chain is empty".to_string()));
+        }
+
+        let mut attempts: Vec<search_core::LlmAttempt> = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            match entry.transport.chat(&entry.model, prompt).await {
+                Ok(body) => {
+                    tracing::info!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        tried = attempts.len() + 1,
+                        "llm: answered"
+                    );
+                    attempts.push(search_core::LlmAttempt::ok(&entry.provider, &entry.model));
+                    self.record(attempts);
+                    return Ok(body);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %entry.provider,
+                        model = %entry.model,
+                        error = %err,
+                        "llm: model failed; trying the next one"
+                    );
+                    attempts.push(search_core::LlmAttempt::failed(
+                        &entry.provider,
+                        &entry.model,
+                        err.to_string(),
+                    ));
+                }
+            }
+        }
+
+        self.record(attempts.clone());
+        let tried = attempts
+            .iter()
+            .map(|a| a.summary())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(AnswerError::Http(format!(
+            "all {} model(s) failed: {tried}",
+            attempts.len()
+        )))
+    }
+}
+
 /// Real HTTP transport: `POST {base_url}/chat/completions` with a bearer token.
 ///
 /// The API key is held only in memory (moved in at construction) and is never logged or embedded
@@ -238,5 +362,87 @@ mod fallback_tests {
         let msg = err.to_string();
         assert!(msg.contains("primary provider failed"), "{msg}");
         assert!(msg.contains("fallback provider failed"), "{msg}");
+    }
+
+    // ---- the model chain (free models first, next one on failure) ----
+
+    #[test]
+    fn provider_label_reads_the_host_without_the_scheme_or_path() {
+        assert_eq!(provider_label("https://api.crowbot.sh/v1"), "crowbot");
+        assert_eq!(provider_label("https://openrouter.ai/api/v1"), "openrouter");
+        assert_eq!(provider_label("https://www.cun.ai/v1"), "cun");
+    }
+
+    #[tokio::test]
+    async fn a_failing_free_model_moves_to_the_next_one() {
+        let first = Fake::new(true);
+        let second = Fake::new(false);
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", first.clone()),
+            ChainEntry::new("openrouter", "free-b:free", second.clone()),
+        ]);
+
+        let out = chain.chat("ignored", "p").await.expect("the second answers");
+
+        assert_eq!(out, "ok:free-b:free");
+        assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.seen.lock().unwrap().as_slice(), ["free-b:free"]);
+        let attempts = chain.last_attempts();
+        assert_eq!(attempts.len(), 2);
+        assert!(!attempts[0].ok, "the first model failed");
+        assert_eq!(attempts[0].model, "free-a:free");
+        assert_eq!(attempts[0].error.as_deref(), Some("transport error: primary is down"));
+        assert!(attempts[1].ok, "the second model answered");
+        assert_eq!(attempts[1].model, "free-b:free");
+    }
+
+    #[tokio::test]
+    async fn a_working_first_model_stops_the_chain() {
+        let first = Fake::new(false);
+        let second = Fake::new(false);
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", first.clone()),
+            ChainEntry::new("crowbot", "deepseek-v4.1-flash", second.clone()),
+        ]);
+
+        let out = chain.chat("ignored", "p").await.expect("the first answers");
+
+        assert_eq!(out, "ok:free-a:free");
+        assert_eq!(
+            second.calls.load(Ordering::SeqCst),
+            0,
+            "a working free model must not spend a call on the paid fallback"
+        );
+        assert_eq!(chain.last_attempts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_model_failing_reports_each_one_by_name() {
+        let chain = ChainTransport::new(vec![
+            ChainEntry::new("openrouter", "free-a:free", Fake::new(true)),
+            ChainEntry::new("openrouter", "free-b:free", Fake::new(true)),
+            ChainEntry::new("crowbot", "deepseek-v4.1-flash", Fake::new(true)),
+        ]);
+
+        let err = chain.chat("ignored", "p").await.expect_err("all fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("all 3 model(s) failed"), "{msg}");
+        for model in ["free-a:free", "free-b:free", "deepseek-v4.1-flash"] {
+            assert!(msg.contains(model), "the error must name {model}: {msg}");
+        }
+        let attempts = chain.last_attempts();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|a| !a.ok));
+    }
+
+    #[tokio::test]
+    async fn an_empty_chain_is_a_config_error_not_a_silent_empty_answer() {
+        let chain = ChainTransport::new(Vec::new());
+
+        let err = chain.chat("ignored", "p").await.expect_err("no entries");
+
+        assert!(matches!(err, AnswerError::Config(_)), "{err:?}");
+        assert!(chain.last_attempts().is_empty());
     }
 }

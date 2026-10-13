@@ -21,7 +21,7 @@ use crate::cache::{cache_key_hash, count_entries, read_cache, write_cache_atomic
 use crate::config::AnswerConfig;
 use crate::error::AnswerError;
 use crate::prompt::{build_prompt, parse_chat_response, PROMPT_VERSION};
-use crate::transport::Transport;
+use crate::transport::{ChainTransport, Transport};
 
 /// A snapshot of cache activity. `hits`/`misses` count `answer` calls served from, or populating,
 /// the on-disk cache. `entries` is the number of `*.json` files on disk.
@@ -41,6 +41,12 @@ struct Inner {
     hits: AtomicU64,
     misses: AtomicU64,
     rt: tokio::runtime::Runtime,
+    /// The chain this client was built over, when it was: lets the attempts of the last call be read
+    /// back (which models were tried, which failed, which answered).
+    chain: Option<Arc<ChainTransport>>,
+    /// Usage of the most recent model call. `None` until one happens; a cache hit records zeros,
+    /// because no tokens were sent.
+    last_usage: Mutex<Option<search_core::TokenUsage>>,
 }
 
 /// LLM answerer implementing [`search_engine::Answerer`].
@@ -55,6 +61,16 @@ pub struct LlmAnswerer {
 impl LlmAnswerer {
     /// Build a client with a caller-supplied transport (hermetic tests, or a custom backend).
     pub fn with_transport(cfg: AnswerConfig, transport: Arc<dyn Transport>) -> Result<Self, AnswerError> {
+        Self::with_transport_and_chain(cfg, transport, None)
+    }
+
+    /// Build a client over a [`ChainTransport`], so the attempts of each call can be reported
+    /// alongside the answer. `chain` must be the same object as `transport` when it is one.
+    pub fn with_transport_and_chain(
+        cfg: AnswerConfig,
+        transport: Arc<dyn Transport>,
+        chain: Option<Arc<ChainTransport>>,
+    ) -> Result<Self, AnswerError> {
         std::fs::create_dir_all(&cfg.cache_dir)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -71,8 +87,17 @@ impl LlmAnswerer {
                 cfg,
                 transport,
                 rt,
+                chain,
+                last_usage: Mutex::new(None),
             }),
         })
+    }
+
+    /// Record what the most recent call cost (see [`Inner::last_usage`]).
+    fn record_usage(&self, usage: Option<search_core::TokenUsage>) {
+        if let Ok(mut guard) = self.inner.last_usage.lock() {
+            *guard = usage;
+        }
     }
 
     /// The configured model id.
@@ -121,6 +146,9 @@ impl LlmAnswerer {
         // Fast path: no lock, no transport.
         if let Some(hit) = read_cache(&self.inner.cache_dir, &hash) {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            // A cache hit sent no tokens: report zeros rather than a stale figure from an earlier
+            // call, so "0 in / 0 out" reads as "nothing was asked of a model".
+            self.record_usage(Some(search_core::TokenUsage::default()));
             return Ok(hit);
         }
 
@@ -137,6 +165,7 @@ impl LlmAnswerer {
         // Double-checked: a peer may have populated the entry while we waited.
         if let Some(hit) = read_cache(&self.inner.cache_dir, &hash) {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            self.record_usage(Some(search_core::TokenUsage::default()));
             return Ok(hit);
         }
 
@@ -153,6 +182,13 @@ impl LlmAnswerer {
                 .map_err(|_| AnswerError::Config("concurrency semaphore closed".to_string()))?;
             self.inner.transport.chat(&model, &prompt).await?
         };
+
+        // Record what the call cost before parsing: the provider was paid even if its body turns
+        // out to be unparseable.
+        let usage = serde_json::from_str::<serde_json::Value>(&body)
+            .map(|v| search_core::TokenUsage::from_provider_json(&v))
+            .unwrap_or_default();
+        self.record_usage(Some(usage));
 
         let answer = parse_chat_response(&body)?;
         write_cache_atomic(
@@ -176,5 +212,20 @@ impl search_engine::Answerer for LlmAnswerer {
     ) -> Result<String, String> {
         self.block_on(self.answer_inner(query, evidence, passages))
             .map_err(|e| e.to_string())
+    }
+
+    /// What the most recent answer call cost the provider (`0 in / 0 out` on a cache hit, because
+    /// nothing was sent).
+    fn last_usage(&self) -> Option<search_core::TokenUsage> {
+        self.inner.last_usage.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// The models tried by the most recent answer call, in order: which failed and which answered.
+    fn last_attempts(&self) -> Vec<search_core::LlmAttempt> {
+        self.inner
+            .chain
+            .as_ref()
+            .map(|chain| chain.last_attempts())
+            .unwrap_or_default()
     }
 }

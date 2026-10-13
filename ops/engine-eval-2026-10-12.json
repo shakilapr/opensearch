@@ -1,0 +1,148 @@
+{
+  "base": "https://search.hexxica.space",
+  "mode": "fast",
+  "queries": 8,
+  "rows": [
+    {
+      "query": "what is retrieval augmented generation",
+      "expect": "answer",
+      "kind": "none",
+      "why": "Wikipedia + vLLM + cookbook pages define it",
+      "stop_reason": "limit_reached",
+      "coverage": 1.0,
+      "mandatory_ok": true,
+      "unsupported": [],
+      "results": 5,
+      "top_title": "Retrieval-Augmented Generation - vLLM",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.21
+    },
+    {
+      "query": "what is a mixture of experts model",
+      "expect": "either",
+      "kind": "none",
+      "why": "in-scope and covered, but this index only mentions MoE without defining it, so an honest refusal is the correct answer",
+      "stop_reason": "limit_reached",
+      "coverage": 1.0,
+      "mandatory_ok": true,
+      "unsupported": [],
+      "results": 5,
+      "top_title": "Paper page - E-MoE: Enhanced Mixture-of-Experts for Non-Factorized Diffusion Language Models",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.22
+    },
+    {
+      "query": "what is a transformer",
+      "expect": "either",
+      "kind": "none",
+      "why": "the original corpus gap: may still refuse honestly",
+      "stop_reason": "limit_reached",
+      "coverage": 1.0,
+      "mandatory_ok": true,
+      "unsupported": [],
+      "results": 5,
+      "top_title": "Vision transformer - Wikipedia",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.25
+    },
+    {
+      "query": "how does paged attention reduce memory use in vllm",
+      "expect": "either",
+      "kind": "none",
+      "why": "depends on whether the explaining vLLM page is indexed",
+      "stop_reason": "limit_reached",
+      "coverage": 0.0,
+      "mandatory_ok": false,
+      "unsupported": [
+        "U1"
+      ],
+      "results": 5,
+      "top_title": "Paged Attention - vLLM",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.37
+    },
+    {
+      "query": "how does the tantivy index store field values",
+      "expect": "either",
+      "kind": "none",
+      "why": "docs.rs/tantivy is the largest source, but coverage is index-dependent",
+      "stop_reason": "limit_reached",
+      "coverage": 1.0,
+      "mandatory_ok": true,
+      "unsupported": [],
+      "results": 5,
+      "top_title": "tantivy::store - Rust",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.32
+    },
+    {
+      "query": "what is the capital of peru",
+      "expect": "refuse",
+      "kind": "none",
+      "why": "not an LLM-topic corpus: must not be answered",
+      "stop_reason": "limit_reached",
+      "coverage": 0.0,
+      "mandatory_ok": false,
+      "unsupported": [
+        "U1"
+      ],
+      "results": 5,
+      "top_title": "Aeron and QuestDB: building open infrastructure for capital markets data | QuestDB",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.21
+    },
+    {
+      "query": "who won the 1998 formula one world championship",
+      "expect": "refuse",
+      "kind": "none",
+      "why": "out of scope, and the index has no sports pages",
+      "stop_reason": "limit_reached",
+      "coverage": 0.0,
+      "mandatory_ok": false,
+      "unsupported": [
+        "U1"
+      ],
+      "results": 5,
+      "top_title": "McLaren Racing announces Groq as an Official Partner of the McLaren Formula 1 Team | Groq is the premier neocloud for fast inference",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.23
+    },
+    {
+      "query": "how do i bake sourdough bread at home",
+      "expect": "refuse",
+      "kind": "none",
+      "why": "out of scope: no cooking pages in the seed set",
+      "stop_reason": "limit_reached",
+      "coverage": 0.0,
+      "mandatory_ok": false,
+      "unsupported": [
+        "U1"
+      ],
+      "results": 5,
+      "top_title": "Introduction to Bake | Docker Docs",
+      "answer_chars": 0,
+      "markers": [],
+      "markers_resolvable": null,
+      "seconds": 0.23
+    }
+  ],
+  "failures": [
+    "'what is retrieval augmented generation': expected a grounded answer, got kind=none coverage=1.0 markers=[] resolvable=None answer_chars=0 stop_reason=limit_reached -- a refusal here is a corpus gap"
+  ],
+  "warnings": [],
+  "ok": false
+}
