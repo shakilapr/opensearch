@@ -54,7 +54,7 @@ impl LlmClient {
         // resort. A model that fails moves to the next entry: today a dead primary provider means
         // the planner loses the plan entirely, which shows up as zero expansion probes.
         let primary_label = crate::transport::provider_label(&cfg.base_url);
-        let listed = crate::config::model_chain();
+        let listed = cfg.models.clone();
         let models = if listed.is_empty() {
             vec![cfg.model.clone()]
         } else {

@@ -88,6 +88,14 @@ pub struct LlmConfig {
     pub base_url: String,
     /// Primary (cheap) model id.
     pub model: String,
+    /// The ordered model chain for **this** config's provider, empty when the caller supplies a
+    /// single model.
+    ///
+    /// Resolved by whoever builds the config, not read from the environment by the client: a
+    /// caller pointing at a different vendor (the planner with `SEARCH_PLANNER_BASE_URL`) must not
+    /// ask that vendor for another provider's model ids — doing so returns a 404 per model and
+    /// loses the plan.
+    pub models: Vec<String>,
     /// Escalation (thinking) model id, used once when the primary output fails validation.
     pub escalate_model: String,
     /// API key; `Some` for the real path, `None` only in hermetic tests.
@@ -169,6 +177,7 @@ impl LlmConfig {
         Ok(LlmConfig {
             base_url,
             model,
+            models: model_chain(),
             escalate_model,
             api_key: Some(api_key),
             timeout_s,

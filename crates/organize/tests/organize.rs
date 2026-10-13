@@ -95,6 +95,7 @@ fn config() -> LlmConfig {
     LlmConfig {
         base_url: "http://test.local/v1".to_string(),
         model: PRIMARY.to_string(),
+        models: Vec::new(),
         escalate_model: ESCALATE.to_string(),
         api_key: Some("test-key".to_string()),
         timeout_s: 5,

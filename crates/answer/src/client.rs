@@ -170,6 +170,9 @@ impl LlmAnswerer {
         }
 
         self.inner.misses.fetch_add(1, Ordering::Relaxed);
+        // Clear the previous call's figure: a call that fails must not report the tokens of the
+        // call before it, which would read as a successful (and wrongly sized) model call.
+        self.record_usage(None);
 
         // Bounded parallelism: hold a permit only across the transport call.
         let body = {

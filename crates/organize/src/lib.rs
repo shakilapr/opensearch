@@ -31,7 +31,7 @@ mod transport;
 
 pub use client::{CacheStats, LlmClient};
 pub use config::{
-    fallback_api_key, fallback_base_url, fallback_model, llm_user_agent, LlmConfig,
+    fallback_api_key, fallback_base_url, fallback_model, llm_user_agent, model_chain, LlmConfig,
     DEFAULT_BASE_URL, DEFAULT_ESCALATE_MODEL, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL,
     DEFAULT_LLM_USER_AGENT, DEFAULT_MODEL, DEFAULT_TIMEOUT_S,
 };

@@ -39,7 +39,9 @@ impl Disabled {
             Disabled::FeatureDisabled => {
                 "query planning disabled (SEARCH_PLANNER_ENABLED is unset or 0)"
             }
-            Disabled::MissingKey => "query planning disabled (KITANI_API_KEY is not set)",
+            Disabled::MissingKey => {
+                "query planning disabled (no API key: SEARCH_PLANNER_API_KEY / SEARCH_LLM_API_KEY / KITANI_API_KEY)"
+            }
         }
     }
 }
@@ -72,9 +74,25 @@ pub fn is_enabled() -> bool {
     }
 }
 
-/// The API key, read only from `KITANI_API_KEY`. Never logged or persisted.
+/// Split a comma-separated model list into ids, dropping blanks.
+fn parse_models(listed: &str) -> Vec<String> {
+    listed
+        .split(',')
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// The API key. `SEARCH_PLANNER_API_KEY`, else the shared `SEARCH_LLM_API_KEY` /
+/// `OPENROUTER_API_KEY`, else `KITANI_API_KEY`. Never logged or persisted.
+///
+/// The shared names come first because the planner is part of the engine: when the engine rides
+/// one provider chain, the planner must ride the same one, or it plans against a dead vendor.
 pub fn api_key() -> Option<String> {
-    env_trim("KITANI_API_KEY")
+    env_trim("SEARCH_PLANNER_API_KEY")
+        .or_else(|| env_trim("SEARCH_LLM_API_KEY"))
+        .or_else(|| env_trim("OPENROUTER_API_KEY"))
+        .or_else(|| env_trim("KITANI_API_KEY"))
 }
 
 /// The reason the planner is disabled. Only meaningful when [`PlannerConfig::from_env`] returns
@@ -113,14 +131,32 @@ impl PlannerConfig {
         }
         let api_key = api_key().ok_or(Disabled::MissingKey)?;
 
+        // The planner rides the engine's provider chain when one is configured (`SEARCH_LLM_*`), so
+        // the engine does not talk to two vendors with one model list; the planner-specific
+        // variables still win, then the vendor's own.
+        let shared_base_url = env_trim("SEARCH_LLM_BASE_URL");
         let base_url = env_trim("SEARCH_PLANNER_BASE_URL")
+            .or_else(|| shared_base_url.clone())
             .or_else(|| env_trim("KITANI_BASE_URL"))
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
         let model = env_trim("SEARCH_PLANNER_MODEL")
+            .or_else(|| env_trim("SEARCH_LLM_MODEL"))
             .or_else(|| env_trim("KITANI_MODEL"))
             .unwrap_or_else(|| DEFAULT_PLANNER_MODEL.to_string());
+        // Inherit the shared model list only when the planner actually points at the shared
+        // provider: the ids in it name models of *that* vendor, so sending them anywhere else is a
+        // guaranteed 404 per model.
+        let models = match env_trim("SEARCH_PLANNER_MODELS") {
+            Some(listed) => parse_models(&listed),
+            None => match shared_base_url.as_deref() {
+                Some(shared) if base_url == shared.trim_end_matches('/') => {
+                    search_organize::model_chain()
+                }
+                _ => Vec::new(),
+            },
+        };
         let timeout_s = env_trim("SEARCH_PLANNER_TIMEOUT_S")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
@@ -140,6 +176,7 @@ impl PlannerConfig {
                 // mirrors `model` rather than leaving a misleading second id.
                 escalate_model: model.clone(),
                 model,
+                models,
                 api_key: Some(api_key),
                 timeout_s,
             },

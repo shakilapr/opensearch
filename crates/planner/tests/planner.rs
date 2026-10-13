@@ -18,6 +18,7 @@ fn cfg(_dir: &Path) -> LlmConfig {
     LlmConfig {
         base_url: "http://planner.test/v1".to_string(),
         model: "test-model".to_string(),
+        models: Vec::new(),
         escalate_model: "test-model".to_string(),
         api_key: None,
         timeout_s: 5,
