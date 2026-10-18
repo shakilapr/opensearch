@@ -698,30 +698,58 @@ impl Indexer {
         Ok(docs)
     }
 
-    /// Doc count + segment count over base and overlay, deduped by `doc_id`,
-    /// tombstones excluded.
-    fn stats(&self) -> AppResult<(u64, u64)> {
+    /// Doc count (base ∪ overlay, deduped by `doc_id`, tombstones excluded) and base segments.
+    ///
+    /// This is the number `publish_manifest` reports, and it must not cost O(corpus). The previous
+    /// implementation ran `AllQuery` over both indices and materialised every stored field, so each
+    /// publish grew with the index — and because ingest published once per batch (and once per
+    /// document before that), total work was quadratic.
+    ///
+    /// `Searcher::num_docs()` returns the number of *alive* documents (tantivy excludes deletes),
+    /// so the base half is O(segments). Only the overlay needs a predicate: it is where documents
+    /// that are not yet published live, and an overlay copy shadows its base copy, so counting both
+    /// would double-count. `published_generation` is the generation this publish is creating — a
+    /// document stamped with it becomes visible in the same step, so it counts.
+    ///
+    /// Cost: O(segments) + O(overlay).
+    fn stats(&self, published_generation: u64) -> AppResult<(u64, u64)> {
         let base_searcher = self.base_reader.searcher();
         let overlay_searcher = self.overlay_reader.searcher();
         let base_segments = base_searcher.segment_readers().len() as u64;
 
-        let mut live: HashMap<String, ()> = HashMap::new();
-        for searcher in [&base_searcher, &overlay_searcher] {
-            let addrs = searcher.search(&AllQuery, &DocSetCollector).ix()?;
-            for addr in addrs {
-                if fast_u64(searcher, addr, "tombstone") != 0 {
-                    continue;
-                }
-                let doc: TantivyDocument = searcher.doc(addr).ix()?;
-                let id = doc
-                    .get_first(self.fields.doc_id)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                live.insert(id, ());
+        // Every base document is published by construction (a write there is followed by a publish).
+        let mut live = base_searcher.num_docs();
+
+        for addr in overlay_searcher.search(&AllQuery, &DocSetCollector).ix()? {
+            if fast_u64(&overlay_searcher, addr, "tombstone") != 0 {
+                continue;
+            }
+            if fast_u64(&overlay_searcher, addr, "visible_generation") > published_generation {
+                continue;
+            }
+            let doc: TantivyDocument = overlay_searcher.doc(addr).ix()?;
+            let id = doc
+                .get_first(self.fields.doc_id)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if id.is_empty() {
+                continue;
+            }
+            // One live document that exists in both indices: the overlay copy replaces the base
+            // copy, which `num_docs()` above already counted.
+            let term = Term::from_field_text(self.fields.doc_id, id);
+            let shadows_base = !base_searcher
+                .search(
+                    &TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic),
+                    &DocSetCollector,
+                )
+                .ix()?
+                .is_empty();
+            if !shadows_base {
+                live += 1;
             }
         }
-        Ok((live.len() as u64, base_segments))
+        Ok((live, base_segments))
     }
 
     /// Publish a manifest row: generation = prev + 1, with doc/segment counts.
@@ -729,10 +757,11 @@ impl Indexer {
     pub fn publish_manifest(&self) -> AppResult<IndexManifest> {
         self.base_reader.reload().ix()?;
         self.overlay_reader.reload().ix()?;
-        let (doc_count, base_segments) = self.stats()?;
 
         let mut state = self.state.lock().unwrap();
         let generation = state.manifest.as_ref().map(|m| m.generation).unwrap_or(0) + 1;
+        // Count for the generation being published, before the manifest exposes it.
+        let (doc_count, base_segments) = self.stats(generation)?;
         let manifest = IndexManifest {
             manifest_id: format!("gen-{generation}"),
             generation,
@@ -1160,6 +1189,56 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "d1");
         assert!(idx2.visible_generation() >= 1, "manifest persisted across reopen");
+    }
+
+    #[test]
+    fn doc_count_is_exact_across_replace_delete_and_duplicate() {
+        // The published count is what the manifest reports, and it used to be produced by scanning
+        // the whole index. It must stay exact now that it is computed from segment metadata plus a
+        // bounded overlay pass: a replacement is one document, a tombstone is none, and re-adding
+        // an existing `doc_id` must not inflate it.
+        let (_t, idx) = tmp();
+        idx.index_batch(vec![
+            doc("d1", "One", "alpha body"),
+            doc("d2", "Two", "beta body"),
+        ])
+        .unwrap();
+        assert_eq!(idx.publish_manifest().unwrap().doc_count, 2);
+
+        // Same doc_id, newer version: still one live document.
+        idx.index_overlay(
+            IndexDoc::new(
+                "d1",
+                "res_d1",
+                "https://example.com/d1",
+                "One v2",
+                "alpha v2",
+            )
+            .with_version(2),
+        )
+        .unwrap();
+        assert_eq!(
+            idx.publish_manifest().unwrap().doc_count,
+            2,
+            "a replacement is still one live document"
+        );
+
+        // Tombstone: not counted.
+        idx.delete("d2").unwrap();
+        assert_eq!(
+            idx.publish_manifest().unwrap().doc_count,
+            1,
+            "tombstoned documents are not live"
+        );
+
+        // Re-adding an existing doc_id must not increase the count.
+        idx.index_batch(vec![doc("d1", "One v3", "alpha v3")])
+            .unwrap();
+        assert_eq!(
+            idx.publish_manifest().unwrap().doc_count,
+            1,
+            "a duplicate add is not a new document"
+        );
     }
 
     #[test]
