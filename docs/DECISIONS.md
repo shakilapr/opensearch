@@ -8,11 +8,18 @@ Each entry states the question, the evidence, the decision, and the cost.
 ## D001 — Stored fields: keep `doc_type` and `language` indexed-not-stored
 
 **Question** (`ops/plan.json` item `stored-fields-decision`). Read-back through
-`Indexer::all_docs` is lossy: `headings`, `entities`, `doc_type`, `language` and
+`Indexer::all_docs` is lossy: `headings`, `doc_type`, `language` and
 `visible_generation` are INDEXED but not STORED in the frozen Tantivy schema
 (`crates/indexer/src/schema.rs:12–31`), so a document rebuilt from the index comes back with
 those fields empty. Options were (a) a schema version bump plus a full re-index, or (b) a
 sidecar. Should we do either?
+
+> **Correction.** `entities` **is** STORED (schema line 23) and was nevertheless being dropped by
+> `Candidate::to_index_doc`, which set it to an empty vector — so every `export --raw` lost the
+> organizing model's key entities even though the index was paying to store them. That is fixed:
+> the field is carried through, and it is now written comma-joined so a multi-word entity survives
+> the round trip. This document previously (and self-contradictorily) listed `entities` as
+> un-stored in its first paragraph.
 
 **Evidence.**
 

@@ -28,8 +28,24 @@ use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Searcher, Term};
 /// read this). First-N-of-body was tried first and reads as boilerplate.
 const SNIPPET_CHARS: usize = 300;
 
-/// Writer arena budget per index. Tantivy needs >= a few MiB per thread.
-const WRITER_BUDGET: usize = 50_000_000;
+/// Writer arena budget per index, in bytes. Tantivy needs >= a few MiB per thread; the default is
+/// deliberately small, so bulk ingest overrides it with `SEARCH_INDEX_WRITER_MB`.
+///
+/// Measured: at 50 MB a 50k-document import wrote ~0.32 MB per document kept (~7x the index size)
+/// because small batches flush small segments that the merge policy then rewrites repeatedly.
+const WRITER_BUDGET: usize = 64_000_000;
+
+/// Writer arena for this process: `SEARCH_INDEX_WRITER_MB` (MiB) when set, else [`WRITER_BUDGET`].
+///
+/// Values below Tantivy's per-thread minimum are ignored rather than made to fail: a bad setting
+/// must not stop the index from opening.
+fn writer_budget() -> usize {
+    std::env::var("SEARCH_INDEX_WRITER_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb >= 16)
+        .map_or(WRITER_BUDGET, |mb| mb * 1024 * 1024)
+}
 const MANIFEST_FILE: &str = "_manifest.json";
 const SCHEMA_HASH_FILE: &str = "_schema_hash";
 
@@ -136,6 +152,9 @@ struct Candidate {
     url: String,
     title: String,
     body: String,
+    /// Key entities, as the organizing model produced them (space-joined in the index). The schema
+    /// STOREs this field, so it is recoverable — the export path used to drop it anyway.
+    entities: String,
     /// Query-relevant excerpt of `body`, set by `collect`; empty means "not
     /// generated" and falls back to the leading characters of the body.
     snippet: String,
@@ -188,6 +207,7 @@ impl Candidate {
             url: text(f.url),
             title: text(f.title),
             body: text(f.body),
+            entities: text(f.entities),
             snippet: String::new(),
             source_id: opt(f.source_id),
             published_at: i64_opt(f.published_at),
@@ -276,9 +296,10 @@ impl Indexer {
         let (base_writer, overlay_writer) = if cfg.read_only {
             (None, None)
         } else {
+            let budget = writer_budget();
             (
-                Some(Mutex::new(base.writer(WRITER_BUDGET).ix()?)),
-                Some(Mutex::new(overlay.writer(WRITER_BUDGET).ix()?)),
+                Some(Mutex::new(base.writer(budget).ix()?)),
+                Some(Mutex::new(overlay.writer(budget).ix()?)),
             )
         };
         let base_reader = base.reader().ix()?;
@@ -669,8 +690,10 @@ impl Indexer {
     ///
     /// Order is `doc_id`-sorted so two runs over the same index are byte-identical.
     ///
-    /// Lossy by design: `headings` and `entities` are not STOREd, so they come back
-    /// empty (see [`Candidate::to_index_doc`]).
+    /// Lossy by design: `headings`, `doc_type` and `language` are INDEXED but not STOREd, so they
+    /// come back empty/default (see [`Candidate::to_index_doc`]). `entities` **is** STOREd and is
+    /// carried through — an earlier version dropped it and silently lost the organizing model's
+    /// key entities on every export.
     pub fn all_docs(&self) -> AppResult<Vec<IndexDoc>> {
         self.base_reader.reload().ix()?;
         self.overlay_reader.reload().ix()?;
@@ -817,7 +840,17 @@ impl Candidate {
             title: self.title.clone(),
             headings: String::new(),
             body: self.body.clone(),
-            entities: Vec::new(),
+            // `entities` IS stored (schema.rs), so an export can carry it; dropping it here made
+            // every export -> import round trip lose the organizing model's key entities.
+            // Split on the comma join used by `IndexDoc::to_tantivy`, which keeps a multi-word
+            // entity ("paged attention") intact; a space split would shred it.
+            entities: self
+                .entities
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             source_id: self.source_id.clone(),
             doc_type: "html".to_string(),
             language: "en".to_string(),
@@ -1200,6 +1233,22 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "d1");
         assert!(idx2.visible_generation() >= 1, "manifest persisted across reopen");
+    }
+
+    #[test]
+    fn all_docs_carries_the_stored_entities() {
+        // `entities` is STORED in the frozen schema, so an export must carry it. It used to be
+        // dropped by `to_index_doc`, which made every export -> import round trip lose the
+        // organizing model's key entities while the schema was still paying to store them.
+        let (_t, idx) = tmp();
+        let mut d = doc("d1", "Entity page", "prose that does not name the topic");
+        d.entities = vec!["zetaquokka".to_string(), "paged attention".to_string()];
+        idx.index_batch(vec![d]).unwrap();
+        idx.publish_manifest().unwrap();
+
+        let docs = idx.all_docs().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].entities, vec!["zetaquokka", "paged attention"]);
     }
 
     #[test]

@@ -116,7 +116,11 @@ impl IndexDoc {
         d.add_text(f("body"), self.body.as_str());
         let body_boost = format!("{} {} {}", self.title, self.headings, self.body);
         d.add_text(f("body_boost"), body_boost);
-        d.add_text(f("entities"), self.entities.join(" "));
+        // Comma-joined, not space-joined: the field is STOREd and read back by `to_index_doc` for
+        // export, and a space join cannot be split again without destroying multi-word entities
+        // ("paged attention" became two entities). Tantivy tokenises on punctuation, so the indexed
+        // terms are unchanged.
+        d.add_text(f("entities"), self.entities.join(", "));
         d.add_text(f("source_id"), self.source_id.clone().unwrap_or_default());
         d.add_text(f("doc_type"), self.doc_type.as_str());
         d.add_text(f("language"), self.language.as_str());
