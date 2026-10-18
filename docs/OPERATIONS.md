@@ -50,7 +50,7 @@ environment (`crates/core::Config::from_env`):
 | `SEARCH_MODEL_CACHE` | `<workspace>/models/fastembed` | where the real embedding weights live (see *Real embedding model*) |
 | `SEARCH_READ_ONLY` | `auto` | `auto` takes the index writer and falls back to a **read-only** open when it is locked (a crawl is running); `1` always read-only, `0` always the writer |
 | `SEARCH_CORS_ORIGIN` | unset | comma-separated origins allowed to call the API from a browser (see *Browser clients and CORS*) |
-| `SEARCH_PLANNER_ENABLED` | unset | opt-in §6/§8 LLM query planning (`search-planner`); needs `KITANI_API_KEY`. See `PLANNER.md` |
+| `SEARCH_PLANNER_ENABLED` | unset | opt-in §6/§8 LLM query planning (`search-planner`); needs `CROWBOT_API_KEY`. See `PLANNER.md` |
 
 ### LLM gateway credentials
 
@@ -60,17 +60,17 @@ keep working unchanged as fallbacks — so a gateway other than the default one 
 
 | variable | overrides | meaning |
 | :--- | :--- | :--- |
-| `SEARCH_LLM_BASE_URL` | `KITANI_BASE_URL` (organize), `SEARCH_ANSWER_BASE_URL` (answer) | OpenAI-chat-compatible endpoint, no trailing `/chat/completions`. |
-| `SEARCH_LLM_API_KEY` | `KITANI_API_KEY` | Credential. |
-| `SEARCH_LLM_MODEL` | `KITANI_MODEL` (organize), `SEARCH_ANSWER_MODEL` (answer) | Primary model id. |
+| `SEARCH_LLM_BASE_URL` | `CROWBOT_BASE_URL` (organize), `SEARCH_ANSWER_BASE_URL` (answer) | OpenAI-chat-compatible endpoint, no trailing `/chat/completions`. |
+| `SEARCH_LLM_API_KEY` | `CROWBOT_API_KEY` | Credential. |
+| `SEARCH_LLM_MODEL` | `CROWBOT_MODEL` (organize), `SEARCH_ANSWER_MODEL` (answer) | Primary model id. |
 
 Precedence is resolved **per variable**, so setting only `SEARCH_LLM_API_KEY` keeps the
-vendor-specific base URL/model. The escalation model (`KITANI_ESCALATE_MODEL`, `search-organize`)
+vendor-specific base URL/model. The escalation model (`CROWBOT_ESCALATE_MODEL`, `search-organize`)
 has no neutral override and is unchanged.
 
 The credential is read **from the environment only** — never from a file, never logged, never put
 in an error message. When neither key variable is set: `search-organize` (`LlmConfig::from_env`)
-fails with `missing environment variable KITANI_API_KEY`, and `search-answer` reports
+fails with `missing environment variable CROWBOT_API_KEY`, and `search-answer` reports
 `Disabled::MissingKey` (answer generation is off).
 
 ## Browser clients and CORS
@@ -335,3 +335,27 @@ The API additionally bounds concurrency (`DEFAULT_MAX_CONCURRENCY` in
 Sizing on the reference box (16 vCPU / 64 GB, no GPU), per the deploy plan: 32–64 async
 HTTP tasks, 4–8 parsers, 2–4 PDF, 2 browser contexts, 2–4 indexers. This is a **single-box**
 system today — see `ROADMAP.md`.
+
+## Bulk ingest: the two knobs, and what each actually buys
+
+`agent0 import` and any bulk path run through `Pipeline::enable_bulk_ingest`, which batches records
+and commits to **base** (spec §6's batch path) rather than the overlay.
+
+| variable | default | effect |
+| :--- | :--- | :--- |
+| `SEARCH_BULK_BATCH` | `512` | records per commit + manifest publish |
+| `SEARCH_INDEX_WRITER_MB` | `64` | Tantivy writer arena per index (MiB, min 16) |
+
+Measured on the reference box over a fixed 50,000-document pack (`scripts/bench_ingest.sh`), so
+these are the numbers any future change should be compared against:
+
+- before batching: **10.7 docs/s**, 3.81 MB written per document kept
+- batch 512, 512 MB arena: **620 docs/s**, 0.31 MB/doc, 21 base segments
+- batch 2048, 512 MB: 421.6 docs/s, 0.28 MB/doc, 18 segments
+- batch 8192, 512 MB: 466.2 docs/s, 0.27 MB/doc, 16 segments
+
+Honest reading: batching and the O(1) publish are what produced the ~58x speedup. The writer arena
+did **not** reduce writes, and bigger batches trade throughput for a ~13% write reduction. The
+remaining ~7x write amplification (13 GB written for a 2 GB index) is merge churn, and fixing it
+needs a merge policy that suppresses background merges during bulk ingest and force-merges once at
+the end — not yet implemented.
