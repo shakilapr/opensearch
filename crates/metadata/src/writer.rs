@@ -95,6 +95,12 @@ pub enum Mutation {
     UpsertManifest {
         manifest_id: String,
         generation: i64,
+        /// `false` reserves the generation without exposing it; `true` publishes it.
+        ///
+        /// Two-phase on purpose: ingest allocates a generation durably before writing anything for
+        /// it, so a crash between the index commit and the publish cannot let that number be handed
+        /// out again (which would make the abandoned batch visible with the next one).
+        published: bool,
         doc_count: i64,
         base_segments: i64,
         created_at: i64,
@@ -992,18 +998,31 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
         Mutation::UpsertManifest {
             manifest_id,
             generation,
+            published,
             doc_count,
             base_segments,
             created_at,
         } => {
-            // Published manifest projection: a duplicate manifest_id is a
-            // no-op, so re-publishing a generation is idempotent.
+            // Idempotent on `generation`: reserving twice keeps one row, and finalizing an already
+            // published generation rewrites the same values. `published_at` is only set when the
+            // row is published, so an unpublished reservation is visibly incomplete.
             tx.execute(
                 "INSERT INTO manifest(manifest_id, generation, published, doc_count,
                         base_segments, created_at, published_at)
-                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5)
-                 ON CONFLICT(manifest_id) DO NOTHING",
-                rusqlite::params![manifest_id, generation, doc_count, base_segments, created_at],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?3 = 1 THEN ?6 END)
+                 ON CONFLICT(generation) DO UPDATE SET
+                     published     = excluded.published,
+                     doc_count     = excluded.doc_count,
+                     base_segments = excluded.base_segments,
+                     published_at  = excluded.published_at",
+                rusqlite::params![
+                    manifest_id,
+                    generation,
+                    published,
+                    doc_count,
+                    base_segments,
+                    created_at
+                ],
             )
             .map_err(crate::db_err)?;
         }

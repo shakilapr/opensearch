@@ -754,12 +754,11 @@ impl Indexer {
 
     /// Publish a manifest row: generation = prev + 1, with doc/segment counts.
     /// Persisted so it survives a reopen (persistence).
-    pub fn publish_manifest(&self) -> AppResult<IndexManifest> {
+    pub fn publish_manifest_at(&self, generation: u64) -> AppResult<IndexManifest> {
         self.base_reader.reload().ix()?;
         self.overlay_reader.reload().ix()?;
 
         let mut state = self.state.lock().unwrap();
-        let generation = state.manifest.as_ref().map(|m| m.generation).unwrap_or(0) + 1;
         // Count for the generation being published, before the manifest exposes it.
         let (doc_count, base_segments) = self.stats(generation)?;
         let manifest = IndexManifest {
@@ -777,6 +776,18 @@ impl Indexer {
         state.manifest = Some(manifest.clone());
         tracing::info!(generation, doc_count, base_segments, "published index manifest");
         Ok(manifest)
+    }
+
+    /// Publish the next generation, for callers with no external allocator (tests, one-shot use).
+    ///
+    /// Ingest must not use this: deriving the generation from the in-memory manifest lets a
+    /// generation be reused after a crash between the commit and the publish, which is exactly how
+    /// an abandoned batch becomes visible with the next one. Those callers allocate from the
+    /// metadata store with [`crate`]-external monotonic state and pass it to
+    /// [`Indexer::publish_manifest_at`].
+    pub fn publish_manifest(&self) -> AppResult<IndexManifest> {
+        let next = self.visible_generation() + 1;
+        self.publish_manifest_at(next)
     }
 
     /// Provenance of a `doc_id`: `Overlay` if a non-tombstone overlay copy

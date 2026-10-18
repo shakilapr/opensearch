@@ -635,6 +635,50 @@ impl Pipeline {
         }
     }
 
+    /// Allocate the next generation durably, before anything is written for it.
+    ///
+    /// The row is inserted with `published = 0`, so the number is consumed even if the process dies
+    /// before the batch is committed. That is what stops a restart from reusing a generation: the
+    /// next allocation is `MAX(generation) + 1` over **all** rows, published or not, so documents
+    /// written for an abandoned attempt stay above the watermark and invisible forever instead of
+    /// being swept in by the next publish.
+    fn reserve_generation(&self) -> AppResult<u64> {
+        let mut w = self.meta.lock().unwrap();
+        let generation: u64 = w
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM manifest",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(search_metadata::db_err)? as u64;
+        w.apply_batch(&[Mutation::UpsertManifest {
+            manifest_id: format!("gen-{generation}"),
+            generation: generation as i64,
+            published: false,
+            doc_count: 0,
+            base_segments: 0,
+            created_at: search_core::time::now_unix_s(),
+        }])?;
+        Ok(generation)
+    }
+
+    /// Flip a reserved generation to published and advance the watermark.
+    fn finalize_generation(&self, manifest: &search_core::IndexManifest) -> AppResult<()> {
+        let mut w = self.meta.lock().unwrap();
+        w.apply_batch(&[Mutation::UpsertManifest {
+            manifest_id: manifest.manifest_id.clone(),
+            generation: manifest.generation as i64,
+            published: true,
+            doc_count: manifest.doc_count as i64,
+            base_segments: manifest.base_segments as i64,
+            created_at: manifest.created_at,
+        }])?;
+        // Monotonic and never lowered, so advancing it after the flag is safe: the gate search
+        // enforces is the manifest file, which was written by `publish_manifest_at`.
+        Watermark::publish(&w, manifest.generation)
+    }
+
     /// Commit + publish every buffered overlay doc in one Tantivy commit and one
     /// manifest, then advance the metadata watermark to match. Idempotent and
     /// cheap when nothing is buffered. Callers that enabled batching must call
@@ -650,7 +694,9 @@ impl Pipeline {
         // Every doc in the batch shares the generation this publish creates, so
         // the watermark gates exactly this batch and no earlier doc is exposed
         // ahead of its own publish.
-        let generation = self.indexer.visible_generation() + 1;
+        // Allocate before writing anything: a crash between the commit and the publish must not let
+        // this generation be handed out again, or the abandoned batch becomes visible with the next.
+        let generation = self.reserve_generation()?;
         let docs: Vec<IndexDoc> = docs
             .into_iter()
             .map(|mut d| {
@@ -659,25 +705,14 @@ impl Pipeline {
             })
             .collect();
         self.index_batch(docs)?;
-        let manifest = self.indexer.publish_manifest()?;
+        let manifest = self.indexer.publish_manifest_at(generation)?;
         tracing::info!(
             target: "agent0::index",
             generation = manifest.generation,
             doc_count = manifest.doc_count,
             "published batched index manifest"
         );
-        let now = search_core::time::now_unix_s();
-        {
-            let mut w = self.meta.lock().unwrap();
-            Watermark::publish(&w, manifest.generation)?;
-            w.apply_batch(&[Mutation::UpsertManifest {
-                manifest_id: manifest.manifest_id.clone(),
-                generation: manifest.generation as i64,
-                doc_count: manifest.doc_count as i64,
-                base_segments: manifest.base_segments as i64,
-                created_at: now,
-            }])?;
-        }
+        self.finalize_generation(&manifest)?;
         *self.overlay_batch_last.lock().unwrap() = Instant::now();
         Ok(())
     }
@@ -1408,7 +1443,15 @@ impl Pipeline {
         }
 
         // LEXICAL_INDEXED (Tantivy overlay)
-        let generation = self.indexer.visible_generation() + 1;
+        let batched = self.batch_overlay.load(AtomicOrdering::Relaxed);
+        // In batched mode the flush assigns the generation to the whole batch, so only the
+        // immediate path reserves one here: a reservation consumes a durable generation even when
+        // the write never happens, and in bulk that would burn one per document.
+        let generation = if batched {
+            self.indexer.visible_generation() + 1
+        } else {
+            self.reserve_generation()?
+        };
         let index_doc = build_index_doc(
             c.resource_id,
             &content_id,
@@ -1422,7 +1465,6 @@ impl Pipeline {
         // Batched mode buffers the doc; `flush_overlay_batch` assigns the final
         // generation and publishes. Every other caller indexes and publishes
         // this one document immediately, exactly as before.
-        let batched = self.batch_overlay.load(AtomicOrdering::Relaxed);
         if batched {
             self.buffer_overlay(index_doc)?;
         } else {
@@ -1443,22 +1485,14 @@ impl Pipeline {
         // Publish manifest + watermark, then VISIBLE. In batched mode this is
         // deferred to `flush_overlay_batch` (one publish per batch).
         if !batched {
-            let manifest = self.indexer.publish_manifest()?;
+            let manifest = self.indexer.publish_manifest_at(generation)?;
             tracing::info!(
                 target: "agent0::index",
                 generation = manifest.generation,
                 doc_count = manifest.doc_count,
                 "published index manifest"
             );
-            let mut w = self.meta.lock().unwrap();
-            Watermark::publish(&w, manifest.generation)?;
-            w.apply_batch(&[Mutation::UpsertManifest {
-                manifest_id: manifest.manifest_id.clone(),
-                generation: manifest.generation as i64,
-                doc_count: manifest.doc_count as i64,
-                base_segments: manifest.base_segments as i64,
-                created_at: c.now,
-            }])?;
+            self.finalize_generation(&manifest)?;
         }
         self.record_stage(&op_key, c.resource_id.as_str(), IngestStage::Visible)?;
         if let Some(l) = c.lease {

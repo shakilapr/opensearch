@@ -422,6 +422,7 @@ fn upsert_manifest_projects_and_is_idempotent() {
     let manifest = || Mutation::UpsertManifest {
         manifest_id: "gen-1".into(),
         generation: 1,
+        published: true,
         doc_count: 4,
         base_segments: 2,
         created_at: 100,

@@ -236,6 +236,58 @@ async fn import_makes_the_structured_extras_searchable() {
 }
 
 #[tokio::test]
+async fn an_abandoned_generation_is_never_reused() {
+    // The crash window: a generation is allocated durably, the batch is written, and the process
+    // dies before the publish. If the next ingest derives its generation from the in-memory
+    // manifest (`visible + 1`) it hands out the same number again, and the abandoned documents
+    // become visible with the new batch. Allocation must be `MAX(generation) + 1` over every row,
+    // published or not.
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = test_config(dir.path());
+    let p = Pipeline::open_with(&cfg, false).unwrap();
+
+    let first = p
+        .import_record(&record("https://example.com/a", "alpha body text"))
+        .unwrap();
+    let g1 = generation_of(&first);
+
+    // Simulate the crash: a reservation with no matching publish.
+    let abandoned = g1 + 1;
+    {
+        let conn = rusqlite::Connection::open(cfg.meta_db()).expect("open metadata db");
+        conn.execute(
+            "INSERT INTO manifest(manifest_id, generation, published, doc_count, base_segments,
+                    created_at, published_at)
+             VALUES (?1, ?2, 0, 0, 0, 1, NULL)",
+            rusqlite::params![format!("gen-{abandoned}"), abandoned as i64],
+        )
+        .expect("reserve an abandoned generation");
+    }
+
+    let second = p
+        .import_record(&record("https://example.com/b", "beta body text"))
+        .unwrap();
+    let g2 = generation_of(&second);
+    assert_ne!(g2, abandoned, "an abandoned generation must never be reused");
+    assert_eq!(
+        g2,
+        abandoned + 1,
+        "allocation is MAX(generation) + 1 across published and unpublished rows"
+    );
+
+    // And the abandoned generation must still be unpublished in the metadata store.
+    let conn = rusqlite::Connection::open(cfg.meta_db()).expect("open metadata db");
+    let published: i64 = conn
+        .query_row(
+            "SELECT published FROM manifest WHERE generation = ?1",
+            rusqlite::params![abandoned as i64],
+            |r| r.get(0),
+        )
+        .expect("read the abandoned row");
+    assert_eq!(published, 0, "the abandoned attempt stays unpublished");
+}
+
+#[tokio::test]
 async fn import_without_extras_still_indexes_a_plain_record() {
     // A raw pack (`export --raw`) carries no structured extras; it must keep working and acquire
     // no fabricated structure.
