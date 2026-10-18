@@ -468,7 +468,7 @@ async fn run_export(args: &[String]) -> ExitCode {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "{e} (set SEARCH_LLM_API_KEY or KITANI_API_KEY, or pass --raw to skip the model)"
+                    "{e} (set SEARCH_LLM_API_KEY or CROWBOT_API_KEY, or pass --raw to skip the model)"
                 );
                 return ExitCode::from(1);
             }
@@ -602,6 +602,18 @@ async fn run_import(args: &[String]) -> ExitCode {
         }
     };
 
+    // Bulk ingest: buffer records and commit them to `base` once per batch (spec §6's batch path)
+    // instead of committing and publishing per record. The previous per-record path called
+    // `publish_manifest` once per document, and that publish scans the whole index for its doc
+    // count, so import cost grew quadratically with corpus size — measured at 12 docs/s on a fresh
+    // index falling to 5.6 docs/s by 7.4k docs.
+    let batch = std::env::var("SEARCH_BULK_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(512);
+    pipeline.enable_bulk_ingest(batch);
+
     let mut imported = 0usize;
     let mut unchanged = 0usize;
     let mut skipped = 0usize;
@@ -636,6 +648,13 @@ async fn run_import(args: &[String]) -> ExitCode {
             }
         }
     }
+    // Flush the tail so the last partial batch is committed, published and searchable. Without
+    // this the final <batch-size records stay invisible — the crawl path has the same requirement.
+    if let Err(e) = pipeline.flush_overlay_batch() {
+        eprintln!("failed to flush the final batch: {e}");
+        return ExitCode::from(1);
+    }
+
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

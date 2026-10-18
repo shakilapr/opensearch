@@ -49,7 +49,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -275,6 +275,16 @@ pub struct Pipeline {
     overlay_batch: Mutex<Vec<IndexDoc>>,
     /// Wall-clock of the last batch commit, for the time-based flush bound.
     overlay_batch_last: Mutex<Instant>,
+    /// Bulk-ingest mode: buffered docs go to **base** (the spec's batch path, §6) instead of the
+    /// overlay, and one generation is published per batch.
+    ///
+    /// Bulk import is offline and does not need the overlay's per-document freshness. Sending a
+    /// million documents through the overlay instead of base both violates the roles §6 assigns to
+    /// the two indices and leaves the overlay as large as the corpus, which in turn makes every
+    /// manifest publish expensive to compute and every future fold a full rewrite.
+    bulk_base: AtomicBool,
+    /// Batch size for bulk ingest; also the overlay batch size when batching is on.
+    bulk_batch: AtomicUsize,
 }
 
 /// Inputs to [`Pipeline::commit_document`]: the post-fetch half of
@@ -455,6 +465,8 @@ impl Pipeline {
             batch_overlay: AtomicBool::new(false),
             overlay_batch: Mutex::new(Vec::new()),
             overlay_batch_last: Mutex::new(Instant::now()),
+            bulk_base: AtomicBool::new(false),
+            bulk_batch: AtomicUsize::new(OVERLAY_BATCH),
         })
     }
 
@@ -570,6 +582,30 @@ impl Pipeline {
         self.batch_overlay.store(true, AtomicOrdering::Relaxed);
     }
 
+    /// Turn on bulk ingest: buffer `batch` documents and commit them to **base** in one go.
+    ///
+    /// This is the path `agent0 import` uses, and it differs from [`Pipeline::enable_overlay_batching`]
+    /// in the target index, not just the cadence. Spec §6 assigns `base` to batched writes and the
+    /// overlay to "recent documents, small": a million-document import sent through the overlay
+    /// breaks that split, leaves the overlay the size of the corpus, and makes every manifest
+    /// publish both expensive and — because the overlay is where unpublished documents live —
+    /// harder to reason about.
+    ///
+    /// Callers must call [`Pipeline::flush_overlay_batch`] once at the end or the tail stays
+    /// uncommitted and invisible.
+    pub fn enable_bulk_ingest(&self, batch: usize) {
+        self.bulk_batch
+            .store(batch.max(1), AtomicOrdering::Relaxed);
+        // Both flags: the buffer/flush machinery is shared, `bulk_base` only chooses the target.
+        self.bulk_base.store(true, AtomicOrdering::Relaxed);
+        self.batch_overlay.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Whether buffered docs go to `base` rather than the overlay.
+    pub fn is_bulk_ingest(&self) -> bool {
+        self.bulk_base.load(AtomicOrdering::Relaxed)
+    }
+
     /// Buffer one built index document, committing the batch when it is full or
     /// the wait bound has elapsed.
     fn buffer_overlay(&self, doc: IndexDoc) -> AppResult<()> {
@@ -577,12 +613,26 @@ impl Pipeline {
             let mut buf = self.overlay_batch.lock().unwrap();
             buf.push(doc);
             let last = *self.overlay_batch_last.lock().unwrap();
-            buf.len() >= OVERLAY_BATCH || last.elapsed() >= OVERLAY_BATCH_MAX_WAIT
+            let limit = self.bulk_batch.load(AtomicOrdering::Relaxed);
+            buf.len() >= limit || last.elapsed() >= OVERLAY_BATCH_MAX_WAIT
         };
         if flush {
             self.flush_overlay_batch()?;
         }
         Ok(())
+    }
+
+    /// Commit one buffered batch to whichever index the current mode targets.
+    ///
+    /// Bulk ingest writes `base` (spec §6's batch path); the crawl keeps the overlay for its
+    /// per-document freshness. One place makes that decision, so a caller cannot accidentally
+    /// pick the wrong index by choosing a different entry point.
+    fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
+        if self.bulk_base.load(AtomicOrdering::Relaxed) {
+            self.indexer.index_batch(docs)
+        } else {
+            self.indexer.index_overlay_batch(docs)
+        }
     }
 
     /// Commit + publish every buffered overlay doc in one Tantivy commit and one
@@ -608,7 +658,7 @@ impl Pipeline {
                 d
             })
             .collect();
-        self.indexer.index_overlay_batch(docs)?;
+        self.index_batch(docs)?;
         let manifest = self.indexer.publish_manifest()?;
         tracing::info!(
             target: "agent0::index",
