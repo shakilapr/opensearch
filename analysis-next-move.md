@@ -51,6 +51,7 @@ That is not a Phase-1 nicety; it is the current user-facing behaviour.
 | No OCR queue | `ocr_decision` consumers | Only `crates/pdf/tests/` — no runtime caller ✓ |
 | LLM structuring of "every page" is expensive | 45,786 structured records | 4.2% of 1,090,184 resources — already selective ✓ |
 | Federation is the cheap way to coverage | each shard opened read-only | shard 0–3 answered the same query in **112–230 ms** standalone ✓ |
+| The shards are usable as they stand | `PRAGMA quick_check` on all four | **ok** on all four; no index corruption ✓ |
 | "Do not add raw BM25 scores from separate indexes" | `fuse()` is rank-based | already rank fusion; no score mixing ✓ |
 | Embeddings are cheap to store | 501,161 × 384 × 4 | **734 MB**, not the ~770 MB quoted — close enough ✓ |
 | The full-scan cost grows linearly | 19,255 → 192.45M dims at 501K | arithmetic correct ✓ |
