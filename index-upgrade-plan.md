@@ -85,22 +85,66 @@ stay testable without keeping the corpus.
 
 ## 4. What the fleet becomes
 
-| | Today | After |
+**Target model, as specified: keep the index that says where things are; never keep the downloaded
+articles.** Concretely, keep *derived* artifacts and delete the *source bytes*:
+
+| Layer | Kept? | Size for 1.09M documents |
 | --- | --- | --- |
-| raw HTML blobs | 284 GB | **0** |
-| extracted text | 13 GB | 13 GB |
-| Tantivy index | 6.0 GB | ~7 GB |
-| metadata + link edges | 4.8 GB | ~12–15 GB |
-| **total** | **~307 GB** | **~32–35 GB** |
+| L0 source knowledge (domain, sections, sitemaps, feeds, authority) | keep | already exists |
+| L1 URL + title + headings + excerpt (~500 chars) + doc_type + language + timestamps | **keep** | ~0.3–0.5 GB |
+| L2 dense vectors (384-d, built once at crawl time) | **keep** | **~1.6 GB** |
+| L3 link graph (src → dst + anchor) | **keep** (if wanted) | ~5–10 GB |
+| BM25 index over title/headings/excerpt | keep | ~1–2 GB |
+| full extracted text | **delete** | 13 GB |
+| raw HTML blobs | **delete** | 284 GB |
 
-That is a 9× reduction with more capability than today (headings readable, links queryable,
-`doc_type`/`language` facetable).
+| | Today | Target |
+| --- | --- | --- |
+| raw HTML + full text | 297 GB | **0** |
+| index + metadata + vectors + links | ~11 GB | ~10–14 GB |
+| **total** | **~307 GB** | **~10–14 GB** (≈ 22–30× less) |
 
-## 5. The one decision this needs
+That is not a compromise: headings become readable, links queryable, `doc_type`/`language`
+facetable, and semantic ranking survives because **the vectors are derived** — they are not
+"downloaded stuff", they are 1.6 GB of index that can be built from text that is then deleted.
 
-**Do you want the link graph?** It is the only irreversibly-lost item, and it is also the input the
-source-first design in `next-move.md` depends on. Capturing it makes Step 3 a full re-parse (hours,
-CPU only). Skipping it makes Step 3 much shorter — but the 284 GB goes away and the links can then
-only be rebuilt by re-crawling 1.09M pages.
+### Is "fetch it when needed" actually viable? Measured today
 
-Everything else in the plan is reversible.
+Two live samples, fetched over HTTP from this host:
+
+| Sample | Reachable | p50 latency | Content drift |
+| --- | --- | --- | --- |
+| 25 random **serving-index** URLs | 23/25 (92%) | **0.30 s** (mean 0.40, max 2.10) | — |
+| 20 random **fleet** URLs | 20/20 (100%) | — | median live/stored text-length ratio **1.00** (unchanged) |
+
+So the pages are still there, they answer in about a third of a second, and they have not drifted
+since the crawl two weeks ago. Fetch-on-demand is viable *for this corpus* — which is what makes the
+whole model work.
+
+Two honest caveats, both measured:
+
+* **8% of the serving sample refused curl** (one 401, one 403). Live retrieval needs degradation
+  paths (browser escalation, or "index says it exists, fetch says no").
+* The corpus is 1–2 weeks old. That says nothing about five-year link rot; the mitigation is
+  keeping the excerpt (which is what a snippet is) and, optionally, snapshots only for rare pages.
+
+## 5. What the ordering constraint becomes
+
+Given the target above, the sequence is:
+
+1. **Free the duplicates** — `raw-dataset/` 47 GB (100% already in the fleet `content` table),
+   `target-browser` 4 GB.
+2. **Build the derived layer from what is already on disk**, in this order, because each source can
+   be deleted only after the next artifact is built from it:
+   `blobs → (headings, links)` then `text → (excerpt, vectors)`. No network in any of these passes.
+3. **Index the 589,572 text-only documents through the same pass**, so their excerpts/vectors land
+   in the new model rather than needing a second re-index later.
+4. **Verify** (same gates as below, plus: every kept document has an excerpt and, where built, a
+   vector).
+5. **Delete `blobs/` (284 GB), then `text/` (13 GB)** — only after the artifacts derived from them
+   are verified.
+
+The one item that cannot be rebuilt after step 5 is the **link graph**, because it is derived from
+raw HTML and is not in any index today. Everything else (excerpt, vectors, headings) can be
+recomputed from text while text still exists.
+
