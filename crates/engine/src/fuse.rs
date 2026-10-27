@@ -29,12 +29,39 @@ pub struct FusionPolicy {
 }
 
 impl Default for FusionPolicy {
+    /// Defaults, with every weight overridable from the environment.
+    ///
+    /// The defaults are what the shipped engine has always used (BM25 1.0, source-first 0.8,
+    /// dense and graph absent, i.e. weight 0). They are read from the environment because the
+    /// weights are an *experiment*, not a constant: `SEARCH_FUSION_DENSE` and `SEARCH_FUSION_GRAPH`
+    /// exist so the semantic lanes can be weighted and measured against the graded query set
+    /// without a rebuild, and reverted by unsetting a variable. A malformed or negative value is
+    /// ignored rather than fatal — a bad experiment flag must not change ranking silently.
     fn default() -> Self {
         let mut weights = HashMap::new();
-        weights.insert(LaneId::Bm25, 1.0);
-        weights.insert(LaneId::SourceFirst, 0.8);
-        Self { c: 60.0, weights, variant_family_cap: 2.0 }
+        weights.insert(LaneId::Bm25, weight_from_env("SEARCH_FUSION_BM25", 1.0));
+        weights.insert(
+            LaneId::SourceFirst,
+            weight_from_env("SEARCH_FUSION_SOURCE_FIRST", 0.8),
+        );
+        weights.insert(LaneId::Dense, weight_from_env("SEARCH_FUSION_DENSE", 0.0));
+        weights.insert(LaneId::Graph, weight_from_env("SEARCH_FUSION_GRAPH", 0.0));
+        Self {
+            c: weight_from_env("SEARCH_FUSION_C", 60.0),
+            weights,
+            variant_family_cap: weight_from_env("SEARCH_FUSION_FAMILY_CAP", 2.0),
+        }
     }
+}
+
+/// A non-negative `f64` from `name`, else `default`. Unset, unparseable and negative values all
+/// fall back to the default.
+fn weight_from_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, PartialEq)]

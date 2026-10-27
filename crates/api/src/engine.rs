@@ -183,14 +183,20 @@ pub fn stop_reason_name(reason: StopReason) -> &'static str {
 /// candidates each lane returns are unchanged (the lane stamp is applied after the cache),
 /// so fusion, provenance, and ranking are byte-identical.
 pub struct SearcherLane<'a, S: Searcher + ?Sized> {
+    /// Call [`Searcher::search_lexical`] instead of [`Searcher::search`]. Set for the `bm25`
+    /// lane so a source-first searcher cannot make both lexical lanes return the same list.
+    lexical_only: bool,
     searcher: &'a S,
     lane: Lane,
     retained: Arc<Mutex<HashMap<String, IndexHit>>>,
     cache: SearchCache,
 }
 
-/// Cache key: the exact arguments that determine the underlying index result.
-type SearchKey = (String, usize, Option<String>);
+/// Cache key: the exact arguments that determine the underlying index result, *including*
+/// which of the two calls produced it. The `bm25` lane scans lexically and the `source_first`
+/// lane takes the searcher's re-ranked output; sharing one key would let whichever ran first
+/// poison the other, which is how the two lanes came to return identical lists.
+type SearchKey = (bool, String, usize, Option<String>);
 /// Request-scoped memo of successful `Searcher::search` calls, shared by the lanes.
 pub type SearchCache = Arc<Mutex<HashMap<SearchKey, Arc<Vec<IndexHit>>>>>;
 
@@ -221,8 +227,22 @@ pub fn take_gauges() -> Vec<(&'static str, u64)> {
 
 impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
     /// A lane adapter stamping every candidate with `lane`, with its own (unshared) cache.
+    /// The `bm25` lane: raw lexical scan, no source-first re-ranking.
+    pub fn lexical(searcher: &'a S, cache: SearchCache) -> Self {
+        Self {
+            lexical_only: true,
+            searcher,
+            lane: Lane::Bm25,
+            retained: Arc::new(Mutex::new(HashMap::new())),
+            cache,
+        }
+    }
+
+    /// A lane over the searcher's own ranking. Used for the `source_first` lane, which *is*
+    /// the searcher's re-ranked output.
     pub fn new(searcher: &'a S, lane: Lane) -> Self {
         Self {
+            lexical_only: false,
             searcher,
             lane,
             retained: Arc::new(Mutex::new(HashMap::new())),
@@ -233,6 +253,7 @@ impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
     /// A lane adapter sharing `cache` with the other lanes of the same request.
     pub fn with_cache(searcher: &'a S, lane: Lane, cache: SearchCache) -> Self {
         Self {
+            lexical_only: false,
             searcher,
             lane,
             retained: Arc::new(Mutex::new(HashMap::new())),
@@ -258,7 +279,12 @@ impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
         limit: usize,
         source_id: Option<&str>,
     ) -> Result<Arc<Vec<IndexHit>>, RetrievalError> {
-        let key: SearchKey = (query.to_string(), limit, source_id.map(str::to_string));
+        let key: SearchKey = (
+            self.lexical_only,
+            query.to_string(),
+            limit,
+            source_id.map(str::to_string),
+        );
         if let Ok(guard) = self.cache.lock() {
             if let Some(hits) = guard.get(&key) {
                 search_engine::timing::count("cache_hits");
@@ -274,10 +300,12 @@ impl<'a, S: Searcher + ?Sized> SearcherLane<'a, S> {
             source_id: Some(s.to_string()),
             ..Default::default()
         });
-        let hits = self
-            .searcher
-            .search(query, limit, filters.as_ref())
-            .map_err(RetrievalError::index)?;
+        let hits = if self.lexical_only {
+            self.searcher.search_lexical(query, limit, filters.as_ref())
+        } else {
+            self.searcher.search(query, limit, filters.as_ref())
+        }
+        .map_err(RetrievalError::index)?;
         let arc = Arc::new(hits);
         if let Ok(mut guard) = self.cache.lock() {
             guard.entry(key).or_insert_with(|| Arc::clone(&arc));
@@ -705,8 +733,13 @@ pub fn run_engine_search(
     // request-scoped cache: the second lane reuses the first's hits instead of
     // repeating the index scan (see `SearcherLane`).
     let search_cache: SearchCache = Arc::new(Mutex::new(HashMap::new()));
-    let lane_bm25 = SearcherLane::with_cache(searcher, Lane::Bm25, Arc::clone(&search_cache));
-    let lane_source = SearcherLane::with_cache(searcher, Lane::SourceFirst, Arc::clone(&search_cache));
+    // The `bm25` lane asks for the *raw* lexical scan and the `source_first` lane for the
+    // searcher's re-ranked output. Before this split both lanes called `Searcher::search`, so
+    // with the serving searcher (which re-ranks source-first internally) the engine was fusing
+    // one list twice and calling it two signals.
+    let lane_bm25 = SearcherLane::lexical(searcher, Arc::clone(&search_cache));
+    let lane_source =
+        SearcherLane::with_cache(searcher, Lane::SourceFirst, Arc::clone(&search_cache));
     let retained_bm25 = lane_bm25.retained();
     let retained_source = lane_source.retained();
     // The two index-backed lanes always run; any injected lane (today: the dense lane over the

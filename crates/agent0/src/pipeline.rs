@@ -2495,6 +2495,20 @@ impl Searcher for SourceFirstSearcher {
         self.inner.doc_text(doc_id)
     }
 
+    /// The raw BM25 scan, before this searcher's source-first re-ranking.
+    ///
+    /// Required, not decorative: the engine's `bm25` lane calls this and its `source_first` lane
+    /// calls `search`. Without the override both lanes return the same list and the engine's
+    /// two-signal fusion is one signal counted twice.
+    fn search_lexical(
+        &self,
+        q: &str,
+        limit: usize,
+        filters: Option<&search_core::SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        self.inner.search(q, limit, filters)
+    }
+
     fn search(
         &self,
         q: &str,

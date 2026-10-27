@@ -283,6 +283,22 @@ pub trait Searcher: Send + Sync {
         filters: Option<&SearchFilters>,
     ) -> AppResult<Vec<IndexHit>>;
 
+    /// Raw lexical (BM25) candidates, without any source-first re-ranking.
+    ///
+    /// Defaulted to [`search`](Searcher::search) so a stub stays a stub. It exists because the
+    /// engine fuses two lexical lanes — `bm25` and `source_first` — and a searcher that
+    /// re-ranks inside `search` (as the serving source-first searcher does) made those two lanes
+    /// return *identical* lists: the engine believed it was fusing two signals and was fusing
+    /// one twice. A searcher that re-ranks MUST override this to return the un-re-ranked scan.
+    fn search_lexical(
+        &self,
+        q: &str,
+        limit: usize,
+        filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        self.search(q, limit, filters)
+    }
+
     /// The stored text of one document, when this implementation can read it.
     ///
     /// Defaulted to `Ok(None)` so a stub searcher stays a stub: the engine is

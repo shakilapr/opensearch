@@ -576,3 +576,87 @@ async fn without_a_planner_the_engine_searches_only_the_original() {
         "no planner line without a planner: {trace:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The two lexical lanes must be two signals, not one counted twice
+// ---------------------------------------------------------------------------
+
+/// A searcher that re-ranks inside `search` (as the serving source-first searcher does) but
+/// exposes the raw scan through `search_lexical`. The engine's `bm25` lane must take the raw
+/// order and its `source_first` lane the re-ranked one; when both lanes called `search` they
+/// returned the same list, so fusion had one lexical signal and said it had two.
+struct RerankingSearcher {
+    /// Raw scan order: doc-000, doc-001, doc-002 …
+    raw: Vec<IndexHit>,
+    /// Re-ranked order: the same documents, reversed.
+    reranked: Vec<IndexHit>,
+}
+
+impl Searcher for RerankingSearcher {
+    fn search(
+        &self,
+        _q: &str,
+        limit: usize,
+        _filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        Ok(self.reranked.iter().take(limit).cloned().collect())
+    }
+
+    fn search_lexical(
+        &self,
+        _q: &str,
+        limit: usize,
+        _filters: Option<&SearchFilters>,
+    ) -> AppResult<Vec<IndexHit>> {
+        Ok(self.raw.iter().take(limit).cloned().collect())
+    }
+}
+
+fn hits_in_order(ids: &[&str]) -> Vec<IndexHit> {
+    let base = StubSearcher::new(ids.len()).hits;
+    ids.iter()
+        .map(|want| {
+            let i: usize = want.trim_start_matches("doc-").parse().unwrap();
+            base[i].clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn bm25_and_source_first_lanes_are_distinct_signals() {
+    // Raw order is 0,1,2,…; the re-ranked order is its reverse.
+    let forward: Vec<String> = (0..6).map(|i| format!("doc-{i:03}")).collect();
+    let backward: Vec<String> = forward.iter().rev().cloned().collect();
+    let fw: Vec<&str> = forward.iter().map(String::as_str).collect();
+    let bw: Vec<&str> = backward.iter().map(String::as_str).collect();
+    let searcher = Arc::new(RerankingSearcher {
+        raw: hits_in_order(&fw),
+        reranked: hits_in_order(&bw),
+    });
+
+    let addr = boot(AppState::new(searcher)).await;
+    let (status, body) = call(
+        addr,
+        "POST",
+        "/search",
+        Some(r#"{"query":"rust","limit":5,"engine":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let results = body["results"].as_array().expect("results");
+    let top = &results[0];
+    let ranks = top["lane_ranks"].as_object().expect("lane_ranks");
+
+    // Both lexical lanes contributed, and they disagree about this document — which is only
+    // possible if they ran different queries.
+    assert!(ranks.contains_key("bm25"), "bm25 lane missing: {ranks:?}");
+    assert!(
+        ranks.contains_key("source_first"),
+        "source_first lane missing: {ranks:?}"
+    );
+    assert_ne!(
+        ranks["bm25"], ranks["source_first"],
+        "the two lexical lanes returned the same order — the bm25 lane is not scanning lexically"
+    );
+}
