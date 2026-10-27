@@ -77,6 +77,7 @@ domain. None is replaced or renamed.
 | `ContentID` | exact content, by hash | `content` | exists, 1,070,364 rows |
 | `PassageID` | a passage inside one content | `passage` | **new (0005)** |
 | `ConceptID` | a topic or concept | `concept` | **new (0005)** |
+| `FeatureID` | a latent feature learned by a specific model version | — | **planned** (see `PLAN-v2.md` §3); a feature id is meaningless without its model version |
 | `SitemapID` | a sitemap document | `sitemap`, `sitemap_entry` | exists / **new (0006)** |
 
 ### The separations the schema enforces
@@ -299,6 +300,11 @@ Explicit acceptance criteria, beyond ids and weights:
 ---
 
 ## 9. Implementation order
+
+The consolidated, gated sequence is in **`docs/PLAN-v2.md`**; this section is the semantic-layer
+slice of it. Two things precede all of it: the answer path must stop discarding its output, and the
+corpus must be reachable (federation), because a semantic layer over 3.8% of the corpus measures
+nothing.
 
 1. **Identity and semantic schema** — done: migrations 0005 and 0006, 39 tests.
 2. **Concept dictionary** — a small verified vocabulary with aliases and typed relations (hundreds of
