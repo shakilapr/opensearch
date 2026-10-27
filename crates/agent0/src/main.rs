@@ -159,6 +159,13 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("frontier") => match args.get(2).map(String::as_str) {
+            Some("recover") => search_agent0::frontier_recover::run(&args),
+            _ => {
+                eprintln!("usage: agent0 frontier recover [--dir PATH]... [--now EPOCH]");
+                ExitCode::from(2)
+            }
+        },
         Some("embed") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::embedbuild::run(&args).await,
             _ => {
@@ -177,6 +184,7 @@ async fn main() -> ExitCode {
              | crawl <seedsfile> [--max-docs N] [--concurrency C] [--out DIR] [--max-urls N] \
              | seeds arxiv [--query Q] [--max N] [--out FILE] \
              | seeds oai [--repo NAME=URL[#SET]]... [--from D] [--until D] [--out FILE] \
+             | frontier recover [--dir PATH]... \
              | export <dir> [--limit N] [--raw] [--name NAME] | import <dir> [--limit N]>",
         ),
     }
