@@ -8,6 +8,7 @@
 
 pub mod deep;
 pub mod engine;
+pub mod federate;
 pub mod graph_lane;
 pub mod query;
 pub mod server;
@@ -18,6 +19,7 @@ pub mod indexer_adapter;
 pub use deep::{
     DeepHit, DeepSearchRequest, DeepSearchResponse, DeepSearcher, DocResponse,
 };
+pub use federate::FederatedSearcher;
 pub use engine::{
     lane_name, run_engine_search, stop_reason_name, EngineCoverage, EngineMode, EngineResult,
     EngineSearchRequest, EngineSearchResponse, SearcherLane,
