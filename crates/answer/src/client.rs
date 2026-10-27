@@ -194,14 +194,23 @@ impl LlmAnswerer {
         self.record_usage(Some(usage));
 
         let answer = parse_chat_response(&body)?;
-        write_cache_atomic(
+        // The cache is a performance optimisation, not a correctness requirement. A full disk,
+        // a read-only mount, or a directory that vanished must not discard an answer the provider
+        // has already been paid for — observed live as ENOSPC discarding every answer while the
+        // model call succeeded and was billed. Log the failure and return the answer uncached.
+        if let Err(e) = write_cache_atomic(
             &self.inner.cache_dir,
             &hash,
             &model,
             PROMPT_VERSION,
             &prompt,
             &answer,
-        )?;
+        ) {
+            tracing::warn!(
+                error = %e,
+                "answer cache write failed; returning the answer uncached"
+            );
+        }
         Ok(answer)
     }
 }

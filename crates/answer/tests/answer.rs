@@ -78,7 +78,7 @@ fn content_body(text: &str) -> String {
 fn config(dir: &std::path::Path) -> AnswerConfig {
     AnswerConfig {
         base_url: "http://test.local/v1".to_string(),
-        model: "deepseek/deepseek-v4.1-flash".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         timeout_ms: 20_000,
         max_tokens: 1024,
         concurrency: 4,
@@ -132,9 +132,9 @@ fn prompt_shape_is_stable() {
 fn no_key_disables_and_never_calls_transport() {
     let _guard = ENV_LOCK.lock().unwrap();
     let saved_enabled = std::env::var("SEARCH_ANSWER_ENABLED").ok();
-    let saved_key = std::env::var("KITANI_API_KEY").ok();
+    let saved_key = std::env::var("CROWBOT_API_KEY").ok();
     std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
-    std::env::remove_var("KITANI_API_KEY");
+    std::env::remove_var("CROWBOT_API_KEY");
 
     let t = FakeTransport::ok(content_body("never"));
     let built = search_answer::from_env_with_transport(Arc::new(t.clone()));
@@ -154,7 +154,7 @@ fn no_key_disables_and_never_calls_transport() {
     );
 
     restore("SEARCH_ANSWER_ENABLED", saved_enabled);
-    restore("KITANI_API_KEY", saved_key);
+    restore("CROWBOT_API_KEY", saved_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ fn cache_write_is_atomic_and_partial_never_poisons() {
     // First call populates the cache normally.
     c.answer("q", &evidence(), &passages()).unwrap();
 
-    let model = "deepseek/deepseek-v4.1-flash";
+    let model = "deepseek-v4.1-flash";
     let prompt = search_answer::build_prompt("q", &evidence(), &passages());
     // Recompute the key the client used (model \0 prompt-version \0 prompt).
     let hash = {
@@ -311,6 +311,38 @@ fn cache_write_is_atomic_and_partial_never_poisons() {
     let got = c2.answer("q", &evidence(), &passages()).unwrap();
     assert_eq!(got, "recomputed");
     assert_eq!(t2.calls(), 1, "a corrupt entry degrades to a fresh call");
+}
+
+// ---------------------------------------------------------------------------
+// A failed cache write must not discard an answer the provider was paid for.
+// ---------------------------------------------------------------------------
+/// Live failure this pins: with the disk full, the model answered (and was billed) and the
+/// answer was then thrown away because the cache write propagated its `ENOSPC`. The cache is a
+/// performance optimisation; a write failure must be logged and the answer returned.
+#[test]
+fn a_failed_cache_write_still_returns_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("llm-cache");
+    let t = FakeTransport::ok(content_body("an answer worth paying for"));
+    let c = client(t.clone(), &cache);
+
+    // Make every write fail the way a full or read-only filesystem does: replace the cache
+    // directory with a regular file, so `create_dir_all`/`write` fail with ENOTDIR.
+    std::fs::remove_dir_all(&cache).unwrap();
+    std::fs::write(&cache, b"not a directory").unwrap();
+
+    let out = c
+        .answer("what is rust async?", &evidence(), &passages())
+        .expect("a cache write failure must not fail the answer");
+    assert_eq!(out, "an answer worth paying for");
+    assert_eq!(c.cache_stats().misses, 1);
+    assert_eq!(c.cache_stats().hits, 0);
+
+    // Nothing was cached, so the same prompt asks the provider again rather than serving a
+    // half-written entry.
+    let again = c.answer("what is rust async?", &evidence(), &passages()).unwrap();
+    assert_eq!(again, "an answer worth paying for");
+    assert_eq!(t.calls(), 2, "an uncached answer is never served from a failed write");
 }
 
 // ---------------------------------------------------------------------------
