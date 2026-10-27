@@ -75,12 +75,32 @@ cannot show its gate is not kept.
 
 1. **Answer-cache write becomes best-effort.** A successful completion must be returned even when
    the cache write fails; add an `ENOSPC` test. Gate: a query returns an answer with the disk full.
+   **Done** (`7180806`): the write logs a warning and the answer is returned; the test simulates the
+   failure with `ENOTDIR`. Deployed and verified live — the same query now answers in 431 chars, and
+   the repeat hits the cache (301 ms, zero tokens).
 2. **Free space**: `raw-dataset/` blobs 47 GB (100% duplicate of the fleet's `content` hashes),
    `target-browser` 4 GB, journals 1.7 GB. Gate: ≥100 GB free.
+   **Partly done**: `target-browser` removed (4 GB). The `raw-dataset` blobs are the *live* crawl's
+   output directory — four shard crawlers were running when this was attempted — so deleting them
+   must wait for the crawl to stop. The duplicate claim is verified for all four shards
+   (174,216/174,219 · 202,507/202,509 · 333,477/333,480 · 168,359/168,361).
 3. **Recover 328,712 expired `FETCHING` leases** so a resumed crawl does not leak attempts.
+   **Tool done** (`e0ef193`): `agent0 frontier recover [--dir PATH]… [--now EPOCH]`. Measured on a
+   copy of shard 0: **82,553 rows reclaimed**. Not run against the live shards yet, because the
+   crawlers are active and an expired lease there may belong to a slow in-flight fetch.
 4. **Deploy HEAD** (the deployed binary is 2026-10-13; HEAD has two-phase generation publish,
    metadata counts, base-segment bulk import, configurable writer arena). Gate: smoke query set on
    the new binary, rollback copy kept.
+   **Done**: rebuilt at HEAD, installed to `/opt/search/bin/agent0`, rollback copy kept, service
+   healthy (gen 19254), `/search` verified.
+
+### Phase 0b — Stop the disk filling again (done, `ca0a156`)
+
+The crawl has filled this filesystem twice; the second time it also took the answer cache with it.
+`SEARCH_MIN_FREE_GB` (default 5 GiB, `--min-free-gb` overrides, `0` disables) is now checked inside
+the crawl loop via `statvfs` every 32 turns, and the run stops with `stopped_for_disk: true` in its
+summary instead of continuing until `ENOSPC`. 3 tests. It takes effect when the running shards next
+restart — they are still on the previous binary.
 
 ### Phase 1 — Make the corpus reachable, and fix the ranking lie (1–2 weeks)
 
