@@ -17,11 +17,12 @@ follows links, an ingestion path that parses pages into metadata + a Tantivy ind
 artifacts, and an HTTP/MCP query surface with two modes — a fast lexical `/search` and an
 `engine:true` mode that runs a budgeted retrieve→fuse→rerank→answer loop. It is **not** the semantic
 "brain" the target architecture describes: the concept tables exist and are **empty**, the dense
-lane is computed and its weight is **0.0**, and the served corpus is **19,255 documents of 1.1 M
-that have been crawled**. The work of the last two sessions has been to make the parts that exist
-honest — an answer that is no longer thrown away, two lexical lanes that are no longer the same
-lane twice, a crawl that stops before it fills the disk, a caller for lease recovery, and a
-federated searcher that can put the four shards behind one query.
+lane is computed but was weighted **0.0** until today (now 0.5), and the served corpus is **19,255
+documents of 1.1 M that have been crawled**. The work of the last two sessions has been to make the
+parts that exist honest — an answer that is no longer thrown away, two lexical lanes that are no
+longer literally the same call, a crawl that stops before it fills the disk, a caller for lease
+recovery, a dense lane that now contributes, and a federated searcher that can put the four shards
+behind one query (wired, not yet enabled).
 
 ---
 
@@ -86,15 +87,27 @@ Runtime under the `bge` feature. It is **not** MRL-trained, so dimension truncat
 
 | Config | nDCG@10 | MRR | recall@10 | p50 ms | p95 ms |
 | --- | --- | --- | --- | --- | --- |
-| dense weight 0.0 (shipped) | 0.4837 | 0.4777 | 0.5017 | 468 | 1011 |
+| dense weight 0.0 (shipped until today) | 0.4837 | 0.4777 | 0.5017 | 468 | 1011 |
 | dense 0.5 | 0.4869 | 0.4826 | 0.5000 | 470 | 1026 |
 | dense 0.8 | 0.4873 | 0.4831 | 0.5000 | 535 | 1274 |
 | dense 1.2 | 0.4881 | 0.4837 | 0.5017 | 513 | 1214 |
+| dense 0.0, after the lane split | 0.4837 | 0.4777 | 0.5017 | 471 | 1010 |
+| dense 0.5, after the lane split | 0.4869 | 0.4826 | 0.5000 | 490 | 1083 |
 
 These labels are *corpus-derived*, not human judgements: a title-as-query can be answered lexically,
 so the ceiling on this set is low and the dense gain is small but monotone. nDCG +0.9 % relative at
 w=1.2 costs +45 ms p50; w=0.5 captures most of the gain for +2 ms. **This is the evidence for the
 weight decision, not a claim that semantic search is now solved.**
+
+**Deployed:** `SEARCH_FUSION_DENSE=0.5` is live since 2026-10-27 (drop-in `fusion.conf`). The effect
+is visible on the user's own example: for `"chemical reactions that affect romance"`, *Chemistry*
+carried `dense: 1` and moved from rank 3 to **rank 1**. The dense lane is no longer computed and
+discarded.
+
+**The limit that no weight can fix:** the same query family `"how oxytocin builds attachment"`
+returns *TypeScript Nightly Builds* and *Docker Builds*, because the corpus contains **no document
+about oxytocin** (measured earlier: 0 title matches for `oxytocin`, `romantic love`,
+`phenylethylamine`). Re-weighting cannot rank a document that was never crawled.
 
 ---
 
@@ -187,11 +200,21 @@ provenance: graph expansion reached 0 document(s)
 Note `graph expansion reached 0` — the graph lane is enabled but contributes nothing, because
 `graph_edge` is empty and the entity set is title-token noise.
 
-### 4.3 What the lanes actually are (the lie this session fixed)
+### 4.3 What the lanes actually are (the lie this session fixed — and what it revealed)
 Both `SearcherLane`s wrapped the **same** `Searcher`, and `SourceFirstSearcher::search` re-ranks
 internally. So the `bm25` lane and the `source_first` lane returned **identical lists** — visible in
-the trace above where every result reads `{'bm25': 1, 'source_first': 1}`. The engine believed it was
-fusing two signals and was fusing one twice. Fixed by `Searcher::search_lexical` (§8).
+earlier traces where every result read `{'bm25': 1, 'source_first': 1}`.
+
+Fixed by `Searcher::search_lexical`: the `bm25` lane now takes the raw scan, the `source_first` lane
+the re-ranked output, and the cache key includes which call produced it (`index_scans` went 1 → 2).
+
+**But measured live after the fix, the two lanes still agree on 15 of 15 top-5 ranks across three
+queries, and the 600-query eval is unchanged to four decimals (0.4837).** The reason is not that the
+fix failed — it is that `SourceFirstSearcher`'s re-ranking preserves BM25 order in practice, so the
+engine's second lexical lane still carries no new information. The lanes are now honestly *two
+functions*; they are still *one signal*. Making the second lexical lane useful needs a genuinely
+different ranking (a source prior that reorders, or a learned re-ranker), not a second call to the
+same scan.
 
 ---
 
@@ -254,9 +277,9 @@ artifact, LLM planner off the request path, MCP surface, answer cache, federatio
 | Sitemap-persisted discovery (`sitemap_entry`) | **0 rows** |
 | Website layer (`website`, `website_host`) | **0 rows** |
 | Sparse-feature index (`feature`, `doc_feature`) | **tables do not exist** |
-| Dense lane weighted | weight **0.0** in production |
+| Dense lane weighted | **0.5** in production since 2026-10-27 (was 0.0) — measured +0.0032 nDCG for +19 ms |
 | Graph lane | enabled, contributes **0** documents |
-| Federation of the four shards | searcher exists; **not enabled in production** |
+| Federation of the four shards | searcher exists and is wired; **not enabled in production** (`SEARCH_FEDERATE_DIRS` unset) |
 
 ### 7.3 Where the implementation diverged from the design
 1. **The identity layer is ahead of its data.** Six migrations of schema, almost none of it filled.
@@ -287,6 +310,7 @@ All committed, all tested, deployed where it affects the live service.
 | `7014c25` | **`bm25` lane is a real lexical scan** (`Searcher::search_lexical`) + fusion weights from env | test: raw vs re-ranked orders must give different `lane_ranks` |
 | `135e491` | **`FederatedSearcher`**: N shards fused by reciprocal rank, URL-deduped, degrade-not-fail | 7 tests |
 | `dbb5a22` | **`SEARCH_FEDERATE_DIRS`** wiring for `serve`, read-only shard open, never create a shard root | 5 tests |
+| (deploy) | **`SEARCH_FUSION_DENSE=0.5` live** | Chemistry moved rank 3 → **1** on the chemistry/romance query; 600-query eval +0.0032 nDCG |
 
 Also this session: `target-browser` removed (4 GB), the deployed binary brought to HEAD with a
 rollback copy kept, and `PLAN-v2.md` Phase 0 annotated with what completed and what could not.
@@ -294,15 +318,19 @@ rollback copy kept, and `PLAN-v2.md` Phase 0 annotated with what completed and w
 ### 8.1 Still open, in order
 1. **Federation not switched on.** The searcher exists and 4 shards hold 1.1 M resources; they are
    schema v4 and would be migrated on open. Decide migrate-on-open, then set `SEARCH_FEDERATE_DIRS`.
-2. **Dense weight still 0.0 in production.** Evidence says 0.5 is the right first step (+0.0032
-   nDCG for +2 ms).
+2. **The second lexical lane is still redundant** — the split made the two lanes two functions, but
+   they agree on 15/15 top-5 ranks (§4.3). A source prior that actually reorders, or a learned
+   re-ranker, is what would make it a second signal.
 3. **The brain has no data.** `doc_concept` needs a tagging pass over existing text before a single
-   semantic lane can mean anything.
-4. **The 47 GB `raw-dataset/` duplicate** waits for the crawl to stop (verified 100 % duplicate on
+   semantic lane can mean anything. This is the highest-value unstarted item.
+4. **The corpus lacks the documents the user's example needs** — no page about oxytocin or romantic
+   attachment exists in either the served or the crawled corpus. Weights cannot fix coverage.
+5. **The 47 GB `raw-dataset/` duplicate** waits for the crawl to stop (verified 100 % duplicate on
    all four shards).
-5. **Zombie leases (82.5k/shard)** wait for the same moment, so a slow in-flight fetch is not
+6. **Zombie leases (82.5k/shard)** wait for the same moment, so a slow in-flight fetch is not
    double-dispatched.
-6. **Storage rule not enforced**: raw HTML and text still accumulate beside the index.
+7. **Storage rule not enforced**: raw HTML and text still accumulate beside the index.
+8. **Shard 2's crawler stopped silently** — no supervisor notices a shard that stopped crawling.
 
 ---
 
@@ -310,9 +338,14 @@ rollback copy kept, and `PLAN-v2.md` Phase 0 annotated with what completed and w
 
 - **The retrieval metrics use corpus-derived labels**, not human relevance judgements; they measure
   "can the title find its own document", which flatters lexical search. Treat deltas, not absolutes.
-- **p50 468 ms for `engine:true`** is with four crawlers saturating the disk; the 200 ms Fast budget
-  is not met at 19K documents and will not be met by adding shards.
+- **p50 ~470 ms for `engine:true`** is with three crawlers saturating the disk; the 200 ms Fast
+  budget is not met at 19K documents and will not be met by adding shards.
 - **Federation has never served a real query.** It is unit-tested against stubs; the four shards
   have not been opened by `serve`.
-- **The graph and dense lanes' contribution is near zero** in the live traces; reporting them as
-  active signals would be false.
+- **The graph lane's contribution is zero** in every live trace measured; reporting it as an active
+  signal would be false. It is enabled, costs time, and returns no documents.
+- **The dense lane's gain is small against these labels** (+0.0032 nDCG). It is deployed because it
+  is the semantic signal the design calls for and the effect on the user's example query was
+  visible (Chemistry 3 → 1), not because the 600-query set can prove a large win.
+- **The lane split is mechanically verified but behaviourally invisible** so far (§4.3). Do not
+  count it as a ranking improvement.
