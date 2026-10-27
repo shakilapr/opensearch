@@ -13,6 +13,9 @@ name = "agent0"
 path = "src/main.rs"
 
 [dependencies]
+# `statvfs` for the crawl's disk guard: the guard runs in the crawl loop, so it must not
+# shell out to `df`.
+libc = "0.2"
 search-core = { path = "../core" }
 search-metadata = { path = "../metadata" }
 search-ingest = { path = "../ingest" }

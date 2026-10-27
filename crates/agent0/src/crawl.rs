@@ -165,6 +165,9 @@ const MAX_CHILD_SITEMAPS: usize = 16;
 const MAX_FEEDS: usize = 8;
 const MAX_DISCOVERED: usize = 512;
 
+/// Default free-space floor for the crawl's disk guard, in GiB.
+const DEFAULT_MIN_FREE_GB: usize = 5;
+
 /// Maximum number of document links followed from one seed page. A hard ceiling
 /// so a link farm cannot spend the whole attempt budget from a single page; the
 /// global `max_urls` bound still applies on top.
@@ -207,6 +210,12 @@ pub struct CrawlOptions {
     /// §21 escalation driver. `None` in production unless `SEARCH_BROWSER` asks for one;
     /// tests attach a `MockBrowser` here to exercise the path hermetically.
     pub browser: Option<Arc<dyn BrowserFetcher>>,
+    /// Stop the run when the filesystem holding the data root has less free space than this.
+    /// `0` disables the guard (the default for tests and for a caller that wants the old
+    /// behaviour). Production sets it from `SEARCH_MIN_FREE_GB`, default 5 GiB: a crawl that
+    /// fills the disk does not just stop, it takes the serving index's answer path with it —
+    /// observed twice on this host, once as `ENOSPC` discarding every generated answer.
+    pub min_free_bytes: u64,
 }
 
 /// Manual `Debug`: the escalation driver is a trait object, which has no `Debug`; its
@@ -245,7 +254,44 @@ impl CrawlOptions {
             origin_cap: None,
             compress: false,
             browser: None,
+            // Off unless the caller asks: a hermetic test must not depend on the host's disk.
+            min_free_bytes: 0,
         }
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, or `None` when it cannot be read.
+///
+/// `statvfs` rather than shelling out to `df`: the guard runs inside the crawl loop and must be
+/// cheap and allocation-light.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c = CString::new(path.to_str()?).ok()?;
+    // SAFETY: `statvfs` only writes into the struct we pass; the pointer is valid for the call.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
+    if rc != 0 {
+        return None;
+    }
+    Some(s.f_bavail.saturating_mul(s.f_frsize))
+}
+
+/// Free bytes on non-Unix hosts: unknown, so the guard never fires.
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether the disk guard should stop the run.
+///
+/// Pure so it can be tested without filling a filesystem: `min == 0` disables it, an unreadable
+/// filesystem (`None`) never stops a run, and only a *known* free figure below the minimum does.
+pub fn should_stop_for_disk(free: Option<u64>, min_free_bytes: u64) -> bool {
+    match (free, min_free_bytes) {
+        (_, 0) => false,
+        (Some(f), min) => f < min,
+        (None, _) => false,
     }
 }
 
@@ -301,6 +347,10 @@ pub struct CrawlSummary {
     pub bytes: u64,
     pub elapsed_ms: u64,
     pub resumed_from: usize,
+    /// True when the run stopped because free disk fell below `min_free_bytes`, rather than
+    /// because the seed list, the document budget or the URL budget was exhausted. A caller
+    /// (the watcher, a supervisor) can restart the run once space is reclaimed.
+    pub stopped_for_disk: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +411,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         origin_cap,
         compress,
         browser: browser_from_env().await,
+        min_free_bytes: resolve_min_free_bytes(flag_usize(args, "--min-free-gb")),
     };
 
     let cfg = Config::from_env();
@@ -374,6 +425,22 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The disk guard's threshold in bytes.
+///
+/// Precedence: `--min-free-gb`, then `SEARCH_MIN_FREE_GB`, then 5 GiB. `0` disables the guard.
+/// A non-numeric value is ignored rather than fatal — a bad setting must not stop a crawl that
+/// would otherwise run.
+fn resolve_min_free_bytes(flag_gb: Option<usize>) -> u64 {
+    let gb = flag_gb
+        .or_else(|| {
+            std::env::var("SEARCH_MIN_FREE_GB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(DEFAULT_MIN_FREE_GB);
+    (gb as u64).saturating_mul(1024 * 1024 * 1024)
 }
 
 fn flag_usize(args: &[String], flag: &str) -> Option<usize> {
@@ -514,6 +581,11 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         &drain.seen,
     );
 
+    // Disk-guard bookkeeping: a counter so `statvfs` runs every 32 turns, and the flag the
+    // summary reports so a supervisor can tell "budget exhausted" from "stopped to save the disk".
+    let mut loop_ticks: u64 = 0;
+    let mut stopped_for_disk = false;
+
     loop {
         // Stream every completed discovery task: enqueue its URLs and seed, then
         // refill the window so discovery never ramps down between batches.
@@ -538,6 +610,24 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
 
         // Reap finished fetches and dispatch new ones (never blocks).
         drain.pump(&mut drain_set);
+
+        // Disk guard: a crawl that fills the filesystem takes the serving index's write path
+        // (and, on this host, the answer cache) down with it. Checked every 32 turns of the
+        // loop (the first turn is checked so a crawl started on a full disk stops at once) —
+        // `statvfs` is cheap, but not free enough to call per dispatch.
+        loop_ticks = loop_ticks.wrapping_add(1);
+        if opts.min_free_bytes > 0 && loop_ticks % 32 == 1 {
+            let probe = if cfg.data_dir.exists() { &cfg.data_dir } else { &opts.out_dir };
+            if should_stop_for_disk(free_bytes(probe), opts.min_free_bytes) {
+                tracing::warn!(
+                    path = %probe.display(),
+                    min_free_bytes = opts.min_free_bytes,
+                    "stopping the crawl: free disk is below the configured minimum"
+                );
+                stopped_for_disk = true;
+                break;
+            }
+        }
 
         // The seed list is exhausted, discovery has quiesced and everything it
         // produced has drained.
@@ -612,7 +702,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // Clear the persisted frontier: everything has been logged.
     persist_frontier(&drain.frontier_path, std::iter::empty::<String>());
 
-    Ok(drain.summary(resumed_from, started.elapsed()))
+    Ok(drain.summary(resumed_from, started.elapsed(), stopped_for_disk))
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +912,7 @@ impl Drainer {
         persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
     }
 
-    fn summary(&self, resumed_from: usize, elapsed: Duration) -> CrawlSummary {
+    fn summary(&self, resumed_from: usize, elapsed: Duration, stopped_for_disk: bool) -> CrawlSummary {
         CrawlSummary {
             ingested: self.counters.ingested,
             unchanged: self.counters.unchanged,
@@ -836,6 +926,7 @@ impl Drainer {
             bytes: self.counters.bytes,
             elapsed_ms: elapsed.as_millis() as u64,
             resumed_from,
+            stopped_for_disk,
         }
     }
 

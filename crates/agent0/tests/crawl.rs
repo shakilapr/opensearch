@@ -1273,3 +1273,51 @@ async fn http_429_backs_off_the_origin_before_the_next_request() {
     assert_eq!(summary.rate_limited, 2, "both 429s counted");
 }
 
+
+// ---------------------------------------------------------------------------
+// Disk guard: a crawl must stop before it fills the filesystem
+// ---------------------------------------------------------------------------
+
+/// The pure decision: `0` disables the guard, an unreadable filesystem never stops a run, and
+/// only a known free figure below the minimum trips it.
+#[test]
+fn disk_guard_decision_is_explicit_about_unknowns() {
+    use search_agent0::crawl::should_stop_for_disk;
+    const GB: u64 = 1024 * 1024 * 1024;
+    assert!(!should_stop_for_disk(Some(0), 0), "0 disables the guard");
+    assert!(!should_stop_for_disk(None, 5 * GB), "unknown free space never stops a run");
+    assert!(should_stop_for_disk(Some(4 * GB), 5 * GB), "below the floor stops");
+    assert!(!should_stop_for_disk(Some(6 * GB), 5 * GB), "above the floor continues");
+    assert!(should_stop_for_disk(Some(0), 1), "a full disk always stops");
+}
+
+/// `free_bytes` reads a real filesystem and returns a plausible figure.
+#[test]
+fn free_bytes_reads_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = search_agent0::crawl::free_bytes(dir.path()).expect("a tempdir is readable");
+    assert!(free > 0, "a mounted filesystem reports free bytes, got {free}");
+}
+
+/// End to end: with an impossible floor, the crawl stops before fetching anything and says so
+/// in its summary rather than pretending the seed list ran out.
+#[tokio::test]
+async fn a_crawl_stops_immediately_when_the_disk_guard_trips() {
+    let (base, fx) = spawn_fixture(vec![("/a", "text/html", P1)], ROBOTS_OPEN).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base}/a")]);
+
+    let mut opts = options(seeds, out.clone());
+    // No filesystem has this much free: the guard must trip on the first turn.
+    opts.min_free_bytes = u64::MAX;
+
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert!(summary.stopped_for_disk, "the summary reports why the run stopped");
+    assert_eq!(summary.ingested, 0, "nothing was fetched");
+    assert!(
+        fx.hits.lock().unwrap().is_empty(),
+        "the guard runs before the first request, not after it"
+    );
+}
