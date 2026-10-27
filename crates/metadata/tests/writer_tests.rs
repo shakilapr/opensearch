@@ -76,7 +76,7 @@ fn migrations_create_watermark_and_all_expected_tables() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5], "each migration applied exactly once");
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6], "each migration applied exactly once");
 
     let tables: Vec<String> = {
         let mut stmt = conn
@@ -119,10 +119,16 @@ fn migrations_create_watermark_and_all_expected_tables() {
         "robots_cache",
         "schema_migration",
         "sitemap",
+        "sitemap_entry",
         "source",
+        "source_concept",
         "source_profile",
+        "source_section",
         "web_link",
+        "website",
+        "website_host",
         "work",
+        "work_location",
     ];
     expected.sort_unstable();
     assert_eq!(
