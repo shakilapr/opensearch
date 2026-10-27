@@ -29,6 +29,7 @@
 pub mod crawl;
 pub mod embedbuild;
 pub mod evalset;
+pub mod fedserve;
 pub mod frontier_recover;
 pub mod graphbuild;
 pub mod deep;

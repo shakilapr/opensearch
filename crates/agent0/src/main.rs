@@ -333,7 +333,15 @@ async fn run_serve() -> ExitCode {
         }
     };
     let pipeline = std::sync::Arc::new(pipeline);
-    let searcher = pipeline.searcher();
+    // One root, or several: `SEARCH_FEDERATE_DIRS` makes the four shards answer as one corpus.
+    // With the variable unset this is exactly `pipeline.searcher()`.
+    let searcher = match search_agent0::fedserve::searcher(pipeline.searcher(), &cfg.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to build the federated searcher: {e}");
+            return ExitCode::from(1);
+        }
+    };
     // Deep search / document read are served from the same pipeline instance.
     let deep: std::sync::Arc<dyn search_api::DeepSearcher + Send + Sync> =
         std::sync::Arc::new(search_agent0::PipelineDeepSearcher::new(pipeline.clone()));
