@@ -55,10 +55,10 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn no_key_disables_answerer_and_search_is_unchanged() {
     let _guard = ENV_LOCK.lock().unwrap();
     let saved_enabled = std::env::var("SEARCH_ANSWER_ENABLED").ok();
-    let saved_key = std::env::var("KITANI_API_KEY").ok();
+    let saved_key = std::env::var("CROWBOT_API_KEY").ok();
 
     std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
-    std::env::remove_var("KITANI_API_KEY");
+    std::env::remove_var("CROWBOT_API_KEY");
     assert!(search_answer::from_env().is_none());
     assert_eq!(
         search_answer::disabled_reason(),
@@ -77,8 +77,8 @@ fn no_key_disables_answerer_and_search_is_unchanged() {
         None => std::env::remove_var("SEARCH_ANSWER_ENABLED"),
     }
     match saved_key {
-        Some(v) => std::env::set_var("KITANI_API_KEY", v),
-        None => std::env::remove_var("KITANI_API_KEY"),
+        Some(v) => std::env::set_var("CROWBOT_API_KEY", v),
+        None => std::env::remove_var("CROWBOT_API_KEY"),
     }
 }
 

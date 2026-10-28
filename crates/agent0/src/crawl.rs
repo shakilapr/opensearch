@@ -170,6 +170,10 @@ const MAX_DISCOVERED: usize = 512;
 /// 213 MB snapshot cost on every flush.
 const PERSIST_FULL_EVERY: u64 = 150;
 
+/// The denial reason `Pipeline::crawl_one` reports when the site root itself is disallowed. The
+/// drain matches on it to retire the host's queue instead of retrying each of its URLs.
+const DENY_ALL_REASON: &str = "robots.txt disallows / (site denies all)";
+
 /// Default free-space floor for the crawl's disk guard, in GiB.
 const DEFAULT_MIN_FREE_GB: usize = 5;
 
@@ -1209,7 +1213,22 @@ impl Drainer {
                 self.ingested += 1;
             }
             "unchanged" => self.counters.unchanged += 1,
-            "denied" => self.counters.denied += 1,
+            "denied" => {
+                self.counters.denied += 1;
+                // A denial that closes the whole site retires the host immediately: drop its
+                // queue and forget it. In production a dead host holds ~15 URLs, and the seeds
+                // for one host often dispatch together, so waiting for `robots` to be consulted
+                // once per URL is what made 88% of attempts denials. `crawl_one` marks the site
+                // as deny-all; this turns that into "stop queueing its work" for the drain.
+                if per.error.as_deref() == Some(DENY_ALL_REASON) {
+                    if let Some(q) = self.queues.get_mut(&per.origin) {
+                        for u in q.drain(..) {
+                            self.remaining.remove(&u);
+                        }
+                    }
+                    self.ready.retain(|o| o != &per.origin);
+                }
+            }
             "failed" => self.counters.failed += 1,
             "deleted" => self.counters.deleted += 1,
             _ => {}
@@ -1470,6 +1489,17 @@ async fn discover_seed_urls(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
+    // (0) Refuse a host that already denied `/`, before any network I/O.
+    //
+    // The site root is the cheapest possible probe of "can this host yield anything", and a host
+    // that disallows it will disallow every page: measured 2026-10-28, 5,818 such hosts were
+    // walked URL by URL at 15.5 URLs each, so the seed page was fetched from sites that had
+    // explicitly said not to. `deny_all` is filled by `Pipeline::crawl_one` and shared across the
+    // run, so only the first seed of such a host pays anything.
+    if pipeline.host_denies_all(seed) {
+        return out;
+    }
+
     // (1) Existing discovery path: robots -> sitemaps -> feeds, persisted and
     // pushed to the metadata frontier. Errors are non-fatal.
     if let Err(e) = pipeline.discover(seed).await {
@@ -1503,7 +1533,11 @@ async fn discover_seed_urls(
     // `Pipeline::discover` already fetched this page for feed discovery but does
     // not surface the body (pipeline.rs is out of scope), so the seed HTML is
     // fetched once more here with the module's discovery `Fetcher`.
-    if follow_links {
+    // Seed pages are fetched only if the host has not been found to deny `/`. `pipeline.discover`
+    // above is where that verdict is recorded (it reads robots.txt), so checking here — after it
+    // and before the second fetcher touches the host — is what makes a dead host cost one
+    // discovery instead of one page fetch per advertised URL.
+    if follow_links && !pipeline.host_denies_all(seed) {
         if let Some(bytes) = fetch_body(fetcher, seed).await {
             let html = String::from_utf8_lossy(&bytes).to_string();
             let seed_site = site_key(seed);

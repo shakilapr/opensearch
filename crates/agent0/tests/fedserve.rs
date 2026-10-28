@@ -130,3 +130,23 @@ impl Searcher for StubPrimary {
         })
     }
 }
+
+/// A federated manifest must report the shards' real generations and counts.
+///
+/// Live defect 2026-10-28: the federation reported `generation 0` and `index_unpublished`
+/// while returning real results, because a shard whose index was open reported
+/// `manifest().is_err()` — swallowed by the sum — instead of its published generation.
+#[test]
+fn stub_shards_report_through_the_federation() {
+    std::env::remove_var("SEARCH_FEDERATE_DIRS");
+    let a: std::sync::Arc<dyn Searcher + Send + Sync> = std::sync::Arc::new(StubPrimary);
+    let b: std::sync::Arc<dyn Searcher + Send + Sync> = std::sync::Arc::new(StubPrimary);
+    let f = search_api::FederatedSearcher::new(vec![
+        ("a".to_string(), a),
+        ("b".to_string(), b),
+    ])
+    .unwrap();
+    let m = f.manifest().unwrap();
+    assert_eq!(m.generation, 1, "both stubs agree: {m:?}");
+    assert_eq!(m.doc_count, 2, "counts are summed: {m:?}");
+}

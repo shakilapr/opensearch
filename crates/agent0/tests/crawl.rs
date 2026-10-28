@@ -1502,3 +1502,52 @@ async fn robots_txt_is_fetched_once_per_domain() {
          ({per_seed:.1} per seed)"
     );
 }
+
+/// A host whose robots.txt denies `/` yields nothing, and the crawl records that as a denial
+/// rather than as a fetch failure.
+///
+/// Production context (measured 2026-10-28): 5,818 hosts each denying `/`, walked URL by URL, so
+/// 88% of all attempts were denials and the crawl ingested nothing. The fix has two parts — robots
+/// is cached per domain (see `robots_txt_is_fetched_once_per_domain`) and a host found to deny `/`
+/// is remembered so its remaining URLs cost a hash lookup. This test pins the second half's
+/// observable outcome: the pages produce denials, never ingested documents, and the run does not
+/// spend its budget re-fetching them.
+#[tokio::test]
+async fn a_host_that_denies_root_yields_no_documents() {
+    const DENY_ALL: &str = "User-agent: *\nDisallow: /\n";
+    let (base, fx) = spawn_fixture(
+        vec![
+            ("/a", "text/html", P1),
+            ("/b", "text/html", P2),
+            ("/c", "text/html", P3),
+        ],
+        DENY_ALL,
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(
+        tmp.path(),
+        "seeds.txt",
+        &[
+            format!("{base}/a"),
+            format!("{base}/b"),
+            format!("{base}/c"),
+        ],
+    );
+
+    let summary = crawl(options(seeds, out), &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 0, "a disallow-all host yields nothing");
+    assert!(summary.denied >= 1, "the denial is reported as a denial");
+    assert_eq!(summary.failed, 0, "a robots denial is not a network failure");
+
+    // The host is fetched at most once per URL: no URL is retried, and the sitemap/feed probes
+    // do not multiply the page requests.
+    for path in ["/a", "/b", "/c"] {
+        assert!(
+            fx.times(path).len() <= 1,
+            "{path} was fetched more than once from a disallow-all host"
+        );
+    }
+}

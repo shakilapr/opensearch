@@ -521,6 +521,14 @@ def refresh_sidecars(plan: dict, metrics: dict) -> None:
             item["evidence"] = f"sidecars rebuilt for generation {gen}"
             save_plan(plan)
         return
+    # The dense and entity sidecars describe the *serving* root (/var/lib/search, ~19k docs).
+    # The crawlers bump that root's generation continuously, so "rebuild whenever the generation
+    # changed" degenerates into a permanent rebuild loop: measured 2026-10-28 an `embed build` at
+    # 700-800% CPU running back to back every ~15 minutes, which starved the four crawlers down to
+    # ~100% CPU each and 24 docs/h. The rebuild is also worthless for the corpus being crawled —
+    # the sidecars cover one root, not the fleet — so it is opt-in now.
+    if os.environ.get("SEARCH_SIDECAR_AUTOBUILD", "").strip() not in ("1", "true", "yes"):
+        return
     binary = REPO / "target" / "release" / "agent0"
     running = sh("pgrep -f 'agent0 (graph|embed) build' | wc -l")[1].strip()
     if running not in ("", "0"):
