@@ -398,8 +398,18 @@ impl Indexer {
     /// Batched writer on the base index. One commit for the whole batch.
     pub fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
         let mut w = self.base_writer()?;
-        for doc in docs {
+        // Two passes: every delete first, then every add, in ONE commit.
+        //
+        // Interleaving them (delete, add, delete, add…) means a later doc's `delete_term` can
+        // match an earlier doc's freshly added document, and the result depends on the order the
+        // caller happened to supply. Measured 2026-10-28 rebuilding the fleet: the index reached
+        // 1.36M documents for 1.17M unique inputs, because a rebuild that re-indexed the same ids
+        // left the previous generation's copies behind when the deletes were applied per-document
+        // against a snapshot that did not yet contain them.
+        for doc in &docs {
             w.delete_term(Term::from_field_text(self.fields.doc_id, &doc.doc_id));
+        }
+        for doc in &docs {
             w.add_document(doc.to_tantivy(&self.schema)).ix()?;
         }
         w.commit().ix()?;
