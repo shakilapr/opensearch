@@ -584,6 +584,8 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         std::env::var("SEARCH_CRAWL_DISCOVERY_WINDOW").ok(),
     );
     let follow_links = opts.follow_links;
+    // One read of the feed table replaces a per-seed join (see `feeds_by_host`).
+    let feeds = Arc::new(feeds_by_host(&pipeline));
     let mut next_seed = 0usize;
     let mut discovery: JoinSet<(String, Vec<String>)> = JoinSet::new();
     let mut drain_set: JoinSet<PerUrl> = JoinSet::new();
@@ -598,6 +600,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         &fetcher,
         follow_links,
         &drain.seen,
+        &feeds,
     );
 
     // Disk-guard bookkeeping: a counter so `statvfs` runs every 32 turns, and the flag the
@@ -625,6 +628,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
             &fetcher,
             follow_links,
             &drain.seen,
+            &feeds,
         );
 
         // Reap finished fetches and dispatch new ones (never blocks).
@@ -1433,6 +1437,7 @@ fn fill_discovery(
     fetcher: &Arc<Fetcher>,
     follow_links: bool,
     seen: &HashSet<String>,
+    feeds: &Arc<std::collections::HashMap<String, Vec<String>>>,
 ) {
     while *next < seeds.len() && discovery.len() < window {
         let seed = seeds[*next].clone();
@@ -1442,9 +1447,11 @@ fn fill_discovery(
         }
         let pl = pipeline.clone();
         let ft = fetcher.clone();
+        let feeds = Arc::clone(feeds);
         let seed_for_task = seed.clone();
         discovery.spawn(async move {
-            let urls = discover_seed_urls(&pl, &ft, &seed_for_task, follow_links).await;
+            let urls =
+                discover_seed_urls(&pl, &ft, &seed_for_task, follow_links, &feeds).await;
             (seed_for_task, urls)
         });
     }
@@ -1459,6 +1466,7 @@ async fn discover_seed_urls(
     fetcher: &Fetcher,
     seed: &str,
     follow_links: bool,
+    feeds: &std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
@@ -1515,15 +1523,20 @@ async fn discover_seed_urls(
     // feeds in the table, fetched again for every seed in the run. At 5,900 feeds and 400 seeds
     // that is 3,200 pointless fetches per shard, and it spends the per-origin politeness
     // interval of eight unrelated hosts on every seed. Scoped to the seed's domain it is 0-2.
-    let domain = seed
+    let host = seed
         .split("://")
         .nth(1)
         .and_then(|r| r.split('/').next())
         .unwrap_or("")
         .to_string();
-    for feed_url in domain_feed_urls(pipeline, &domain, MAX_FEEDS as i64) {
-        if let Some(bytes) = fetch_body(fetcher, &feed_url).await {
-            let entries = parse_feed(&bytes, &feed_url).unwrap_or_default();
+    let host = host.trim_start_matches("www.").to_ascii_lowercase();
+    let feeds_for_host: &[String] = feeds
+        .get(&host)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for feed_url in feeds_for_host.iter().take(MAX_FEEDS) {
+        if let Some(bytes) = fetch_body(fetcher, feed_url).await {
+            let entries = parse_feed(&bytes, feed_url).unwrap_or_default();
             for r in entries.into_iter().take(MAX_DISCOVERED) {
                 out.push(r.url);
             }
@@ -1541,29 +1554,37 @@ async fn discover_seed_urls(
     out
 }
 
-/// Feeds registered for `domain`, most recently fetched first.
-fn domain_feed_urls(pipeline: &Pipeline, domain: &str, limit: i64) -> Vec<String> {
-    pipeline
+/// Every feed, keyed by its host, most recently fetched first — loaded once per run.
+///
+/// A per-seed `JOIN domain` costs a `SCAN domain` (65,857 rows on a fleet shard) or a `SCAN feed`
+/// plus a temp B-tree, and it runs once per seed. Profiled 2026-10-28, that put 80% of the crawl's
+/// CPU inside `sqlite3VdbeExec` for 114 attempts/min. The feed table is small (5,917 rows on the
+/// same shard) and changes only as discovery runs, so one read at startup replaces thousands of
+/// scans; a seed that matches nothing (the overwhelmingly common case) then costs a hash lookup.
+fn feeds_by_host(pipeline: &Pipeline) -> std::collections::HashMap<String, Vec<String>> {
+    let rows: Vec<(String, String)> = pipeline
         .with_meta_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT f.url FROM feed f
-                     JOIN domain d ON d.domain_id = f.domain_id
-                     WHERE d.host = ?1 OR d.host = ?2
-                     ORDER BY f.fetched_at DESC LIMIT ?3",
+                    "SELECT d.host, f.url FROM feed f
+                       JOIN domain d ON d.domain_id = f.domain_id
+                      ORDER BY f.fetched_at DESC",
                 )
                 .map_err(search_metadata::db_err)?;
-            let bare = domain.trim_start_matches("www.").to_string();
             let rows = stmt
-                .query_map(rusqlite::params![domain, bare, limit], |r| {
-                    r.get::<_, String>(0)
-                })
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(search_metadata::db_err)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(search_metadata::db_err)?;
             Ok(rows)
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (host, url) in rows {
+        let host = host.trim_start_matches("www.").to_ascii_lowercase();
+        out.entry(host).or_default().push(url);
+    }
+    out
 }
 
 /// Fetch a sitemap; if it is an index, follow exactly one level of children.
