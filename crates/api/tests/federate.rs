@@ -211,14 +211,21 @@ fn the_manifest_never_overstates_the_federated_view() {
     let m = f.manifest().unwrap();
     assert_eq!(m.doc_count, 350, "counts are summed");
     assert_eq!(m.watermark, 20, "the oldest watermark, not the newest");
-    assert_eq!(m.generation, 0, "shards disagree, so no generation is claimed");
+    // Shards crawled independently sit at different generations by design. The honest report is
+    // the oldest one (every shard is at least this fresh), not 0 — which the API reads as
+    // "unpublished" and echoes to /health as a false statement about the corpus.
+    assert_eq!(m.generation, 7, "the oldest generation, not 0 and not the newest");
     assert!(m.manifest_id.contains("federated"), "{}", m.manifest_id);
 
     let same = federated(vec![
         ("shard-a", StubShard::new(&[])),
         ("shard-b", StubShard::new(&[])),
     ]);
-    assert_eq!(same.manifest().unwrap().generation, 7, "agreement is reported");
+    assert_eq!(
+        same.manifest().unwrap().generation,
+        7,
+        "agreement is still the minimum"
+    );
 }
 
 /// A searcher with no shards is a misconfiguration, not an empty corpus.
