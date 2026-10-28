@@ -165,6 +165,11 @@ const MAX_CHILD_SITEMAPS: usize = 16;
 const MAX_FEEDS: usize = 8;
 const MAX_DISCOVERED: usize = 512;
 
+/// How many incremental frontier flushes pass between full snapshots. The delta is
+/// appended to `frontier.adds` in between, so this bounds its growth without paying the
+/// 213 MB snapshot cost on every flush.
+const PERSIST_FULL_EVERY: u64 = 150;
+
 /// Default free-space floor for the crawl's disk guard, in GiB.
 const DEFAULT_MIN_FREE_GB: usize = 5;
 
@@ -689,6 +694,12 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     for u in read_frontier(&drain.frontier_path) {
         drain.enqueue(u);
     }
+    // The delta written since the last full snapshot. A clean exit leaves no delta (see
+    // `Drainer::final_persist`); after a kill it holds exactly the URLs enqueued since
+    // the last snapshot, which is what makes the 213 MB rewrite unnecessary.
+    for u in read_frontier_adds(&adds_path(&drain.frontier_path)) {
+        drain.enqueue(u);
+    }
 
     // Final drain for anything still queued (no-op when the bound was met).
     if !drain.bound_reached() {
@@ -699,8 +710,11 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // searchable and survive a resume (see `Pipeline::enable_overlay_batching`).
     pipeline.flush_overlay_batch()?;
 
-    // Clear the persisted frontier: everything has been logged.
-    persist_frontier(&drain.frontier_path, std::iter::empty::<String>());
+    // Leave an accurate frontier: a crawl that stopped because it hit `--max-docs` has
+    // thousands of URLs still pending, and clearing the file would make the next run
+    // rediscover them from scratch. A run that genuinely emptied its queue writes []
+    // because `remaining` is empty.
+    drain.final_persist();
 
     Ok(drain.summary(resumed_from, started.elapsed(), stopped_for_disk))
 }
@@ -782,6 +796,13 @@ struct Drainer {
     /// over a run; it is only a resumability hint (the log is the source of
     /// truth for done URLs), so it is throttled.
     last_persist: Instant,
+    /// `remaining` URLs added since the last full snapshot. Resumability only needs
+    /// "what is still pending", so the steady state is an append of the *new* URLs to
+    /// `frontier.adds` rather than a rewrite of the whole 200 MB set; the snapshot is
+    /// written rarely (see [`PERSIST_FULL_EVERY`]) and at exit.
+    pending_adds: Vec<String>,
+    /// Full snapshots written so far; drives the periodic compaction of `pending_adds`.
+    full_snapshots: u64,
     counters: Counters,
 }
 
@@ -817,6 +838,8 @@ impl Drainer {
             ingested: 0,
             remaining: BTreeSet::new(),
             last_persist: Instant::now(),
+            pending_adds: Vec::new(),
+            full_snapshots: 0,
             counters: Counters::default(),
         }
     }
@@ -833,6 +856,9 @@ impl Drainer {
         if self.seen.contains(&url) || !self.remaining.insert(url.clone()) {
             return;
         }
+        // Resumability: this URL is pending and must survive a kill. Recorded as a delta
+        // rather than by rewriting the whole snapshot (see `Drainer::persist`).
+        self.pending_adds.push(url.clone());
         let o = origin_of(&url);
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
@@ -853,6 +879,7 @@ impl Drainer {
         {
             return;
         }
+        self.pending_adds.push(url.clone());
         let o = origin_of(&url);
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
@@ -901,15 +928,44 @@ impl Drainer {
     fn persist(&mut self) {
         // The frontier is a resumability hint, not a correctness boundary: every
         // terminal URL is already in the log, and an un-logged URL that falls out
-        // of a stale frontier is simply rediscovered. Rewriting the whole set on
-        // every completion is O(N) per document and dominated the run, so cap it
-        // at one write every two seconds.
+        // of a stale frontier is simply rediscovered.
+        //
+        // Measured 2026-10-28: at 2.9M pending URLs the snapshot is 213 MB of JSON,
+        // and serialising it takes 0.7 s. Retried every 2 s that is 107 MB/s of JSON
+        // generation per shard — 427 MB/s across four shards, on the crawl's own event
+        // loop, which is why the box sat at 8% CPU and 5,300 attempts/hour. The
+        // snapshot is now the exception: the steady state appends only the URLs added
+        // since the last one, which is proportional to *new work*, not to queue depth.
         let now = Instant::now();
         if now.saturating_duration_since(self.last_persist) < Duration::from_secs(2) {
             return;
         }
         self.last_persist = now;
+        if self.pending_adds.is_empty() {
+            return;
+        }
+        // Every `PERSIST_FULL_EVERY`-th flush (and, via `final_persist`, at exit) writes
+        // the whole snapshot and truncates the delta, so the delta cannot grow without
+        // bound over a long run.
+        self.full_snapshots = self.full_snapshots.wrapping_add(1);
+        if self.full_snapshots % PERSIST_FULL_EVERY == 0 {
+            persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
+            self.pending_adds.clear();
+            let _ = std::fs::remove_file(adds_path(&self.frontier_path));
+        } else {
+            append_frontier_adds(&adds_path(&self.frontier_path), &self.pending_adds);
+            self.pending_adds.clear();
+        }
+    }
+
+    /// Write the full snapshot unconditionally. Called once as the crawl exits, so a
+    /// clean shutdown leaves a complete `frontier.json` and no delta behind.
+    fn final_persist(&mut self) {
         persist_frontier(&self.frontier_path, self.remaining.iter().cloned());
+        // The snapshot now contains every pending URL, so the delta is redundant. A
+        // failure to remove it is harmless: the resume reader unions both.
+        let _ = std::fs::remove_file(adds_path(&self.frontier_path));
+        self.pending_adds.clear();
     }
 
     fn summary(&self, resumed_from: usize, elapsed: Duration, stopped_for_disk: bool) -> CrawlSummary {
@@ -1663,6 +1719,51 @@ fn read_log_urls(path: &Path) -> AppResult<HashSet<String>> {
 fn read_frontier(path: &Path) -> Vec<String> {
     let bytes = std::fs::read(path).unwrap_or_default();
     serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// The delta file that sits beside `frontier.json`.
+fn adds_path(frontier: &Path) -> std::path::PathBuf {
+    frontier.with_extension("adds")
+}
+
+/// Append newly-enqueued URLs to the delta file, one JSON array element per line.
+///
+/// Line-delimited rather than one array: an interrupted append leaves at most one
+/// unparseable trailing line, which the reader skips, exactly like the crawl log.
+fn append_frontier_adds(path: &Path, urls: &[String]) {
+    if urls.is_empty() {
+        return;
+    }
+    let mut buf = String::with_capacity(urls.len() * 64);
+    for u in urls {
+        match serde_json::to_string(u) {
+            Ok(s) => {
+                buf.push_str(&s);
+                buf.push('\n');
+            }
+            Err(_) => continue,
+        }
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(buf.as_bytes()) {
+                eprintln!("failed to append frontier adds: {e}");
+            }
+        }
+        Err(e) => eprintln!("failed to open frontier adds: {e}"),
+    }
+}
+
+/// Every URL the delta file holds. A missing file is empty; a malformed trailing line is
+/// skipped (see [`append_frontier_adds`]).
+fn read_frontier_adds(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<String>(l).ok())
+        .collect()
 }
 
 fn persist_frontier(path: &Path, urls: impl Iterator<Item = String>) {

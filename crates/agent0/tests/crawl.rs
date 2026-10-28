@@ -1321,3 +1321,96 @@ async fn a_crawl_stops_immediately_when_the_disk_guard_trips() {
         "the guard runs before the first request, not after it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Resumability after the frontier became incremental
+// ---------------------------------------------------------------------------
+
+/// The frontier is a resumability hint, and it stopped being a full rewrite because the
+/// rewrite cost 213 MB of JSON every 2 s at 2.9M pending URLs (107 MB/s per shard,
+/// measured 2026-10-28). What must survive that change: a killed crawl's pending URLs are
+/// still pending afterwards — from the delta as well as from the snapshot.
+#[tokio::test]
+async fn a_killed_crawl_resumes_from_the_incremental_frontier() {
+    // Two pages linked from one seed, so the drain is mid-queue when it stops.
+    // Four seeds, so a one-document budget leaves the rest pending.
+    let (base, _fx) = spawn_fixture(
+        vec![("/a", "text/html", P1), ("/b", "text/html", P2), ("/c", "text/html", P1)],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(
+        tmp.path(),
+        "seeds.txt",
+        &[
+            format!("{base}/a"),
+            format!("{base}/b"),
+            format!("{base}/c"),
+        ],
+    );
+
+    // First run: stop after one document, so URLs are left pending.
+    let mut opts = options(seeds.clone(), out.clone());
+    opts.max_docs = 1;
+    let first = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(first.ingested, 1, "the first run ingested exactly its budget");
+
+    // The snapshot and/or the delta must account for what is still pending.
+    let snapshot: Vec<String> = std::fs::read(out.join("frontier.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let adds: Vec<String> = std::fs::read_to_string(out.join("frontier.adds"))
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<String>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !snapshot.is_empty() || !adds.is_empty(),
+        "a crawl stopped by its budget must leave its pending URLs behind"
+    );
+
+    // Second run with a larger budget: it must pick up the pending work rather than
+    // rediscovering it, and must not lose the already-ingested document.
+    let mut opts = options(seeds, out.clone());
+    opts.max_docs = 10;
+    let second = crawl(opts, &cfg).await.unwrap();
+    assert!(
+        second.resumed_from > 0,
+        "the second run resumed from a persisted frontier (resumed_from={})",
+        second.resumed_from
+    );
+    assert!(
+        second.ingested >= 1,
+        "the resumed run made progress (ingested={})",
+        second.ingested
+    );
+}
+
+/// A clean finish leaves an empty snapshot and no delta: the delta must not accumulate
+/// forever, and a completed crawl must not look like it has work left.
+#[tokio::test]
+async fn a_completed_crawl_leaves_no_pending_frontier() {
+    let (base, _fx) = spawn_fixture(vec![("/a", "text/html", P1)], ROBOTS_OPEN).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base}/a")]);
+
+    crawl(options(seeds, out.clone()), &cfg).await.unwrap();
+
+    let snapshot: Vec<String> = std::fs::read(out.join("frontier.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    assert!(snapshot.is_empty(), "nothing is pending: {snapshot:?}");
+    assert!(
+        !out.join("frontier.adds").exists(),
+        "a clean finish removes the delta"
+    );
+}
