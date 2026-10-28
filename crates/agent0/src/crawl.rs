@@ -190,6 +190,17 @@ pub struct CrawlOptions {
     pub seeds_file: PathBuf,
     /// Output directory for `crawl-log.jsonl`, `blobs/` and `frontier.json`.
     pub out_dir: PathBuf,
+    /// Write a second copy of every raw body under `out_dir/blobs`.
+    ///
+    /// Off by default. The pipeline already spills the raw bytes to `<data_dir>/blobs/<sha>`
+    /// (`Config::blob_path`), so writing them again into the crawl output stores the corpus
+    /// twice: measured 2026-10-28 the fleet held **295 GB under `data_dir/blobs` and another
+    /// 45 GB under `raw-dataset/*/blobs`, with zero overlap in the names** — the same bytes,
+    /// two hash-keyed directories, and the second one is read by nothing (`import` reads the
+    /// index, tests read their own temp dirs). Writing it also gzipped every page on the
+    /// crawl's own task. `--keep-raw-blobs` restores the old behaviour for a corpus that is
+    /// meant to be shipped as a folder of raw pages.
+    pub keep_raw_blobs: bool,
     /// Stop after this many *successfully ingested* documents.
     pub max_docs: usize,
     /// Stop after this many total fetch attempts.
@@ -258,6 +269,7 @@ impl CrawlOptions {
             origin_interval: Duration::from_millis(DEFAULT_ORIGIN_INTERVAL_MS),
             origin_cap: None,
             compress: false,
+            keep_raw_blobs: false,
             browser: None,
             // Off unless the caller asks: a hermetic test must not depend on the host's disk.
             min_free_bytes: 0,
@@ -398,6 +410,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_ORIGIN_INTERVAL_MS);
+    let keep_raw_blobs = args.iter().any(|a| a == "--keep-raw-blobs");
     let compress = args.iter().any(|a| a == "--compress")
         || matches!(
             std::env::var("SEARCH_CRAWL_COMPRESS").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
@@ -415,6 +428,7 @@ pub async fn run_crawl(args: &[String]) -> ExitCode {
         origin_interval: Duration::from_millis(interval_ms),
         origin_cap,
         compress,
+        keep_raw_blobs,
         browser: browser_from_env().await,
         min_free_bytes: resolve_min_free_bytes(flag_usize(args, "--min-free-gb")),
     };
@@ -1175,6 +1189,10 @@ impl Drainer {
         // ~237 KB, so a million of them is ~237 GB uncompressed — which is the difference between a
         // large corpus fitting on this disk and not. The sha256 in the name stays the hash of the
         // *uncompressed* bytes, so dedup and the crawl log mean the same thing either way.
+        // Off by default: the pipeline already spilled these bytes to `data_dir/blobs`
+        // (see `CrawlOptions::keep_raw_blobs`). Writing them again doubled the corpus on disk
+        // and ran a gzip on the crawl loop for a directory nothing reads.
+        if self.opts.keep_raw_blobs {
         if let (Some(raw), Some(sha)) = (&per.raw, &per.sha256) {
             let ext = ext_for(per.content_type.as_deref());
             let name = if self.opts.compress {
@@ -1202,6 +1220,7 @@ impl Drainer {
                     self.counters.bytes += payload.len() as u64;
                 }
             }
+        }
         }
 
         let line = serde_json::json!({

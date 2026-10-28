@@ -273,6 +273,9 @@ fn options(seeds: PathBuf, out: PathBuf) -> CrawlOptions {
     let mut o = CrawlOptions::new(seeds);
     o.out_dir = out;
     o.allow_loopback = true;
+    // The raw-spill suite below asserts on `out_dir/blobs`, which production no longer writes
+    // (see `CrawlOptions::keep_raw_blobs`); the default-off behaviour has its own test.
+    o.keep_raw_blobs = true;
     // Zero interval for the fast tests; the politeness test overrides it.
     o.origin_interval = Duration::ZERO;
     o
@@ -1413,4 +1416,31 @@ async fn a_completed_crawl_leaves_no_pending_frontier() {
         !out.join("frontier.adds").exists(),
         "a clean finish removes the delta"
     );
+}
+
+/// Raw bodies are spilled by the pipeline into `data_dir/blobs` already; the crawl must not
+/// write a second hash-keyed copy under its output directory unless asked. Measured on the
+/// fleet: 295 GB in `data_dir/blobs` and 45 GB in `raw-dataset/*/blobs`, no name overlap, and
+/// the second copy is read by nothing.
+#[tokio::test]
+async fn raw_blobs_are_not_duplicated_into_the_output_directory_by_default() {
+    let (base, _fx) = spawn_fixture(vec![("/a", "text/html", P1)], ROBOTS_OPEN).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base}/a")]);
+
+    let mut opts = options(seeds, out.clone());
+    opts.keep_raw_blobs = false;
+
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 1);
+    assert_eq!(summary.blobs, 0, "no second copy is written");
+    assert!(
+        blob_files(&out).is_empty(),
+        "out_dir/blobs stays empty: {:?}",
+        blob_files(&out)
+    );
+    // The document is still fully ingested and logged — only the duplicate copy is gone.
+    assert_eq!(log_lines(&out).len(), 1);
 }
