@@ -54,11 +54,13 @@ fn flag_str(args: &[String], flag: &str) -> Option<String> {
     args.get(idx + 1).cloned()
 }
 
-/// Every downloaded document in one shard that has extracted text.
+/// One page of downloaded documents that have extracted text.
 ///
-/// `text_path` is absolute in the database, which is what lets this run against a shard whose
-/// data root has moved.
-fn pending_docs(reader: &MetadataReader, limit: usize) -> AppResult<Vec<Pending>> {
+/// Paged on `docver_id` rather than materialised: 1.16M rows of metadata is small, but each row
+/// carries a text path and the caller then reads megabytes of body, so holding "all pending docs"
+/// in memory is what let a 386k-document shard reach 3.5 GB and be OOM-killed (measured
+/// 2026-10-28, `CONSTRAINT_MEMCG` kill on the index build).
+fn pending_docs_page(reader: &MetadataReader, after: &str, limit: usize) -> AppResult<Vec<Pending>> {
     let conn = reader.conn();
     let mut stmt = conn
         .prepare(
@@ -73,15 +75,16 @@ fn pending_docs(reader: &MetadataReader, limit: usize) -> AppResult<Vec<Pending>
                JOIN resource r ON r.resource_id = dv.resource_id
                JOIN content  c ON c.content_id = dv.content_id
               WHERE c.text_path IS NOT NULL
+                AND dv.docver_id > ?1
                 AND dv.version_no = (
                       SELECT MAX(d2.version_no) FROM document_version d2
                        WHERE d2.resource_id = dv.resource_id)
               ORDER BY dv.docver_id
-              LIMIT ?1",
+              LIMIT ?2",
         )
         .map_err(search_metadata::db_err)?;
     let rows = stmt
-        .query_map(rusqlite::params![limit as i64], |r| {
+        .query_map(rusqlite::params![after, limit as i64], |r| {
             Ok(Pending {
                 doc_id: r.get(0)?,
                 resource_id: r.get(1)?,
@@ -116,9 +119,6 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
     pipeline.enable_bulk_ingest(batch);
 
     let reader = MetadataReader::from_path(&cfg.meta_db())?;
-    let pending = pending_docs(&reader, limit)?;
-    let total = pending.len();
-    tracing::info!(documents = total, batch, "index build: documents to index");
 
     let mut report = Report {
         indexed: 0,
@@ -127,63 +127,78 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
         elapsed_ms: 0,
     };
     let mut batch_docs: Vec<IndexDoc> = Vec::with_capacity(batch);
+    // Page size is independent of the index batch: the page bounds peak memory (one text at a
+    // time is still the real cost), the batch bounds the commit count.
+    let page = 2_000usize;
+    let mut after = String::new();
+    let mut seen = 0usize;
 
-    for (n, p) in pending.into_iter().enumerate() {
-        let body = match std::fs::read_to_string(&p.text_path) {
-            Ok(b) => b,
-            Err(_) => {
-                // The row exists but the text is gone. Counting it is honest; indexing a title
-                // with an empty body would put a document in the index that cannot be read.
-                report.missing_text += 1;
+    'pages: loop {
+        let rows = pending_docs_page(&reader, &after, page.min(limit.saturating_sub(seen)).max(1))?;
+        if rows.is_empty() {
+            break;
+        }
+        for p in rows {
+            seen += 1;
+            after = p.doc_id.clone();
+            if seen > limit {
+                break 'pages;
+            }
+            let body = match std::fs::read_to_string(&p.text_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    // The row exists but the text is gone. Counting it is honest; indexing a title
+                    // with an empty body would put a document in the index that cannot be read.
+                    report.missing_text += 1;
+                    continue;
+                }
+            };
+            if body.trim().is_empty() {
+                report.empty_text += 1;
                 continue;
             }
-        };
-        if body.trim().is_empty() {
-            report.empty_text += 1;
-            continue;
-        }
-        batch_docs.push(IndexDoc {
-            doc_id: p.doc_id,
-            version: 1,
-            resource_id: p.resource_id,
-            work_id: None,
-            content_id: Some(p.content_id),
-            url: p.url,
-            title: p.title,
-            headings: String::new(),
-            body,
-            entities: Vec::new(),
-            source_id: None,
-            doc_type: "html".to_string(),
-            language: "en".to_string(),
-            published_at: p.published_at,
-            modified_at: None,
-            fetched_at: p.fetched_at,
-            // A rebuilt document is visible immediately: it is being indexed *now*, and the
-            // manifest this pass publishes is what gates it.
-            visible_generation: 0,
-            tombstone: false,
-        });
+            batch_docs.push(IndexDoc {
+                doc_id: p.doc_id,
+                version: 1,
+                resource_id: p.resource_id,
+                work_id: None,
+                content_id: Some(p.content_id),
+                url: p.url,
+                title: p.title,
+                headings: String::new(),
+                body,
+                entities: Vec::new(),
+                source_id: None,
+                doc_type: "html".to_string(),
+                language: "en".to_string(),
+                published_at: p.published_at,
+                modified_at: None,
+                fetched_at: p.fetched_at,
+                // A rebuilt document is visible immediately: it is being indexed *now*, and the
+                // manifest this pass publishes is what gates it.
+                visible_generation: 0,
+                tombstone: false,
+            });
 
-        if batch_docs.len() >= batch {
-            let n_docs = batch_docs.len();
-            pipeline.index_batch(std::mem::take(&mut batch_docs))?;
-            report.indexed += n_docs;
-            if report.indexed % (batch * 10) == 0 {
-                tracing::info!(
-                    indexed = report.indexed,
-                    total,
-                    rate = format!("{:.0}/s", report.indexed as f64 / started.elapsed().as_secs_f64()),
-                    "index build: progress"
-                );
+            if batch_docs.len() >= batch {
+                let n_docs = batch_docs.len();
+                pipeline.index_batch(std::mem::take(&mut batch_docs))?;
+                report.indexed += n_docs;
+                if report.indexed % (batch * 10) == 0 {
+                    tracing::info!(
+                        indexed = report.indexed,
+                        rate = format!(
+                            "{:.0}/s",
+                            report.indexed as f64 / started.elapsed().as_secs_f64()
+                        ),
+                        "index build: progress"
+                    );
+                }
             }
         }
-        let _ = n;
-    }
-    if !batch_docs.is_empty() {
-        let n_docs = batch_docs.len();
-        pipeline.index_batch(batch_docs)?;
-        report.indexed += n_docs;
+        if seen >= limit {
+            break;
+        }
     }
     // Publish: every buffered document becomes visible under one manifest.
     pipeline.flush_overlay_batch()?;
