@@ -791,6 +791,13 @@ struct Drainer {
     busy: HashSet<String>,
     last: HashMap<String, Instant>,
     rr: usize,
+    /// Origins that have queued work, are not busy, and are not backing off — the dispatch
+    /// candidate set. The old dispatch walked `order` (one entry per origin ever seen: 9,215 on
+    /// a resumed shard) on every spawn attempt; at 256 in flight that is a 2.36M-entry sweep per
+    /// loop turn, which is why four crawlers burned 500% CPU while dispatching 71 URLs/min.
+    /// Membership is a hint only: `dispatch` still re-checks busy/interval/backoff when it pops,
+    /// so a stale entry costs one skipped iteration, never a double fetch.
+    ready: VecDeque<String>,
     in_flight: usize,
     /// Attempts charged per origin; a host at `origin_cap()` is retired so no
     /// single sitemap can consume the whole budget (see `dispatch`).
@@ -851,6 +858,7 @@ impl Drainer {
             busy: HashSet::new(),
             last: HashMap::new(),
             rr: 0,
+            ready: VecDeque::new(),
             in_flight: 0,
             origin_attempts: HashMap::new(),
             backoff_until: HashMap::new(),
@@ -888,12 +896,24 @@ impl Drainer {
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
         }
-        let q = self.queues.entry(o).or_default();
+        let q = self.queues.entry(o.clone()).or_default();
         // Ranked documents drain before generic pages within an origin.
         if url_rank(&url) > 0 {
             q.push_front(url);
         } else {
             q.push_back(url);
+        }
+        self.mark_ready(&o);
+    }
+
+    /// Offer `origin` as a dispatch candidate.
+    ///
+    /// Deduplicated by `ready_set`-free design: `ready` may hold an origin more than once, and
+    /// `dispatch` drops entries whose queue is empty by then. That keeps this O(1) and cannot
+    /// starve an origin by forgetting to re-add it.
+    fn mark_ready(&mut self, origin: &str) {
+        if !self.busy.contains(origin) {
+            self.ready.push_back(origin.to_string());
         }
     }
 
@@ -911,12 +931,13 @@ impl Drainer {
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
         }
-        let q = self.queues.entry(o).or_default();
+        let q = self.queues.entry(o.clone()).or_default();
         if url_rank(&url) > 0 {
             q.push_front(url);
         } else {
             q.push_back(url);
         }
+        self.mark_ready(&o);
     }
 
     /// Per-origin attempt cap. The derived default is one tenth of the document
@@ -1064,77 +1085,75 @@ impl Drainer {
 
     /// Dispatch as many eligible URLs as the concurrency + per-origin politeness
     /// allow. Returns how many tasks were spawned. Never blocks.
+    ///
+    /// Pops from [`Drainer::ready`] instead of sweeping [`Drainer::order`]: the old loop walked
+    /// one entry per origin ever seen (9,215 on a resumed shard) for every spawn attempt, and
+    /// re-entered that sweep up to `concurrency` (256) times per turn. Measured 2026-10-28, that
+    /// cost 500% CPU across four crawlers to dispatch 71 URLs/min. Every condition is still
+    /// re-checked here — a `ready` entry is a hint, so a stale one costs one skipped iteration
+    /// and can never cause a double fetch.
     fn dispatch(&mut self, joinset: &mut JoinSet<PerUrl>) -> usize {
         let interval = self.opts.origin_interval;
         let concurrency = self.opts.concurrency;
         let mut spawned = 0;
-        loop {
+        // A turn can examine at most this many candidates before giving up: with a long
+        // politeness interval almost every origin is "not yet", and re-pushing each one forever
+        // would just move the spin inside the pop loop.
+        let budget = self.ready.len().max(1);
+        let mut examined = 0usize;
+        while examined < budget {
             if self.in_flight >= concurrency
                 || self.attempts >= self.opts.max_urls
                 || self.ingested >= self.opts.max_docs
-                || self.order.is_empty()
             {
                 break;
             }
-            let now = Instant::now();
-            let n = self.order.len();
-            let mut chosen: Option<String> = None;
-            // A full round of the origin list is the worst case, and it is what the old code did
-            // on *every* pass: at 9,215 pending origins and 256 tasks in flight that is 2.36M
-            // `busy`/map lookups per loop turn, which is why the box ran at 150% CPU while
-            // dispatching 40 URLs/min. Bounded here to the origins actually worth looking at:
-            // `ready` holds the indices that were not busy and not backing off, so the common
-            // case is a short scan instead of a full sweep.
-            // Bound: one full wrap is the worst case, but a scan that finds nothing after
-            // visiting every origin means nothing is dispatchable *now*, so stop rather than
-            // re-scan inside the same `loop` iteration (the old code re-entered this `for` up to
-            // `concurrency` times per turn).
-            let mut scanned = 0usize;
-            for k in 0..n {
-                scanned += 1;
-                let o = &self.order[(self.rr + k) % n];
-                if self.busy.contains(o) {
-                    continue;
-                }
-                match self.queues.get(o) {
-                    Some(q) if !q.is_empty() => {}
-                    _ => continue,
-                }
-                // Fairness: a single host (a giant sitemap) must not absorb the
-                // whole attempt budget. Once an origin reaches its cap its
-                // queue is dropped, so the remaining sources get the budget —
-                // the Stage-1 corpus wants many sources, not one deep host.
-                if self.origin_attempts.get(o).copied().unwrap_or(0) >= self.origin_cap() {
-                    if let Some(q) = self.queues.get_mut(o) {
-                        for u in q.drain(..) {
-                            self.remaining.remove(&u);
-                        }
-                    }
-                    continue;
-                }
-                if let Some(t) = self.last.get(o) {
-                    if now.saturating_duration_since(*t) < interval {
-                        continue;
-                    }
-                }
-                // Rate-limit backoff: an origin that answered 429 is skipped
-                // until its delay elapses. The slot then goes to whichever other
-                // origin the round-robin reaches — that is the point.
-                if let Some(until) = self.backoff_until.get(o) {
-                    if now < *until {
-                        continue;
-                    }
-                }
-                chosen = Some(o.clone());
-                self.rr = (self.rr + k + 1) % n;
-                break;
-            }
-            let Some(o) = chosen else {
-                let _ = scanned;
+            let Some(o) = self.ready.pop_front() else {
                 break;
             };
+            examined += 1;
+            if self.busy.contains(&o) {
+                continue;
+            }
+            let now = Instant::now();
+            let empty = match self.queues.get(&o) {
+                Some(q) => q.is_empty(),
+                None => true,
+            };
+            if empty {
+                continue;
+            }
+            // Fairness: a single host (a giant sitemap) must not absorb the whole attempt
+            // budget. Once an origin reaches its cap its queue is dropped, so the remaining
+            // sources get the budget — the Stage-1 corpus wants many sources, not one deep host.
+            if self.origin_attempts.get(&o).copied().unwrap_or(0) >= self.origin_cap() {
+                if let Some(q) = self.queues.get_mut(&o) {
+                    for u in q.drain(..) {
+                        self.remaining.remove(&u);
+                    }
+                }
+                continue;
+            }
+            // Politeness: an origin whose interval has not elapsed goes back on the ready queue
+            // so a later turn picks it up, but is not retried in this one.
+            if let Some(t) = self.last.get(&o) {
+                if now.saturating_duration_since(*t) < interval {
+                    self.ready.push_back(o);
+                    continue;
+                }
+            }
+            // Rate-limit backoff: an origin that answered 429 is skipped until its delay
+            // elapses. The slot goes to whichever other origin is ready — that is the point.
+            if let Some(until) = self.backoff_until.get(&o) {
+                if now < *until {
+                    self.ready.push_back(o);
+                    continue;
+                }
+            }
 
-            let url = self.queues.get_mut(&o).unwrap().pop_front().unwrap();
+            let Some(url) = self.queues.get_mut(&o).and_then(|q| q.pop_front()) else {
+                continue;
+            };
             self.busy.insert(o.clone());
             self.last.insert(o.clone(), now);
             *self.origin_attempts.entry(o.clone()).or_insert(0) += 1;
@@ -1164,6 +1183,18 @@ impl Drainer {
 
         self.in_flight = self.in_flight.saturating_sub(1);
         self.busy.remove(&per.origin);
+        // The origin just became eligible again. Without this, work enqueued for an origin while
+        // it was busy is never offered to `dispatch` — `mark_ready` skips busy origins, and
+        // nothing re-adds them when the task completes. That is a deadlock that looks like a
+        // slow crawl: the queues are non-empty and no attempt is in flight.
+        if self
+            .queues
+            .get(&per.origin)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+        {
+            self.ready.push_back(per.origin.clone());
+        }
         self.remaining.remove(&per.url);
         // Mark as done so a later frontier re-read never re-queues it.
         self.seen.insert(per.url.clone());
