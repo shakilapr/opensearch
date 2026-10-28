@@ -245,13 +245,13 @@ impl Searcher for FederatedSearcher {
         let base_segments = manifests.iter().map(|m| m.base_segments).sum();
         let watermark = manifests.iter().map(|m| m.watermark).min().unwrap_or(0);
         let metadata_version = manifests.iter().map(|m| m.metadata_version).max().unwrap_or(0);
-        // The *oldest* generation, not "0 unless every shard agrees". Four shards crawled
-        // independently are at four different generations by design; reporting 0 for that made
-        // `/health` say `generation: 0, index_unpublished` while returning real results, which
-        // is worse than useless — it is a false statement about the corpus. The minimum is the
-        // honest claim: every shard is at least this fresh. A shard that publishes generation 0
-        // (nothing yet) still drags the minimum to 0, which is then correct.
-        let generation = manifests.iter().map(|m| m.generation).min().unwrap_or(0);
+        // A generation is a *per-root* counter: two shards at generation 159,801 and 19,254 are
+        // not comparable, they just publish on their own schedules. Any single number is therefore
+        // arbitrary; what matters is (a) it is non-zero, so the API does not mark a working
+        // federation `index_unpublished`, and (b) `manifest_id` says how many roots it covers.
+        // The maximum is used because it is the only value guaranteed non-zero when any shard has
+        // published, and `doc_count` below is the number that actually describes the corpus.
+        let generation = manifests.iter().map(|m| m.generation).max().unwrap_or(0);
         let mut embedding_model_ids: Vec<String> = manifests
             .iter()
             .flat_map(|m| m.embedding_model_ids.clone())
