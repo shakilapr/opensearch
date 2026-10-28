@@ -32,8 +32,9 @@ behind one query (wired, not yet enabled).
 
 | Fact | Value | Where it comes from |
 | --- | --- | --- |
-| Serving index | **gen 19254, 19,255 resources / 18,947 content**, 225 domains | `/health`, `resource`/`content`/`domain` counts |
-| Served corpus vs crawled | **19,255 of ~1.12 M resources (1.7 %)** | sum of `resource` counts |
+| **Served corpus** | **5 shards federated, ~1.05 M documents, gen 211k** | `/health` -> `federated-5x211246` |
+| Primary root | gen 19254, 19,255 resources, 225 domains | `resource`/`domain` counts |
+| Federated latency | **124–145 ms** for 5 shards (was 71–92 ms for 19K docs) | live `POST /search` |
 | Fleet (4 shards) | 182,361 · 370,454 · 372,812 · 176,074 resources | per-shard `meta.sqlite` |
 | Fleet disk | **310 GB** (56–99 GB per shard) | `du` |
 | Serving data root | 6.1 GB (4.5 GB blobs, 315 MB Tantivy, 309 MB text, 430 MB LLM cache) | `du` |
@@ -242,6 +243,32 @@ deletion pass is planned (`index-upgrade-plan.md`) and **not done** — the shar
 right now, so `raw-dataset/` (49 GB) is a live output directory.
 
 ---
+
+## 5b. Throughput — the crawl was I/O-bound on its own bookkeeping
+
+Measured 2026-10-28, before and after the fixes below: **106 attempts/min and ~30 docs/h →
+~2,000 attempts/min and ~10,000 docs/h (14.6x)**. None of it was the network: a probe of 40 real
+seed URLs showed p50 0.3 s / mean 0.8 s, i.e. concurrency 32 alone supports ~2,300/min.
+
+| Cause | Measured | Fix |
+| --- | --- | --- |
+| `frontier.json` rewritten every 2 s | 213 MB JSON, 0.7 s to serialise, per shard | append delta + snapshot every 150 flushes (`30e559d`, `ebb5c65`) |
+| `frontier.push` one autocommit INSERT per URL, 512 per seed | ~80% of process CPU in `sqlite3VdbeExec` | `push_many`, one transaction (`b7f2d07`) |
+| lease query could not use its index (`status IN (...)`) | **522 ms per lease call** | partial index + ANALYZE, **0.4 ms** (`2ed2a71`) |
+| `dispatch` swept 9,215 origins × 256 in flight | 2.36M map lookups per loop turn | ready deque (`e499b09`) |
+| per-seed `SELECT url FROM feed LIMIT 8`, no predicate | same 8 feeds refetched for every seed | one host→url map at startup (`389b527`) |
+| duplicate raw spill (data_dir **and** out_dir) | 295 GB + 45 GB, zero name overlap | opt-in `--keep-raw-blobs` (`2d17cd2`) |
+| `database is locked` | **1,416 failures/hour** — documents silently dropped | `BEGIN IMMEDIATE` + busy retry (`c06d460`) |
+| embedding batch size 1 | 31.5 docs/s vs 98.1 batched | `embed_batch` override (`08e7c67`) |
+
+## 5c. Federation
+
+`SEARCH_FEDERATE_DIRS` makes `serve` answer from all four fleet shards. A shard is opened as **its
+Tantivy index only** (`IndexerConfig::read_only` + `IndexerSearcher`) — a full
+`Pipeline::open_read_only` builds a `MetadataWriter` (migrations, i.e. writes) and the crawler
+holds the writer's lockfile, so it fails on `PermissionDenied` then `Failed to acquire Lockfile`.
+The unit runs as `root` with `ReadWritePaths` covering both roots because the crawlers recreate
+`.managed.json`/`meta.json` 0600 root-only on every commit.
 
 ## 6. Operational surface
 
