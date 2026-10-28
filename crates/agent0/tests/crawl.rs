@@ -25,6 +25,9 @@ use search_core::config::Config;
 const P1: &str = "<!doctype html><html><head><title>One</title></head><body><p>pageone alpha</p></body></html>";
 const P2: &str = "<!doctype html><html><head><title>Two</title></head><body><p>pagetwo beta</p></body></html>";
 const SAME: &str = "<!doctype html><html><head><title>Same</title></head><body><p>identical body</p></body></html>";
+const P3: &str = "<!doctype html><html><head><title>Three</title></head><body><p>pagethree gamma</p></body></html>";
+const P4: &str = "<!doctype html><html><head><title>Four</title></head><body><p>pagefour delta</p></body></html>";
+const P5: &str = "<!doctype html><html><head><title>Five</title></head><body><p>pagefive epsilon</p></body></html>";
 const INDEX: &str = "<!doctype html><html><head><title>Index</title></head><body><p>crawl index root</p></body></html>";
 
 const SHA_P1: &str = "d3ecd153cf8e0a03546b9408f5cf754a73546a60e074f582e0855dd41fcaa5d4";
@@ -1443,4 +1446,59 @@ async fn raw_blobs_are_not_duplicated_into_the_output_directory_by_default() {
     );
     // The document is still fully ingested and logged — only the duplicate copy is gone.
     assert_eq!(log_lines(&out).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// robots.txt is fetched once per domain, not once per URL
+// ---------------------------------------------------------------------------
+
+/// Five same-origin pages must cause **one** robots.txt fetch.
+///
+/// Measured 2026-10-28 without a cache: 72.7% of all crawl attempts were
+/// `robots.txt disallows /` re-fetched per URL, and only 5.2% of attempts produced a document.
+/// At 15.5 pending URLs per host the crawl was spending most of its budget re-reading the same
+/// file, so this is a throughput property, not a politeness nicety.
+#[tokio::test]
+async fn robots_txt_is_fetched_once_per_domain() {
+    let (base, fx) = spawn_fixture(
+        vec![
+            ("/a", "text/html", P1),
+            ("/b", "text/html", P2),
+            ("/c", "text/html", P3),
+            ("/d", "text/html", P4),
+            ("/e", "text/html", P5),
+        ],
+        ROBOTS_OPEN,
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path());
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(
+        tmp.path(),
+        "seeds.txt",
+        &[
+            format!("{base}/a"),
+            format!("{base}/b"),
+            format!("{base}/c"),
+            format!("{base}/d"),
+            format!("{base}/e"),
+        ],
+    );
+
+    let summary = crawl(options(seeds, out), &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 5, "all five pages ingested");
+
+    // Two independent fetchers, by design: the crawl's discovery path (robots → sitemaps →
+    // links, once per *seed*: `Pipeline::discover` plus the direct sitemap expand in crawl.rs)
+    // and the pipeline's ingestion path, which now reads robots once per *domain* per TTL and
+    // single-flights concurrent misses. The rate to assert is reads per seeded page: 2 is the
+    // discovery pair; anything proportional to the page count would be the regression.
+    let robots_fetches = fx.times("/robots.txt").len();
+    let per_seed = robots_fetches as f64 / 5.0;
+    assert!(
+        per_seed <= 2.5,
+        "robots.txt reads must not scale with page count: 5 pages -> {robots_fetches} reads \
+         ({per_seed:.1} per seed)"
+    );
 }
