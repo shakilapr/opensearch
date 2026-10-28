@@ -24,6 +24,7 @@ pub const MIGRATIONS: &[(u64, &str)] = &[
     (4, include_str!("../migrations/0004_storage_tier.sql")),
     (5, include_str!("../migrations/0005_semantic_index.sql")),
     (6, include_str!("../migrations/0006_identity_layer.sql")),
+    (7, include_str!("../migrations/0007_frontier_dispatch_index.sql")),
 ];
 
 /// Migration ledger: records the version of every migration already applied.

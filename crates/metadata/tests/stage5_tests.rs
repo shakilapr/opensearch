@@ -38,7 +38,7 @@ fn migration_runner_applies_0001_through_0004_in_order() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6], "ledger records each version once, in order");
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7], "ledger records each version once, in order");
 }
 
 /// `resource.storage_tier` exists with the expected `TEXT NOT NULL DEFAULT 'hot'` shape, and the

@@ -48,7 +48,7 @@ fn migrations_idempotent_and_ledger_is_1_2_3() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6], "ledger has each version once");
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7], "ledger has each version once");
 }
 
 /// Every Stage-1 table exists with its expected columns.

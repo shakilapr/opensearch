@@ -146,6 +146,16 @@ struct Inner {
 ///
 /// Owns exactly one writer connection (see the module docs for why this is a
 /// documented exception to the batched-mutation single-writer path).
+/// The lease candidate query. Kept as a constant so the plan test and the real path cannot drift
+/// apart — the whole point of the partial dispatch index is this exact shape.
+const LEASE_SQL: &str = "SELECT resource_id, domain_id, attempt, epoch
+       FROM frontier_entry
+      WHERE status IN ('NEW', 'READY')
+        AND earliest_fetch_at <= ?1
+        AND (lease_until IS NULL OR lease_until < ?1)
+      ORDER BY priority ASC, earliest_fetch_at ASC, resource_id ASC
+      LIMIT ?2";
+
 pub struct Frontier {
     inner: Mutex<Inner>,
     cfg: FrontierConfig,
@@ -219,6 +229,31 @@ impl Frontier {
         Ok(pushed)
     }
 
+    /// Refresh the planner's statistics. Called after a bulk load so `lease` keeps choosing the
+    /// partial dispatch index; without statistics SQLite kept preferring the older
+    /// `(status, priority, earliest_fetch_at)` index plus a temp B-tree.
+    pub fn conn_analyze(&self) -> AppResult<()> {
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
+        conn.execute_batch("ANALYZE").map_err(search_metadata::db_err)
+    }
+
+    /// The `EXPLAIN QUERY PLAN` output for the lease query. Exposed so a test can pin the plan:
+    /// the rows are identical whether or not the index is used, but the cost is 1,300x apart.
+    pub fn lease_query_plan(&self, now: i64, limit: usize) -> AppResult<String> {
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", LEASE_SQL))
+            .map_err(search_metadata::db_err)?;
+        let rows = stmt
+            .query_map(params![now, limit as i64], |r| r.get::<_, String>(3))
+            .map_err(search_metadata::db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(search_metadata::db_err)?;
+        Ok(rows.join("\n"))
+    }
+
     /// The upsert behind both `push` and `push_many`.
     fn push_one(
         conn: &rusqlite::Connection,
@@ -274,13 +309,7 @@ impl Frontier {
         let candidates: Vec<(String, String, i64, i64)> = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT resource_id, domain_id, attempt, epoch
-                       FROM frontier_entry
-                      WHERE status IN ('NEW', 'READY')
-                        AND earliest_fetch_at <= ?1
-                        AND (lease_until IS NULL OR lease_until < ?1)
-                      ORDER BY priority ASC, earliest_fetch_at ASC, resource_id ASC
-                      LIMIT ?2",
+                    LEASE_SQL,
                 )
                 .map_err(search_metadata::db_err)?;
             let rows = stmt
