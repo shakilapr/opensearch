@@ -193,6 +193,37 @@ impl Frontier {
     pub fn push(&self, entry: FrontierEntry) -> AppResult<()> {
         let guard = self.lock()?;
         let conn = guard.conn.as_ref().expect("connection opened by lock()");
+        Self::push_one(conn, &entry)
+    }
+
+    /// Push many entries in **one** transaction.
+    ///
+    /// `push` is a single autocommit INSERT, so persisting one seed's discovery (up to 512 URLs)
+    /// cost 512 WAL commits. Profiled 2026-10-28, that put ~80% of every crawl process's CPU
+    /// inside `sqlite3VdbeExec` and held throughput at ~114 attempts/min across four shards.
+    /// One transaction per batch turns that into a single commit; the conflict handling is
+    /// identical, so re-pushing a known URL is still an update, not a duplicate.
+    pub fn push_many(&self, entries: &[FrontierEntry]) -> AppResult<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let guard = self.lock()?;
+        let conn = guard.conn.as_ref().expect("connection opened by lock()");
+        let tx = conn.unchecked_transaction().map_err(search_metadata::db_err)?;
+        let mut pushed = 0usize;
+        for entry in entries {
+            Self::push_one(&tx, entry)?;
+            pushed += 1;
+        }
+        tx.commit().map_err(search_metadata::db_err)?;
+        Ok(pushed)
+    }
+
+    /// The upsert behind both `push` and `push_many`.
+    fn push_one(
+        conn: &rusqlite::Connection,
+        entry: &FrontierEntry,
+    ) -> AppResult<()> {
         conn.execute(
             "INSERT INTO frontier_entry
                  (resource_id, url, domain_id, priority, earliest_fetch_at,

@@ -1057,7 +1057,7 @@ impl Pipeline {
         }
 
         // (3) push discovered resources into the frontier (bounded).
-        let mut pushed = 0usize;
+        let mut entries: Vec<FrontierEntry> = Vec::new();
         for r in discovered.into_iter().take(MAX_DISCOVERED_RESOURCES) {
             if r.kind == ResourceKind::Sitemap {
                 continue;
@@ -1070,7 +1070,7 @@ impl Pipeline {
                 ResourceKind::FeedEntry => Priority::Hot,
                 _ => Priority::Discovery,
             };
-            let entry = FrontierEntry {
+            entries.push(FrontierEntry {
                 resource_id,
                 url: r.url.clone(),
                 domain_id: domain_id.as_str().to_string(),
@@ -1078,11 +1078,11 @@ impl Pipeline {
                 earliest_fetch_at: 0,
                 expected_value: None,
                 discovered_from: Some(r.source_url.clone()),
-            };
-            if self.frontier.push(entry).is_ok() {
-                pushed += 1;
-            }
+            });
         }
+        // One transaction for the batch. Pushing inside the loop was one WAL commit per URL —
+        // up to 512 of them per seed — and profiled at ~80% of the crawl process's CPU.
+        let pushed = self.frontier.push_many(&entries).unwrap_or(0);
         report.resources = pushed;
 
         Ok(report)
