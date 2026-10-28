@@ -222,6 +222,35 @@ fn open_read_only(path: &Path) -> AppResult<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// Attempts for a write transaction that loses the WAL write race.
+const BUSY_ATTEMPTS: u32 = 6;
+/// Ceiling for the busy backoff, in milliseconds.
+const BUSY_MAX_BACKOFF_MS: u64 = 250;
+
+/// A batch failure, split by whether retrying could help.
+enum BusyOrOther {
+    /// SQLITE_BUSY / SQLITE_LOCKED: another connection holds the write lock. Transient.
+    Busy,
+    /// Anything else: a real error, returned immediately.
+    NotBusy(search_core::AppError),
+}
+
+impl BusyOrOther {
+    fn from_db(e: rusqlite::Error) -> Self {
+        match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if matches!(
+                    err.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                BusyOrOther::Busy
+            }
+            _ => BusyOrOther::NotBusy(crate::db_err(e)),
+        }
+    }
+}
+
 /// The single writer. Owns a connection and consumes [`Mutation`]s.
 pub struct MetadataWriter {
     conn: rusqlite::Connection,
@@ -245,12 +274,57 @@ impl MetadataWriter {
     /// Apply a batch of mutations inside one transaction. All-or-nothing: any
     /// failing mutation rolls the whole batch back.
     pub fn apply_batch(&mut self, batch: &[Mutation]) -> AppResult<()> {
-        let tx = self.conn.transaction().map_err(crate::db_err)?;
-        for m in batch {
-            apply_one(&tx, m)?;
+        self.apply_batch_retrying(batch)
+    }
+
+    /// [`apply_batch`](MetadataWriter::apply_batch), retrying on SQLITE_BUSY.
+    ///
+    /// A crawl runs four processes against four data roots, but each root also has readers and,
+    /// in a fleet, the same page can be ingested by a process whose WAL checkpoint is running.
+    /// Measured 2026-10-28: **1,416 `database error: database is locked` failures in one hour**,
+    /// every one of them a document silently dropped from the corpus. `busy_timeout=5000` only
+    /// covers lock waits *inside* a statement; a write transaction that loses the race at
+    /// `BEGIN IMMEDIATE` returns busy immediately, so the timeout never applies.
+    ///
+    /// Retried with exponential backoff (1 ms doubling to 250 ms, 6 attempts ≈ 0.5 s worst case)
+    /// because a busy writer is a transient condition, not a data error. A non-busy error is
+    /// returned at once: retrying a constraint violation would only lose the same document
+    /// more slowly.
+    fn apply_batch_retrying(&mut self, batch: &[Mutation]) -> AppResult<()> {
+        let mut backoff_ms = 1u64;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.try_apply_batch(batch) {
+                Ok(()) => return Ok(()),
+                Err(BusyOrOther::NotBusy(e)) => return Err(e),
+                Err(BusyOrOther::Busy) if attempt >= BUSY_ATTEMPTS => {
+                    return Err(search_core::AppError::Db(format!(
+                        "database stayed locked after {BUSY_ATTEMPTS} attempts"
+                    )))
+                }
+                Err(BusyOrOther::Busy) => {
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(BUSY_MAX_BACKOFF_MS);
+                }
+            }
         }
-        tx.commit().map_err(crate::db_err)?;
-        Ok(())
+    }
+
+    /// One attempt. Classifies a lock failure so the caller can retry it and fail on anything
+    /// else.
+    fn try_apply_batch(&mut self, batch: &[Mutation]) -> Result<(), BusyOrOther> {
+        // IMMEDIATE takes the write lock up front rather than upgrading mid-transaction: a
+        // deferred transaction that upgrades on its first write is where a writer already holding
+        // the lock produces a busy error after the caller has done the work of building the batch.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(BusyOrOther::from_db)?;
+        for m in batch {
+            apply_one(&tx, m).map_err(BusyOrOther::NotBusy)?;
+        }
+        tx.commit().map_err(BusyOrOther::from_db)
     }
 
     pub fn conn(&self) -> &rusqlite::Connection {

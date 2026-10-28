@@ -510,3 +510,86 @@ async fn background_writer_batches_and_flushes_tail() {
     assert_eq!(n, 50);
     assert_eq!(r.journal_len().unwrap(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Contended writes must not lose documents
+// ---------------------------------------------------------------------------
+
+/// Two writers on one database, both applying batches: neither may fail with "database is
+/// locked". Measured live on 2026-10-28, this cost 1,416 documents in a single hour of crawling —
+/// every `database is locked` is a page that was fetched, paid for, and then dropped from the
+/// corpus because `busy_timeout` does not cover losing the race at transaction start.
+#[test]
+fn contended_writers_retry_instead_of_dropping_documents() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+
+    // Create the schema and a shared resource both writers will contend on.
+    let mut setup = MetadataWriter::from_path(&path).unwrap();
+    setup
+        .apply_batch(&[domain("d1"), resource("r1", "d1")])
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for w in 0..2 {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut writer = MetadataWriter::from_path(&path).unwrap();
+            barrier.wait();
+            for i in 0..25 {
+                writer
+                    .apply_batch(&[Mutation::RecordFetch {
+                        resource_id: "r1".into(),
+                        http_status: 200,
+                        etag: None,
+                        last_modified: None,
+                        content_hash: Some(format!("hash-{w}-{i}")),
+                        fetched_at: 1000 + i as i64,
+                    }])
+                    .unwrap_or_else(|e| panic!("writer {w} batch {i} failed: {e}"));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("writer thread panicked");
+    }
+
+    // Both writers made progress: the row carries one of their hashes, not an error.
+    let r = MetadataReader::from_path(&path).unwrap();
+    let res = r.resource_by_id("r1").unwrap().expect("resource readable");
+    assert!(
+        res.last_fetch.is_some(),
+        "both writers committed: {res:?}"
+    );
+}
+
+/// A non-busy error is not retried into a timeout: the failure is returned at once.
+#[test]
+fn a_non_busy_error_is_returned_immediately() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+    let mut w = MetadataWriter::from_path(&path).unwrap();
+
+    // A content row whose resource does not exist violates the FK; retrying cannot fix it.
+    let started = std::time::Instant::now();
+    let err = w.apply_batch(&[Mutation::UpsertDocumentVersion {
+        docver_id: "dv1".into(),
+        resource_id: "does-not-exist".into(),
+        version_no: 1,
+        content_id: None,
+        title: None,
+        fetched_at: 1,
+        body_hash: None,
+        parser_version: "1".into(),
+        published_at: None,
+        modified_at: None,
+    }]);
+    assert!(err.is_err(), "an FK violation must fail");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a non-busy error must not be retried ({:?})",
+        started.elapsed()
+    );
+}
