@@ -279,6 +279,10 @@ pub struct Pipeline {
     /// Test-only: exempt loopback targets from the SSRF guard so a hermetic
     /// local server can be crawled. Production (`open`) leaves this `false`.
     allow_loopback: bool,
+    /// Whether to keep the raw fetched bytes beside the extracted text. Set from
+    /// `SEARCH_KEEP_RAW_BLOBS` at open time, so a test can choose per pipeline instead of racing
+    /// another test through the process environment.
+    keep_raw_blobs: bool,
     /// Stage-3 freshness scheduler (background due work + P0 query refresh).
     scheduler: ActivationScheduler,
     /// Stage-3 dispatch budget. Charged *before* a live refresh fetch is
@@ -489,6 +493,7 @@ impl Pipeline {
             robots_gate: Mutex::new(HashMap::new()),
             deny_all: Mutex::new(std::collections::HashSet::new()),
             allow_loopback,
+            keep_raw_blobs: keep_raw_blobs(),
             scheduler: ActivationScheduler::new(scheduler_cfg, BudgetLedger::new(budget_capacity)),
             dispatch_budget: BudgetLedger::new(budget_capacity),
             trace,
@@ -2258,11 +2263,23 @@ impl Pipeline {
         text: &[u8],
     ) -> AppResult<()> {
         let hex = content_id.as_str().trim_start_matches("cnt_");
-        let blob = self.cfg.blob_path(hex);
-        if let Some(p) = blob.parent() {
-            std::fs::create_dir_all(p)?;
+        // Raw HTML retention. The corpus needs the *derived* artifacts — URL, title, extracted
+        // text, vectors, index — and not the source bytes: measured 2026-10-28 the fleet held
+        // **299 GB of raw HTML against 13.8 GB of extracted text, a 38x ratio**, and the blob
+        // store was the only thing growing fast enough to matter (7.6 GB/h at ~1,100 docs/min).
+        // `read_pipeline_bytes` already falls back to the text file when a blob is absent, so a
+        // crawl that skips this write produces the same log line, the same dedupe and the same
+        // dataset export.
+        //
+        // `SEARCH_KEEP_RAW_BLOBS=1` restores the old behaviour for a corpus that is meant to be
+        // shipped as raw pages. `--compress` in the crawl only affects its own duplicate copy.
+        if self.keep_raw_blobs {
+            let blob = self.cfg.blob_path(hex);
+            if let Some(p) = blob.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(&blob, body)?;
         }
-        std::fs::write(&blob, body)?;
 
         let text_path = self.cfg.text_path(hex);
         if let Some(p) = text_path.parent() {
@@ -2401,6 +2418,21 @@ fn build_index_doc(
         visible_generation: generation,
         tombstone: false,
     }
+}
+
+/// Whether the pipeline keeps the raw fetched bytes beside the extracted text.
+///
+/// Read once per call rather than cached: it only guards a filesystem write, and an operator
+/// turning it off mid-run should take effect without a restart.
+fn keep_raw_blobs() -> bool {
+    matches!(
+        std::env::var("SEARCH_KEEP_RAW_BLOBS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 fn header_string(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {

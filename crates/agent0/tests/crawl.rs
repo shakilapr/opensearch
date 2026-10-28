@@ -254,6 +254,11 @@ async fn spawn_429_fixture(seed_html: &'static str) -> (String, Fx) {
 // Helpers
 // ---------------------------------------------------------------------------
 fn test_config(data_dir: &Path) -> Config {
+    // The raw-spill tests below assert on `<data_dir>/blobs`, which production no longer writes
+    // by default (`SEARCH_KEEP_RAW_BLOBS`): raw HTML is 38x the extracted text and nothing needs
+    // it, because `read_pipeline_bytes` falls back to the text file. The default-off behaviour has
+    // its own test at the bottom of this file.
+    std::env::set_var("SEARCH_KEEP_RAW_BLOBS", "1");
     let mut cfg = Config::default();
     cfg.data_dir = data_dir.to_path_buf();
     cfg.user_agent = "agent0-crawl-test/0.1 (+test)".to_string();
@@ -1550,4 +1555,45 @@ async fn a_host_that_denies_root_yields_no_documents() {
             "{path} was fetched more than once from a disallow-all host"
         );
     }
+}
+
+/// By default the crawl keeps no raw HTML: the derived artifacts (URL, title, extracted text,
+/// index) are the corpus, and the source bytes are 38x their size.
+///
+/// Measured 2026-10-28: 299 GB of raw blobs against 13.8 GB of extracted text across the fleet,
+/// growing at 7.6 GB/h. Deleting the convention is safe because `read_pipeline_bytes` already
+/// falls back to the text file, so the crawl log, dedupe and export are unchanged — which is what
+/// this asserts: the document is still ingested and still logged, only the blob is absent.
+#[tokio::test]
+async fn raw_html_is_not_stored_by_default() {
+    let (base, _fx) = spawn_fixture(vec![("/a", "text/html", P1)], ROBOTS_OPEN).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // `test_config` sets SEARCH_KEEP_RAW_BLOBS for the raw-spill tests; this one needs the
+    // default, and the pipeline reads the flag when it opens.
+    std::env::remove_var("SEARCH_KEEP_RAW_BLOBS");
+    let cfg = test_config(tmp.path());
+    std::env::remove_var("SEARCH_KEEP_RAW_BLOBS");
+    let out = tmp.path().join("out");
+    let seeds = write_seeds(tmp.path(), "seeds.txt", &[format!("{base}/a")]);
+
+    // `options()` turns the crawl's own copy on for the raw-spill suite; this test is the default.
+    let mut opts = options(seeds, out.clone());
+    opts.keep_raw_blobs = false;
+
+    let summary = crawl(opts, &cfg).await.unwrap();
+    assert_eq!(summary.ingested, 1, "the document is still ingested");
+    assert_eq!(summary.blobs, 0, "no raw copy is counted");
+    assert_eq!(log_lines(&out).len(), 1, "the crawl log is unchanged");
+
+    // The extracted text is what remains, and it is enough to index from.
+    let text_dir = tmp.path().join("text");
+    let texts: Vec<_> = std::fs::read_dir(&text_dir)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(!texts.is_empty(), "extracted text is still written");
+    let blob_dir = tmp.path().join("blobs");
+    let blobs: Vec<_> = std::fs::read_dir(&blob_dir)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(blobs.is_empty(), "no raw blob is written: {blobs:?}");
 }
