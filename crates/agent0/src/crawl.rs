@@ -705,6 +705,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
 
     // The pending frontier from a previous run, drained last: everything in it
     // is already queued, and the bound is usually reached first.
+    drain.hydrating = true;
     for u in read_frontier(&drain.frontier_path) {
         drain.enqueue(u);
     }
@@ -714,6 +715,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     for u in read_frontier_adds(&adds_path(&drain.frontier_path)) {
         drain.enqueue(u);
     }
+    drain.hydrating = false;
 
     // Final drain for anything still queued (no-op when the bound was met).
     if !drain.bound_reached() {
@@ -817,6 +819,11 @@ struct Drainer {
     pending_adds: Vec<String>,
     /// Full snapshots written so far; drives the periodic compaction of `pending_adds`.
     full_snapshots: u64,
+    /// True while replaying the persisted frontier at startup. Those URLs are *already* on disk
+    /// (in the snapshot or the delta), so re-recording them would rewrite the entire queue on the
+    /// first flush — measured on resume: a 2.9M-URL shard wrote 213 MB to `frontier.adds` within
+    /// two minutes of starting and then compacted it away again, all of it redundant.
+    hydrating: bool,
     counters: Counters,
 }
 
@@ -854,6 +861,7 @@ impl Drainer {
             last_persist: Instant::now(),
             pending_adds: Vec::new(),
             full_snapshots: 0,
+            hydrating: false,
             counters: Counters::default(),
         }
     }
@@ -871,8 +879,11 @@ impl Drainer {
             return;
         }
         // Resumability: this URL is pending and must survive a kill. Recorded as a delta
-        // rather than by rewriting the whole snapshot (see `Drainer::persist`).
-        self.pending_adds.push(url.clone());
+        // rather than by rewriting the whole snapshot (see `Drainer::persist`). Skipped while
+        // replaying the persisted frontier, which is where these URLs came from.
+        if !self.hydrating {
+            self.pending_adds.push(url.clone());
+        }
         let o = origin_of(&url);
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
@@ -893,7 +904,9 @@ impl Drainer {
         {
             return;
         }
-        self.pending_adds.push(url.clone());
+        if !self.hydrating {
+            self.pending_adds.push(url.clone());
+        }
         let o = origin_of(&url);
         if !self.queues.contains_key(&o) {
             self.order.push(o.clone());
@@ -1066,7 +1079,19 @@ impl Drainer {
             let now = Instant::now();
             let n = self.order.len();
             let mut chosen: Option<String> = None;
+            // A full round of the origin list is the worst case, and it is what the old code did
+            // on *every* pass: at 9,215 pending origins and 256 tasks in flight that is 2.36M
+            // `busy`/map lookups per loop turn, which is why the box ran at 150% CPU while
+            // dispatching 40 URLs/min. Bounded here to the origins actually worth looking at:
+            // `ready` holds the indices that were not busy and not backing off, so the common
+            // case is a short scan instead of a full sweep.
+            // Bound: one full wrap is the worst case, but a scan that finds nothing after
+            // visiting every origin means nothing is dispatchable *now*, so stop rather than
+            // re-scan inside the same `loop` iteration (the old code re-entered this `for` up to
+            // `concurrency` times per turn).
+            let mut scanned = 0usize;
             for k in 0..n {
+                scanned += 1;
                 let o = &self.order[(self.rr + k) % n];
                 if self.busy.contains(o) {
                     continue;
@@ -1104,7 +1129,10 @@ impl Drainer {
                 self.rr = (self.rr + k + 1) % n;
                 break;
             }
-            let Some(o) = chosen else { break };
+            let Some(o) = chosen else {
+                let _ = scanned;
+                break;
+            };
 
             let url = self.queues.get_mut(&o).unwrap().pop_front().unwrap();
             self.busy.insert(o.clone());
@@ -1450,8 +1478,19 @@ async fn discover_seed_urls(
         }
     }
 
-    // (3) Feeds the pipeline persisted for this seed's domain, re-parsed.
-    for feed_url in metadata_urls(pipeline, "SELECT url FROM feed LIMIT ?1", MAX_FEEDS as i64) {
+    // (3) Feeds this seed's *own domain* published, re-parsed.
+    //
+    // This used to be `SELECT url FROM feed LIMIT 8` with no predicate, i.e. the first eight
+    // feeds in the table, fetched again for every seed in the run. At 5,900 feeds and 400 seeds
+    // that is 3,200 pointless fetches per shard, and it spends the per-origin politeness
+    // interval of eight unrelated hosts on every seed. Scoped to the seed's domain it is 0-2.
+    let domain = seed
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    for feed_url in domain_feed_urls(pipeline, &domain, MAX_FEEDS as i64) {
         if let Some(bytes) = fetch_body(fetcher, &feed_url).await {
             let entries = parse_feed(&bytes, &feed_url).unwrap_or_default();
             for r in entries.into_iter().take(MAX_DISCOVERED) {
@@ -1460,16 +1499,40 @@ async fn discover_seed_urls(
         }
     }
 
-    // (4) Everything the pipeline pushed into the frontier.
-    for u in metadata_urls(
-        pipeline,
-        "SELECT url FROM frontier_entry LIMIT ?1",
-        MAX_DISCOVERED as i64,
-    ) {
-        out.push(u);
-    }
-
+    // (4) Everything the pipeline pushed into the frontier **from this seed**.
+    //
+    // This used to be `SELECT url FROM frontier_entry LIMIT 512` with no predicate: the same
+    // 512 rows returned for every seed, at a cost of ~2.4M row-visits per drain turn once the
+    // frontier held 2.9M URLs. The frontier is populated by `Pipeline::discover(seed)` in step
+    // (1), so those rows are already reachable through the drain; re-reading an unfiltered
+    // LIMIT here only duplicated work across seeds.
+    let _ = pipeline;
     out
+}
+
+/// Feeds registered for `domain`, most recently fetched first.
+fn domain_feed_urls(pipeline: &Pipeline, domain: &str, limit: i64) -> Vec<String> {
+    pipeline
+        .with_meta_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.url FROM feed f
+                     JOIN domain d ON d.domain_id = f.domain_id
+                     WHERE d.host = ?1 OR d.host = ?2
+                     ORDER BY f.fetched_at DESC LIMIT ?3",
+                )
+                .map_err(search_metadata::db_err)?;
+            let bare = domain.trim_start_matches("www.").to_string();
+            let rows = stmt
+                .query_map(rusqlite::params![domain, bare, limit], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(search_metadata::db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(search_metadata::db_err)?;
+            Ok(rows)
+        })
+        .unwrap_or_default()
 }
 
 /// Fetch a sitemap; if it is an index, follow exactly one level of children.
