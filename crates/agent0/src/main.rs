@@ -141,6 +141,13 @@ async fn main() -> ExitCode {
             }
             None => usage("agent0 search <query> [limit]"),
         },
+        Some("index") => match args.get(2).map(String::as_str) {
+            Some("build") => search_agent0::indexbuild::run(&args).await,
+            _ => {
+                eprintln!("usage: agent0 index build [--dir PATH]... [--batch N] [--limit N]");
+                ExitCode::from(2)
+            }
+        },
         Some("serve") => run_serve().await,
         Some("crawl") => search_agent0::crawl::run_crawl(&args).await,
         Some("eval") => match args.get(2).map(String::as_str) {

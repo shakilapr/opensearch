@@ -657,7 +657,10 @@ impl Pipeline {
     /// Bulk ingest writes `base` (spec §6's batch path); the crawl keeps the overlay for its
     /// per-document freshness. One place makes that decision, so a caller cannot accidentally
     /// pick the wrong index by choosing a different entry point.
-    fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
+    /// Index a batch of documents. `pub(crate)` for `indexbuild`, which indexes documents that
+    /// were downloaded before the index existed — the same path the crawler uses, so the schema
+    /// and dedupe cannot drift between a crawl and a rebuild.
+    pub(crate) fn index_batch(&self, docs: Vec<IndexDoc>) -> AppResult<()> {
         if self.bulk_base.load(AtomicOrdering::Relaxed) {
             self.indexer.index_batch(docs)
         } else {
