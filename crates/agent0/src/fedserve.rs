@@ -5,15 +5,20 @@
 //! stays the primary (its dense and graph lanes keep working, since those are per-root artifacts),
 //! and every listed root contributes its lexical index through [`FederatedSearcher`].
 //!
-//! Each extra root is opened **read-only** — no Tantivy writer, so no lock — which is what lets a
-//! shard still be crawled while it is being served. A root that cannot be opened is reported and
-//! skipped rather than aborting the server: serving three shards beats refusing to start.
+//! Each extra root is opened as **its Tantivy index only** — no metadata writer, no frontier, no
+//! pipeline. A full `Pipeline::open_read_only` still constructs a `MetadataWriter` (which runs
+//! migrations, i.e. writes), and the crawler holds the index writer's lockfile, so neither works
+//! for a shard being crawled: measured 2026-10-28, `PermissionDenied` on `.managed.json` followed
+//! by `Failed to acquire Lockfile`. A plain `IndexerSearcher` over a `read_only` `Indexer` needs
+//! neither, and that is what lets `serve` answer from a shard while a crawler writes it.
+//!
+//! A root that cannot be opened is reported and skipped rather than aborting the server: serving
+//! three shards beats refusing to start.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use search_api::{FederatedSearcher, Searcher};
-use search_core::config::Config;
+use search_api::{FederatedSearcher, IndexerSearcher, Searcher};
 use search_core::{AppError, AppResult};
 
 /// Data roots named by `SEARCH_FEDERATE_DIRS`, in order, skipping the primary root and repeats.
@@ -42,16 +47,17 @@ fn open_shard(dir: &std::path::Path) -> AppResult<(String, Arc<dyn Searcher + Se
             dir.display()
         )));
     }
-    let mut cfg = Config::from_env();
-    cfg.data_dir = dir.to_path_buf();
-    let pipeline = crate::Pipeline::open_read_only(&cfg, false).map_err(|e| {
-        AppError::Config(format!("shard {}: {e}", dir.display()))
-    })?;
+    let mut cfg = search_indexer::IndexerConfig::read_only(dir.join("tantivy"));
+    // `read_only` means "no writer", which is what avoids the lockfile. Nothing here needs the
+    // rest of the pipeline: an `IndexerSearcher` reads the index and nothing else.
+    cfg.read_only = true;
+    let indexer = search_indexer::Indexer::open(cfg)
+        .map_err(|e| AppError::Config(format!("shard {}: {e}", dir.display())))?;
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| dir.display().to_string());
-    Ok((name, pipeline.searcher()))
+    Ok((name, Arc::new(IndexerSearcher::new(Arc::new(indexer)))))
 }
 
 /// Build the searcher `serve` should use.
