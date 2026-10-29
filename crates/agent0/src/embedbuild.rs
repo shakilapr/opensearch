@@ -149,13 +149,47 @@ pub async fn run(args: &[String]) -> ExitCode {
     let docs: Vec<IndexDoc> = docs.into_iter().take(limit).collect();
 
     let started = Instant::now();
-    let store = match build_store(&docs, embedder.as_ref(), max_chars) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to embed: {e}");
+    // Embed in chunks with a checkpoint after each, so a run that takes hours cannot lose
+    // everything to one bad document or an OOM kill. Measured 2026-10-29: shard-0's 310K documents
+    // is ~6.5 h at 13.2 docs/s, and the first version held every vector in memory and wrote
+    // `vectors.bin` only at the end — one interruption discarded the whole run.
+    //
+    // The checkpoint is the output file itself, replaced atomically, holding everything embedded
+    // so far. A re-run resumes from the checkpoint's document count.
+    let mut store = match VectorStore::load_if_present(&out) {
+        Some(s) => {
+            println!("  resuming from {} ({})", out.display(), s.len());
+            s
+        }
+        None => VectorStore::new(embedder.dim()),
+    };
+    let done = store.len();
+    let todo: Vec<&IndexDoc> = docs.iter().skip(done).collect();
+    let total = docs.len();
+    const CHECKPOINT_EVERY: usize = 5_000;
+    let mut batch_start = 0usize;
+    while batch_start < todo.len() {
+        let end = (batch_start + CHECKPOINT_EVERY).min(todo.len());
+        let chunk: Vec<IndexDoc> = todo[batch_start..end].iter().map(|d| (*d).clone()).collect();
+        match build_store(&chunk, embedder.as_ref(), max_chars) {
+            Ok(part) => store.extend_from(&part),
+            Err(e) => {
+                eprintln!("failed to embed: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        if let Err(e) = store.save(&out) {
+            eprintln!("checkpoint write failed for {}: {e}", out.display());
             return ExitCode::from(1);
         }
-    };
+        batch_start = end;
+        println!(
+            "  {}/{} embedded ({:.1}%)",
+            done + batch_start,
+            total,
+            100.0 * (done + batch_start) as f64 / total.max(1) as f64
+        );
+    }
     if let Err(e) = store.save(&out) {
         eprintln!("failed to write {}: {e}", out.display());
         return ExitCode::from(1);

@@ -196,6 +196,31 @@ impl VectorStore {
     }
 
     /// Read a store written by [`VectorStore::save`].
+    /// Load a store if the file exists and parses, else `None`.
+    ///
+    /// Used as a resume checkpoint: a long embed run replaces the file after every chunk, so an
+    /// interrupted run loses at most one chunk. A file that exists but does not parse is treated as
+    /// absent — a corrupted checkpoint should restart the run, not wedge it.
+    pub fn load_if_present(path: &Path) -> Option<Self> {
+        if !path.is_file() {
+            return None;
+        }
+        Self::load(path).ok()
+    }
+
+    /// Append another store's entries, for checkpointed incremental builds.
+    ///
+    /// Dimensions must match; a mismatch drops the incoming store rather than mixing vectors from
+    /// two models into one file, which would make every similarity meaningless.
+    pub fn extend_from(&mut self, other: &Self) {
+        if self.dim != other.dim {
+            return;
+        }
+        for e in &other.entries {
+            self.entries.push(e.clone());
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self, StoreError> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 8];

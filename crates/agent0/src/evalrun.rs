@@ -28,6 +28,9 @@ pub struct Options {
     lanes: String,
     /// Opt into the §6–§18 engine (false = the frozen legacy lexical path).
     engine: bool,
+    /// Search mode. `Fast` by default because the benchmark must be hermetic and repeatable;
+    /// `Auto`/`Deep` perform live fetches, which a measurement run cannot afford.
+    mode: search_api::engine::EngineMode,
 }
 
 impl Options {
@@ -38,6 +41,7 @@ impl Options {
             out: None,
             lanes: "all".to_string(),
             engine: true,
+            mode: search_api::engine::EngineMode::Fast,
         };
         let mut i = 0;
         while i < args.len() {
@@ -69,6 +73,21 @@ impl Options {
                 "--no-engine" => {
                     opts.engine = false;
                     i += 1;
+                }
+                "--mode" => {
+                    let v = args.get(i + 1).map(String::as_str).unwrap_or("fast");
+                    opts.mode = match v {
+                        "auto" => search_api::engine::EngineMode::Auto,
+                        "deep" => search_api::engine::EngineMode::Deep,
+                        "fast" => search_api::engine::EngineMode::Fast,
+                        other => {
+                            // Fall back rather than exit: this parser returns Options, and a
+                            // benchmark that refuses to start over a typo wastes a full run.
+                            eprintln!("unknown --mode `{other}` (fast|auto|deep); using fast");
+                            search_api::engine::EngineMode::Fast
+                        }
+                    };
+                    i += 2;
                 }
                 _ => i += 1,
             }
@@ -161,7 +180,11 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
                 filters: None,
             },
             engine: opts.engine,
-            mode: search_api::engine::EngineMode::Auto,
+            // Fast by default: `Auto` performs §17's 8 live fetches per query, and a benchmark
+            // run inside this process has no network path — each fetch waits out its timeout, so
+            // 3 queries took over 280 s and reported nothing. Fast mode's refresh_count is 0, which
+            // is what makes a 604-case run tractable and repeatable. `--mode deep` opts back in.
+            mode: opts.mode,
         };
         let started = std::time::Instant::now();
         let _ = search_engine::timing::take();
