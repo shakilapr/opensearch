@@ -41,6 +41,40 @@ pub enum Mutation {
         source_id: Option<String>,
         kind: String,
     },
+    /// Register a concept (idempotent on `concept_id`; a name collision is an error, because
+    /// `concept.name` is unique — an ambiguity is two concepts plus a `related` relation).
+    UpsertConcept {
+        concept_id: String,
+        name: String,
+        description: Option<String>,
+        kind: String,
+        created_at: i64,
+    },
+    /// Add a surface form that resolves to a concept.
+    UpsertConceptAlias {
+        concept_id: String,
+        alias: String,
+        lang: Option<String>,
+        created_at: i64,
+    },
+    /// Record one weighted document→concept association.
+    ///
+    /// This is the row the whole semantic index is built from: `weight` in `[0,1]`, `relation_kind`
+    /// either `direct` (the document states it) or `inferred` (reached through `concept_relation`).
+    /// The key includes `relation_kind`, so the same document may hold both for one concept and a
+    /// reader can prefer the direct claim.
+    UpsertDocConcept {
+        resource_id: String,
+        concept_id: String,
+        weight: f64,
+        relation_kind: String,
+        evidence: Option<String>,
+        passage_id: Option<String>,
+        via_concept_id: Option<String>,
+        model_version: Option<String>,
+        work_id: Option<String>,
+        created_at: i64,
+    },
     /// Append a fetch observation.
     RecordFetch {
         resource_id: String,
@@ -964,6 +998,79 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     url=excluded.url, canonical_url=excluded.canonical_url,
                     source_id=COALESCE(excluded.source_id, resource.source_id)",
                 rusqlite::params![resource_id, url, canonical_url, domain_id, source_id, kind, now],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertConcept {
+            concept_id,
+            name,
+            description,
+            kind,
+            created_at,
+        } => {
+            // The name is unique, so a re-registration of the same concept is a rename and an
+            // attempt to give a second concept an existing name is a conflict the schema rejects.
+            tx.execute(
+                "INSERT INTO concept (concept_id, name, description, kind, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+                 ON CONFLICT(concept_id) DO UPDATE SET
+                     description = COALESCE(excluded.description, concept.description),
+                     updated_at = excluded.updated_at",
+                rusqlite::params![concept_id, name, description, kind, created_at],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertConceptAlias {
+            concept_id,
+            alias,
+            lang,
+            created_at,
+        } => {
+            tx.execute(
+                "INSERT INTO concept_alias (concept_id, alias, lang, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(concept_id, alias) DO NOTHING",
+                rusqlite::params![concept_id, alias, lang, created_at],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertDocConcept {
+            resource_id,
+            concept_id,
+            weight,
+            relation_kind,
+            evidence,
+            passage_id,
+            via_concept_id,
+            model_version,
+            work_id,
+            created_at,
+        } => {
+            tx.execute(
+                "INSERT INTO doc_concept
+                     (resource_id, concept_id, weight, relation_kind, evidence, passage_id,
+                      via_concept_id, model_version, work_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                 ON CONFLICT(resource_id, concept_id, relation_kind) DO UPDATE SET
+                     weight = excluded.weight,
+                     evidence = COALESCE(excluded.evidence, doc_concept.evidence),
+                     passage_id = COALESCE(excluded.passage_id, doc_concept.passage_id),
+                     via_concept_id = COALESCE(excluded.via_concept_id, doc_concept.via_concept_id),
+                     model_version = COALESCE(excluded.model_version, doc_concept.model_version),
+                     work_id = COALESCE(excluded.work_id, doc_concept.work_id),
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    resource_id,
+                    concept_id,
+                    weight,
+                    relation_kind,
+                    evidence,
+                    passage_id,
+                    via_concept_id,
+                    model_version,
+                    work_id,
+                    created_at,
+                ],
             )
             .map_err(crate::db_err)?;
         }

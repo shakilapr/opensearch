@@ -11,6 +11,10 @@ license.workspace = true
 real-indexer = ["dep:search-indexer"]
 
 [dependencies]
+# The concept lane reads `doc_concept` directly: the matrix is SQLite-resident and a lane that
+# proxied through another crate would only add a layer without changing the query.
+rusqlite.workspace = true
+search-metadata = { path = "../metadata" }
 search-core = { path = "../core" }
 search-embed = { path = "../embed" }
 search-indexer = { path = "../indexer", optional = true }

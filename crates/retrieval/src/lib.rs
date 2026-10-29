@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod concept;
+pub mod concept_tag;
 pub mod dense;
 
 pub use dense::DenseLane;
@@ -43,6 +45,11 @@ pub enum Lane {
     /// Entity-graph lane: candidates reached by activating the entity graph around the entities a
     /// query names (plan §9.4). Its hits are what the API reports as `graph_expansion`.
     Graph,
+    /// Concept lane: candidates reached through the weighted document↔concept matrix
+    /// (`doc_concept`). This is the lane `docs/SEMANTIC_INDEX_ARCHITECTURE.md` specifies — a
+    /// query resolves to concepts, the matrix resolves concepts to document ids, and the weights
+    /// become the score.
+    Concept,
 }
 
 /// A scored retrieval candidate carrying enough provenance for the UI's
