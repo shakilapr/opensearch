@@ -9,9 +9,25 @@ use search_core::{AppResult, IndexManifest, Provenance, SearchFilters};
 
 use search_agent0::fedserve::{dirs_from_env, searcher};
 
+/// Every test that touches `SEARCH_FEDERATE_DIRS` must hold this.
+///
+/// The variable is process-global, so tests in one binary race: a test that expects "no shards
+/// configured" ran while another had just set it, and asserted `federated-3x166341` against
+/// `primary-stub`. `std::env` has no per-test scoping, so the only correct fix is to serialise the
+/// tests that mutate it.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A poisoned lock means a previous holder panicked; the env may be dirty, but the tests that
+    // follow re-set it before use, so recovering is safer than cascading failures.
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Unset: no shards, so `serve` keeps the single-root path exactly as it was.
 #[test]
 fn no_env_var_means_no_federated_shards() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     std::env::remove_var("SEARCH_FEDERATE_DIRS");
     assert!(dirs_from_env(std::path::Path::new("/var/lib/search")).is_empty());
 }
@@ -21,6 +37,8 @@ fn no_env_var_means_no_federated_shards() {
 /// repeated root is skipped too.
 #[test]
 fn dirs_are_parsed_in_order_without_the_primary_or_repeats() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     // A private variable name per test would be better, but the process env is global to the
     // binary under test; this test is the only one that sets it.
     std::env::set_var(
@@ -43,6 +61,8 @@ fn dirs_are_parsed_in_order_without_the_primary_or_repeats() {
 /// the primary — the alternative is a server that refuses to start.
 #[test]
 fn an_unopenable_shard_does_not_stop_the_server() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     std::env::set_var("SEARCH_FEDERATE_DIRS", "/nonexistent/shard-does-not-exist");
     let primary: std::sync::Arc<dyn Searcher + Send + Sync> =
         std::sync::Arc::new(StubPrimary::default());
@@ -58,6 +78,8 @@ fn an_unopenable_shard_does_not_stop_the_server() {
 /// worse outcome than a server that logs one loud refusal.
 #[test]
 fn a_missing_shard_root_is_not_created() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("typo");
     std::env::set_var("SEARCH_FEDERATE_DIRS", missing.to_str().unwrap());
@@ -72,6 +94,8 @@ fn a_missing_shard_root_is_not_created() {
 /// pay for a fusion layer it does not need.
 #[test]
 fn with_no_shards_the_primary_is_returned_untouched() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     std::env::remove_var("SEARCH_FEDERATE_DIRS");
     let primary: std::sync::Arc<dyn Searcher + Send + Sync> =
         std::sync::Arc::new(StubPrimary::default());
@@ -138,6 +162,8 @@ impl Searcher for StubPrimary {
 /// `manifest().is_err()` — swallowed by the sum — instead of its published generation.
 #[test]
 fn stub_shards_report_through_the_federation() {
+    // Serialised: SEARCH_FEDERATE_DIRS is process-global.
+    let _guard = env_lock();
     std::env::remove_var("SEARCH_FEDERATE_DIRS");
     let a: std::sync::Arc<dyn Searcher + Send + Sync> = std::sync::Arc::new(StubPrimary);
     let b: std::sync::Arc<dyn Searcher + Send + Sync> = std::sync::Arc::new(StubPrimary);
