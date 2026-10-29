@@ -122,10 +122,20 @@ const MAX_REFRESH_CANDIDATES: usize = 64;
 /// per page, so the crawl was commit-bound (a 4-shard fleet sat at ~110 docs/min
 /// with every core idle). Committing once per batch amortises that cost while
 /// keeping the index no more than this many documents behind the crawl log.
-const OVERLAY_BATCH: usize = 128;
+/// Documents buffered before a commit + publish.
+///
+/// Raised from 128 after profiling the crawl (2026-10-28): `publish_manifest_at` costs a full
+/// overlay scan plus one `TermQuery` per overlay document against base, and at 128 docs it ran
+/// every few seconds — 21% of crawler CPU in `tantivy StoreReader::read_block` and 16% in
+/// `from_utf8`, all of it bookkeeping. Publishing an order of magnitude less often moves that
+/// work off the hot path without delaying visibility beyond a minute.
+const OVERLAY_BATCH: usize = 2048;
 /// Longest a buffered overlay doc may wait before a flush, so a slow trickle of
 /// documents is still published and a kill loses at most a few seconds of work.
-const OVERLAY_BATCH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest a buffered document waits before it is committed and published regardless of batch
+/// size. Raise it with `OVERLAY_BATCH`: 10 s forced the expensive publish on a timer even when
+/// the corpus was arriving slowly.
+const OVERLAY_BATCH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The result of one [`Pipeline::crawl_one`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
