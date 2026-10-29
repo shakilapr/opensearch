@@ -46,6 +46,13 @@ impl Default for FusionPolicy {
         );
         weights.insert(LaneId::Dense, weight_from_env("SEARCH_FUSION_DENSE", 0.0));
         weights.insert(LaneId::Graph, weight_from_env("SEARCH_FUSION_GRAPH", 0.0));
+        // The concept lane (v2 §6) reads the weighted document↔concept matrix. Default 0.0 for the
+        // same reason as dense and graph: a lane that has not been measured against the graded
+        // query set must not move ranking. Turn it on with SEARCH_FUSION_CONCEPT=0.8 and measure.
+        weights.insert(
+            LaneId::Concept,
+            weight_from_env("SEARCH_FUSION_CONCEPT", 0.0),
+        );
         Self {
             c: weight_from_env("SEARCH_FUSION_C", 60.0),
             weights,

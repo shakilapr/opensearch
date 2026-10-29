@@ -36,6 +36,7 @@ pub mod frontier_recover;
 pub mod graphbuild;
 pub mod indexbuild;
 pub mod deep;
+pub mod migrate;
 pub mod pipeline;
 pub mod planner_cache;
 pub mod portable;

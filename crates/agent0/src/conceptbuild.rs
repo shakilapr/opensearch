@@ -45,6 +45,12 @@ fn flag_str(args: &[String], flag: &str) -> Option<String> {
 /// One document ready to tag.
 struct Doc {
     resource_id: String,
+    /// The pagination cursor. Must be the same column the query orders and filters on
+    /// (`document_version.docver_id`); an earlier version advanced the cursor to `resource_id`
+    /// while filtering on `docver_id`, so every page restarted near the beginning of the corpus and
+    /// the same documents were re-tagged indefinitely. Measured 2026-10-29: 60,435 documents in 25
+    /// minutes, with progress stalling because pages overlapped almost completely.
+    docver_id: String,
     title: String,
     text_path: String,
 }
@@ -111,8 +117,9 @@ fn page_of_docs(
         .map_err(search_metadata::db_err)?;
     Ok(rows
         .into_iter()
-        .map(|(resource_id, _docver, title, text_path)| Doc {
+        .map(|(resource_id, docver_id, title, text_path)| Doc {
             resource_id,
+            docver_id,
             title,
             text_path,
         })
@@ -200,7 +207,7 @@ fn build_root(cfg: &Config, batch: usize, limit: usize, dry_run: bool) -> AppRes
             // Headings live in the body text for extracted pages, so they are searched through the
             // body; a page's title comes from the metadata row.
             let assocs_for_doc = concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON);
-            after = d.resource_id.clone();
+            after = d.docver_id.clone();
             if assocs_for_doc.is_empty() {
                 continue;
             }

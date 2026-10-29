@@ -120,6 +120,38 @@ fn build_graph_lane(
     }
 }
 
+/// Build the concept lane over the `doc_concept` matrix.
+///
+/// This is the lane `docs/SEMANTIC_INDEX_ARCHITECTURE.md` describes and `architecture-update-v2.md`
+/// §6 requires, and until 2026-10-29 it existed but nothing in the serving path referenced it: the
+/// live API answered "chemical reactions that affect romance" with the band My Chemical Romance.
+///
+/// No associations = no lane, logged at info. An empty lane would take a share of every fused
+/// result's weight and contribute nothing, which is worse than being absent.
+///
+/// The lane reads each shard's own `doc_concept` table. Federation fuses the shards after retrieval,
+/// so a document's id is the same on every shard and needs no rewriting here.
+fn build_concept_lane(
+    cfg: &search_core::config::Config,
+) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
+    match search_retrieval::concept::from_data_dir(&cfg.data_dir) {
+        Some(lane) => {
+            tracing::info!(
+                dir = %cfg.data_dir.display(),
+                "concept lane enabled (doc_concept matrix)"
+            );
+            vec![std::sync::Arc::new(lane)]
+        }
+        None => {
+            tracing::info!(
+                dir = %cfg.data_dir.display(),
+                "no concept associations: the concept lane is off (build with `agent0 concepts build`)"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Honour RUST_LOG (default `info`); without this the deploy unit's RUST_LOG
@@ -141,6 +173,7 @@ async fn main() -> ExitCode {
             }
             None => usage("agent0 search <query> [limit]"),
         },
+        Some("migrate") => search_agent0::migrate::run(&args),
         Some("concepts") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::conceptbuild::run(&args).await,
             _ => {
@@ -409,6 +442,7 @@ async fn run_serve() -> ExitCode {
 
     let mut extra_lanes = build_dense_lane(&cfg);
     extra_lanes.extend(build_graph_lane(&cfg));
+    extra_lanes.extend(build_concept_lane(&cfg));
     if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, planner, extra_lanes).await {
         eprintln!("server error: {e}");
         return ExitCode::from(1);

@@ -179,6 +179,53 @@ fn body_weight(n: usize) -> f64 {
 /// that is genuinely about the query. The floor is what turns "mentioned" into "about".
 const MIN_WEIGHT: f64 = 0.18;
 
+/// Markers that show a concept is being used in its *other* sense.
+///
+/// "romance" is a concept about attachment, and also a fiction genre and a band name. Measured
+/// 2026-10-29 while validating the concept lane: a light-novel category page
+/// (`novelcool.com/category/Drama.html`) scored **0.60 on `romance`** and ranked in the top five for
+/// "chemical reactions that affect romance", as did My Chemical Romance concert news. The alias
+/// list cannot fix this, because the word is correct in both senses; only context distinguishes
+/// them.
+///
+/// A non-fiction corpus should therefore discount a concept when the page also carries markers of
+/// the other sense. The discount is applied to `direct`, since a genre listing is not claiming this
+/// concept topically, and the association is dropped entirely if nothing else supports it.
+const FICTION_MARKERS: &[&str] = &[
+    "novel", "chapter", "fiction", "romance novel", "audiobook", "ebook", "kindle", "read online",
+    "webnovel", "light novel", "manga", "anime", "episode", "season 2", "watch online", "subtitle",
+    "lyrics", "album", "tracklist", "tour dates", "concert", "tickets", "band",
+];
+
+/// Markers of a music/entertainment page, the other sense of "chemical".
+///
+/// Measured 2026-10-29: "My Chemical Romance announce 2026 tour" scored **0.49 on `chemistry`**
+/// because the band's name contains the alias. The page is not about chemistry at all, and it was
+/// the top lexical result for "chemical reactions that affect romance".
+const MUSIC_MARKERS: &[&str] = &[
+    "band", "tour", "album", "lyrics", "concert", "tickets", "spotify", "itunes", "playlist",
+    "singer", "song", "track", "gig", "festival", "merch", "vinyl", "setlist",
+];
+
+/// Concepts whose correct sense is ambiguous in a general web corpus, and the markers that indicate
+/// the wrong sense. Keyed by concept id.
+fn wrong_sense_markers(concept_id: &str) -> Option<&'static [&'static str]> {
+    match concept_id {
+        // "romance" the attachment concept vs the fiction genre.
+        "c-romance" => Some(FICTION_MARKERS),
+        // "chemical" the science vs the band.
+        "c-chemistry" => Some(MUSIC_MARKERS),
+        _ => None,
+    }
+}
+
+/// How much of `direct` survives when the page carries the concept's other sense.
+///
+/// Not zero: a genuine article about romantic attachment can quote a novel, and a page about a band
+/// can still discuss chemistry. A modest discount removes genre listings from the top ranks without
+/// making the concept unreachable.
+const AMBIGUOUS_SENSE_FACTOR: f64 = 0.15;
+
 /// One document's association with one concept, as v2 §6 requires: a vector of dimensions, not a
 /// single number.
 ///
@@ -303,6 +350,24 @@ pub fn tag(
             (body_weight(mechanism_hits) * MECHANISM_FACTOR).min(MAX_WEIGHT)
         } else {
             0.0
+        };
+
+        // Wrong-sense discount. Applied to `direct` only, and only when the page actually carries
+        // the markers — a page with no genre vocabulary is untouched.
+        let (direct, contextual, mechanism) = match wrong_sense_markers(seed.concept_id) {
+            Some(markers) => {
+                let hits = markers.iter().filter(|m| body_l.contains(**m)).count();
+                if hits >= 2 {
+                    (
+                        direct * AMBIGUOUS_SENSE_FACTOR,
+                        contextual * AMBIGUOUS_SENSE_FACTOR,
+                        mechanism * AMBIGUOUS_SENSE_FACTOR,
+                    )
+                } else {
+                    (direct, contextual, mechanism)
+                }
+            }
+            None => (direct, contextual, mechanism),
         };
 
         let assoc = Association {
@@ -548,6 +613,49 @@ mod tests {
         assert!(
             a.mechanism > a.direct,
             "an explanatory page with an unhelpful title must lead on mechanism: {a:?}"
+        );
+    }
+
+    /// Polysemy: a fiction-genre listing must not score high on `romance`, while a page about
+    /// romantic attachment must. Measured 2026-10-29: a light-novel category page scored 0.60 on
+    /// `romance` and ranked top-five for a chemistry query.
+    #[test]
+    fn a_genre_listing_is_not_a_romance_association() {
+        let genre = tag(
+            "Drama Novels - Read Online",
+            "Romance",
+            "Read romance novel online. Latest chapter updates, webnovel listing, ebook downloads.",
+            lex(),
+        );
+        let scholarly = tag(
+            "Romantic attachment and pair bonding",
+            "Introduction",
+            "Romantic love involves attachment processes; research on romantic relationships \
+             and pair bonding in adults.",
+            lex(),
+        );
+
+        let genre_w = weight_of(&genre, "c-romance").unwrap_or(0.0);
+        let real_w = weight_of(&scholarly, "c-romance").unwrap_or(0.0);
+        assert!(
+            real_w > genre_w * 2.0,
+            "a genre listing ({genre_w:.3}) must score far below a real article ({real_w:.3})"
+        );
+    }
+
+    /// My Chemical Romance: a band page mentioning the words must not dominate a chemistry query.
+    #[test]
+    fn a_band_page_is_not_a_chemistry_association() {
+        let band = tag(
+            "My Chemical Romance announce 2026 tour",
+            "",
+            "The band My Chemical Romance add tour dates; tickets on sale, album news, lyrics.",
+            lex(),
+        );
+        let chem = weight_of(&band, "c-chemistry").unwrap_or(0.0);
+        assert!(
+            chem < 0.2,
+            "a band page must not be a strong chemistry association: {chem:.3}"
         );
     }
 
