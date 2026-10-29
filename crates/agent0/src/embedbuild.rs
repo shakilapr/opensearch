@@ -208,6 +208,59 @@ pub async fn run(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// The checkpoint cycle: embed a chunk, save, reload, extend, save again — and end up with
+    /// every document exactly once. This is the contract `run` depends on, and it is the part that
+    /// a 6.5-hour run cannot afford to get wrong.
+    #[test]
+    fn checkpoints_resume_and_do_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.bin");
+        let emb = HashEmbedder::new(32);
+
+        let first: Vec<IndexDoc> = (0..5).map(|i| doc(&format!("d{i}"), "T", "body")).collect();
+        let part = build_store(&first, &emb, 200).unwrap();
+        part.save(&path).unwrap();
+
+        // Resume: the checkpoint must load, and the next chunk must append.
+        let mut store = VectorStore::load_if_present(&path).expect("checkpoint loads");
+        assert_eq!(store.len(), 5);
+
+        let second: Vec<IndexDoc> = (5..10).map(|i| doc(&format!("d{i}"), "T", "body")).collect();
+        let part2 = build_store(&second, &emb, 200).unwrap();
+        store.extend_from(&part2);
+        store.save(&path).unwrap();
+
+        let reloaded = VectorStore::load(&path).unwrap();
+        assert_eq!(reloaded.len(), 10, "every document exactly once");
+    }
+
+    /// An absent checkpoint yields an empty store rather than an error, so a fresh run needs no
+    /// special case.
+    #[test]
+    fn a_missing_checkpoint_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(VectorStore::load_if_present(&dir.path().join("absent.bin")).is_none());
+    }
+
+    /// A corrupted checkpoint is treated as absent: restarting is correct, wedging is not.
+    #[test]
+    fn a_corrupt_checkpoint_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.bin");
+        std::fs::write(&path, b"not a vector store").unwrap();
+        assert!(VectorStore::load_if_present(&path).is_none());
+    }
+
+    /// Dimensions must match, or the append is refused: mixing vectors from two models would make
+    /// every similarity in the file meaningless.
+    #[test]
+    fn extending_across_dimensions_is_refused() {
+        let mut a = build_store(&[doc("a", "T", "b")], &HashEmbedder::new(32), 100).unwrap();
+        let b = build_store(&[doc("b", "T", "b")], &HashEmbedder::new(64), 100).unwrap();
+        a.extend_from(&b);
+        assert_eq!(a.len(), 1, "a mismatched store must not be appended");
+    }
+
     fn doc(id: &str, title: &str, body: &str) -> IndexDoc {
         IndexDoc::new(id, format!("res_{id}"), format!("https://example.com/{id}"), title, body)
     }
