@@ -96,7 +96,7 @@ struct Fields {
     title_boost: Field,
     headings: Field,
     body: Field,
-    excerpt: Field,
+    body_boost: Field,
     entities: Field,
     source_id: Field,
     doc_type: Field,
@@ -122,7 +122,7 @@ impl Fields {
             title_boost: g("title_boost"),
             headings: g("headings"),
             body: g("body"),
-            excerpt: g("excerpt"),
+            body_boost: g("body_boost"),
             entities: g("entities"),
             source_id: g("source_id"),
             doc_type: g("doc_type"),
@@ -551,14 +551,14 @@ impl Indexer {
                 self.fields.title_boost,
                 self.fields.headings,
                 self.fields.entities,
-                self.fields.body,
+                self.fields.body_boost,
                 self.fields.url,
             ],
         );
         parser.set_field_boost(self.fields.title_boost, 3.0);
         parser.set_field_boost(self.fields.entities, 3.0);
         parser.set_field_boost(self.fields.headings, 2.0);
-        parser.set_field_boost(self.fields.body, 1.0);
+        parser.set_field_boost(self.fields.body_boost, 1.0);
         // Parse the pruned query: the index tokenizer keeps stop-words and
         // single letters, over which an OR query degenerates into noise.
         let pruned = search_core::text::prune_query(query);

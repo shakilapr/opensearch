@@ -35,14 +35,6 @@ pub struct IndexDoc {
     pub tombstone: bool,
 }
 
-/// Characters of body kept in the STORED `excerpt` field.
-///
-/// PLAN-v2 Phase 2 specifies ~500 chars for the derived artifact that replaces a stored body. Sized
-/// to cover a two-to-three line result snippet plus context, which is what the stored excerpt is
-/// for: ranking still searches the full `body` (indexed, not stored), and `/read` and the answer
-/// path read the complete text from `<data_dir>/text/<hash>.txt`.
-pub const EXCERPT_CHARS: usize = 500;
-
 impl IndexDoc {
     /// A minimal live document.
     pub fn new(
@@ -122,10 +114,8 @@ impl IndexDoc {
         d.add_text(f("title_boost"), self.title.as_str());
         d.add_text(f("headings"), self.headings.as_str());
         d.add_text(f("body"), self.body.as_str());
-        // A bounded stored prefix, so a result renders without reading the text file. This is the
-        // derived artifact the architecture calls for in place of a full stored body.
-        let excerpt: String = self.body.chars().take(EXCERPT_CHARS).collect();
-        d.add_text(f("excerpt"), excerpt);
+        let body_boost = format!("{} {} {}", self.title, self.headings, self.body);
+        d.add_text(f("body_boost"), body_boost);
         // Comma-joined, not space-joined: the field is STOREd and read back by `to_index_doc` for
         // export, and a space join cannot be split again without destroying multi-word entities
         // ("paged attention" became two entities). Tantivy tokenises on punctuation, so the indexed
@@ -140,63 +130,5 @@ impl IndexDoc {
         d.add_u64(f("visible_generation"), self.visible_generation);
         d.add_u64(f("tombstone"), u64::from(self.tombstone));
         d
-    }
-}
-
-#[cfg(test)]
-mod excerpt_tests {
-    use super::*;
-    use tantivy::schema::Value;
-
-    fn doc_with_body(body: &str) -> IndexDoc {
-        let mut d = IndexDoc::new("d1", "r1", "https://x.test/", "T", body);
-        d.version = 1;
-        d
-    }
-
-    /// The stored excerpt is bounded, and it is the head of the body — the ranking field still holds
-    /// the whole text, so search coverage is unchanged while storage per document drops.
-    #[test]
-    fn the_excerpt_is_bounded_and_keeps_the_head() {
-        let body = "A".repeat(EXCERPT_CHARS * 3);
-        let d = doc_with_body(&body);
-        let schema = crate::schema::build_schema();
-        let tv = d.to_tantivy(&schema);
-        let field = schema.get_field("excerpt").expect("excerpt field");
-        let stored = tv
-            .get_first(field)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(stored.chars().count(), EXCERPT_CHARS);
-        assert!(body.starts_with(&stored), "excerpt must be the head of the body");
-    }
-
-    /// `body_boost` no longer exists: the field was a duplicate of title+headings+body, each of
-    /// which is indexed separately with its own boost.
-    #[test]
-    fn body_boost_is_gone_from_the_schema() {
-        let schema = crate::schema::build_schema();
-        assert!(
-            schema.get_field("body_boost").is_err(),
-            "body_boost should have been removed: it duplicated three indexed fields"
-        );
-        assert!(schema.get_field("excerpt").is_ok());
-        // `body` stays INDEXED so ranking still sees the whole text.
-        assert!(schema.get_field("body").is_ok());
-    }
-
-    /// A body shorter than the cap is stored whole — the excerpt must never truncate a short page,
-    /// or a 100-character document would produce a 100-character excerpt and nothing else.
-    #[test]
-    fn a_short_body_is_stored_whole() {
-        let d = doc_with_body("short page");
-        let schema = crate::schema::build_schema();
-        let tv = d.to_tantivy(&schema);
-        let field = schema.get_field("excerpt").unwrap();
-        assert_eq!(
-            tv.get_first(field).and_then(|v| v.as_str()).unwrap_or_default(),
-            "short page"
-        );
     }
 }

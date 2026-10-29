@@ -19,14 +19,7 @@ pub fn build_schema() -> Schema {
     b.add_text_field("title_boost", TEXT);
     b.add_text_field("headings", TEXT);
     b.add_text_field("body", TEXT | STORED);
-    // `body_boost` is gone: it held `format!("{title} {headings} {body}")` — a third full copy of
-    // content already indexed as `title_boost`, `headings` and `body`, each with its own boost. It
-    // made every document's text occupy the index twice over for no ranking benefit: the parser
-    // already searched the three fields separately with the same weights.
-    //
-    // Measured 2026-10-29 before removal: the fleet's Tantivy indices were 16.6 GB for 1.35M
-    // documents against PLAN-v2's 10-14 GB target for the whole system.
-    b.add_text_field("excerpt", STORED);
+    b.add_text_field("body_boost", TEXT);
     b.add_text_field("entities", TEXT | STORED);
     b.add_text_field("source_id", STRING | STORED);
     b.add_text_field("doc_type", STRING);
