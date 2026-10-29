@@ -13,8 +13,12 @@ use search_organize::{
     Transport,
 };
 
-const PRIMARY: &str = "deepseek/deepseek-v4.1-flash";
-const ESCALATE: &str = "deepseek/deepseek-v4.1-flash-thinking";
+/// The organizer's primary model and its escalation model. **Distinct by contract**: escalation
+/// exists to ask a *different* model when the primary's answer is unusable, so the ids must differ
+/// or the per-model call counts below cannot tell "escalated" from "asked again". A deployment may
+/// point both at the same model; the mechanism still runs, it just has nowhere better to go.
+const PRIMARY: &str = "primary-model";
+const ESCALATE: &str = "escalate-model";
 
 /// A canned-response transport with observability: total calls, per-model calls, and the maximum
 /// number of simultaneous in-flight calls (to prove bounded parallelism).
@@ -247,13 +251,13 @@ async fn organize_all_is_stable_and_bounds_concurrency() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. from_env() without KITANI_API_KEY errors mentioning that variable.
+// 5. from_env() without CROWBOT_API_KEY errors mentioning that variable.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn from_env_errors_without_api_key() {
     // Any of the three key sources would satisfy `from_env`, so all of them must be cleared for
     // this test to be meaningful (and hermetic against the developer's own environment).
-    let saved: Vec<(&str, Option<String>)> = ["KITANI_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"]
+    let saved: Vec<(&str, Option<String>)> = ["CROWBOT_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"]
         .iter()
         .map(|n| (*n, std::env::var(n).ok()))
         .collect();
@@ -265,7 +269,7 @@ async fn from_env_errors_without_api_key() {
     let msg = err.to_string();
     // The error must name every accepted source, so an operator with any one of them set knows why
     // the process refused to start.
-    for name in ["KITANI_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"] {
+    for name in ["CROWBOT_API_KEY", "SEARCH_LLM_API_KEY", "OPENROUTER_API_KEY"] {
         assert!(msg.contains(name), "error must name {name}, got: {msg}");
     }
     assert!(matches!(err, OrganizeError::MissingEnv(_)));

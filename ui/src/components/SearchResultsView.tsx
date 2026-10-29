@@ -6,7 +6,7 @@
  */
 
 import React from 'react';
-import { EngineCoverage, LlmAttemptView, SearchCategory, SearchResult } from '../domain/models';
+import { EngineCoverage, LlmAttemptView, SearchCategory, SearchResult, TokenUsageView } from '../domain/models';
 import { describeSearchFailure, SearchUnavailableError } from '../services/searchErrors';
 import { AnswerPanel } from './AnswerPanel';
 import { EngineStatusStrip } from './EngineStatusStrip';
@@ -28,6 +28,7 @@ interface SearchResultsViewProps {
   readonly llmAttempts: readonly LlmAttemptView[];
   /** The engine's own trace, used for the plan summary in the status strip. */
   readonly trace: readonly string[];
+  readonly usage?: TokenUsageView | null;
   readonly onRetry: () => void;
 }
 
@@ -44,8 +45,11 @@ export const SearchResultsView: React.FC<SearchResultsViewProps> = ({
   answer,
   llmAttempts,
   trace,
+  usage,
   onRetry,
 }) => {
+  const answering = llmAttempts.find((attempt) => attempt.ok);
+  const answeringModel = answering ? `${answering.provider}/${answering.model}` : null;
   if (isLoading) {
     return (
       <div className="empty-state-container">
@@ -84,7 +88,7 @@ export const SearchResultsView: React.FC<SearchResultsViewProps> = ({
         trace={trace}
       />
 
-      {answer !== null && answer.length > 0 && <AnswerPanel answer={answer} />}
+      {answer !== null && answer.length > 0 && <AnswerPanel answer={answer} model={answeringModel} usage={usage} />}
 
       {showEmptyState ? (
         <div className="empty-state-container" data-testid="no-results">

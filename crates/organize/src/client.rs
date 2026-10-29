@@ -47,7 +47,7 @@ impl LlmClient {
     ) -> Result<Self, OrganizeError> {
         let api_key = cfg.api_key.clone().ok_or_else(|| {
             OrganizeError::MissingEnv(
-                "KITANI_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
+                "CROWBOT_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
             )
         })?;
         // Free models first, on the primary provider, then the fallback provider as the last
@@ -116,7 +116,7 @@ impl LlmClient {
         self.complete_with(&model, prompt).await
     }
 
-    /// Ask the escalation model (e.g. `deepseek/deepseek-v4.1-flash-thinking`).
+    /// Ask the escalation model (e.g. `deepseek-v4.1-flash`).
     pub async fn complete_escalated(&self, prompt: &str) -> Result<String, OrganizeError> {
         let model = self.cfg.escalate_model.clone();
         self.complete_with(&model, prompt).await

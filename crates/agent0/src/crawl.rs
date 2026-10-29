@@ -533,6 +533,9 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     let resumed_from = seen.len();
 
     let mut pipeline = Pipeline::open_with(cfg, opts.allow_loopback)?;
+    // The option is authoritative; the environment variable is only its default. Without this the
+    // pipeline re-read the variable and `CrawlOptions::keep_raw_blobs` had no effect.
+    pipeline.set_keep_raw_blobs(opts.keep_raw_blobs);
     if let Some(browser) = opts.browser.clone() {
         tracing::info!("browser escalation enabled for this crawl");
         pipeline.set_browser(browser);

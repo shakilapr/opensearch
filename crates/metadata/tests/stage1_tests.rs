@@ -31,7 +31,7 @@ fn count(conn: &rusqlite::Connection, table: &str) -> i64 {
 /// ledger is exactly [1, 2, 3, 4, 5, 6]; SCHEMA_VERSION is 6.
 #[test]
 fn migrations_idempotent_and_ledger_is_1_2_3() {
-    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 6);
+    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 8);
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta.db");
     let conn = search_metadata::writer::open(&path).unwrap();
@@ -48,7 +48,13 @@ fn migrations_idempotent_and_ledger_is_1_2_3() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7], "ledger has each version once");
+    // Derive the expected ledger from MIGRATIONS rather than hard-coding it: this assertion
+    // exists to prove each version is recorded exactly once, not to pin the current count.
+    let expected: Vec<i64> = search_metadata::migrations::MIGRATIONS
+        .iter()
+        .map(|(v, _)| *v as i64)
+        .collect();
+    assert_eq!(versions, expected, "ledger has each version once");
 }
 
 /// Every Stage-1 table exists with its expected columns.

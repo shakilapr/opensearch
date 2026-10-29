@@ -54,11 +54,14 @@ the record text. Design points that matter in practice:
   nothing and is the normal way to resume after a failure.
 * **Bounded parallelism.** `SEARCH_LLM_CONCURRENCY` (default 8) caps in-flight requests; the
   fan-out is a task set, so a batch of hundreds of pages is a configuration change, not a code one.
-* **Escalation, once.** If the primary model's output fails validation, the thinking model is
-  asked once. Reasoning models need a large `max_tokens` budget: with a small one they spend it on
-  the hidden trace and return `finish_reason=length` with `content: null`.
-* **Timeout.** 180 s. The cheap model is slow on long pages — a 12,000-character prompt was
-  measured at ~48 s.
+* **Escalation, once.** If the primary model's output fails validation, the escalation model — a
+  *different* model id, so the escalation is not a silent retry of the same model — is asked once.
+  A reasoning model needs a large `max_tokens` budget: with a small one it spends it on the hidden
+  trace and returns `finish_reason=length` with `content: null`, so the budget is raised
+  automatically for an id containing `thinking`/`reason`/`r1`/`o1`.
+* **Timeout.** 180 s. A generous cap rather than a measured need: the providers in use answer in
+  ~3 s even on a 24,000-character prompt (measured 2026-10-13), and the headroom covers a longer
+  page plus a fallback that has to be tried after the primary stalls.
 * **Partial batches survive.** One page failing does not discard the batch; failures are reported
   per URL and counted in the export summary.
 * **Incremental and resumable (`PackWriter`).** Records are written to disk as they are produced —
@@ -69,10 +72,10 @@ the record text. Design points that matter in practice:
   could never finish inside its timeout. Resume is by content (record id), not by count, so it
   needs no bookkeeping file. A manifest that fails validation is an error, never a silent restart.
 
-Environment: `KITANI_API_KEY` (required; never hardcoded), `KITANI_BASE_URL`,
-`KITANI_MODEL` (default `deepseek/deepseek-v4.1-flash`),
-`KITANI_ESCALATE_MODEL` (default `deepseek/deepseek-v4.1-flash-thinking`),
-`KITANI_TIMEOUT_S`, `SEARCH_LLM_CACHE`, `SEARCH_LLM_CONCURRENCY`.
+Environment: `CROWBOT_API_KEY` (required; never hardcoded), `CROWBOT_BASE_URL`,
+`CROWBOT_MODEL` (default `deepseek-v4.1-flash`),
+`CROWBOT_ESCALATE_MODEL` (default `deepseek-v4.1-flash`),
+`CROWBOT_TIMEOUT_S`, `SEARCH_LLM_CACHE`, `SEARCH_LLM_CONCURRENCY`.
 
 ## Measured (2026-10-09, this host)
 
@@ -84,7 +87,7 @@ Over a real harvest of 25 Wikipedia / docs.rs / arxiv pages (`agent0 ingest` per
 | `export --raw` | 25 records, one shard, checksummed manifest |
 | `import` into a **fresh** data dir | 25 imported, 0 unchanged, 0 failed |
 | search the fresh index | real hits with real titles (`Inverted_index`, `Information_retrieval`, …) |
-| `export` (organized) | 24–25 records structured by `deepseek-v4.1-flash`, ~300 ms–48 s per page |
+| `export` (organized) | 24–25 records structured by `deepseek-v4.1-flash` — served by the kitani relay on that date; that provider is retired, the model id is now served by crowbot — ~300 ms–48 s per page |
 | cache after a re-run | 27 hits / 2 misses — re-runs of organized pages are free |
 
 ## Honest limits

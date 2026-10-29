@@ -2,28 +2,35 @@
 //!
 //! The provider is OpenAI-chat-compatible. Base URL and credentials come from the
 //! environment; a credential is **never** hardcoded here. The vendor-neutral `SEARCH_LLM_*`
-//! variables take precedence over the vendor-specific `KITANI_*` ones, which remain the
-//! fallback. `from_env` fails loudly (naming `KITANI_API_KEY`) when neither key is present so a
+//! variables take precedence over the vendor-specific `CROWBOT_*` ones, which remain the
+//! fallback. `from_env` fails loudly (naming `CROWBOT_API_KEY`) when neither key is present so a
 //! misconfigured process cannot silently run against the wrong (or no) endpoint.
 
 use crate::error::OrganizeError;
 
 /// Default base URL for the OpenAI-chat-compatible provider.
-pub const DEFAULT_BASE_URL: &str = "https://api.kitani.ai/v1";
-/// Default primary (cheap) model id.
-pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4.1-flash";
-/// Default escalation (thinking) model id.
-pub const DEFAULT_ESCALATE_MODEL: &str = "deepseek/deepseek-v4.1-flash-thinking";
+pub const DEFAULT_BASE_URL: &str = "https://api.crowbot.sh/v1";
+/// Default primary model id.
+pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
+/// Default escalation model id: Sonar, a *different* model.
+///
+/// Escalation exists to ask a different model when the primary's answer is unusable, so this must
+/// not name the primary — two identical ids would make every escalation a silent retry of the same
+/// model at the same cost. The deployment sets `SEARCH_LLM_ESCALATE_MODEL` explicitly.
+pub const DEFAULT_ESCALATE_MODEL: &str = "t/sonar";
 /// Default per-request timeout in seconds.
 ///
-/// The cheap model is *slow* on long pages: a 12k-character prompt was measured taking ~48 s,
-/// and the thinking model takes longer still. A short timeout turns those into hard failures.
+/// Generous on purpose. The answer path is latency-sensitive and bounded separately
+/// (`SEARCH_ANSWER_TIMEOUT_MS`); this one covers batch structuring, where a long page and a
+/// multi-model fallback chain can each add seconds, and a short timeout would turn a slow success
+/// into a hard failure measured at ~3 s per call against the current providers.
 pub const DEFAULT_TIMEOUT_S: u64 = 180;
 
-/// Default base URL of the **fallback** provider (cun.ai), tried only when a primary call fails.
-pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://www.cun.ai/v1";
-/// Default **fallback** model id (cun.ai's DeepSeek-V4.1-Flash).
-pub const DEFAULT_FALLBACK_MODEL: &str = "DeepSeek-V4.1-Flash";
+/// Default base URL of the **fallback** provider (the apizio relay in front of Perplexity Sonar),
+/// tried only when a primary call fails.
+pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://newapi.apizio.com/v1";
+/// Default **fallback** model id: `t/sonar`, the search-specialised model.
+pub const DEFAULT_FALLBACK_MODEL: &str = "t/sonar";
 
 fn env_trim(name: &str) -> Option<String> {
     std::env::var(name)
@@ -34,10 +41,10 @@ fn env_trim(name: &str) -> Option<String> {
 
 /// The `User-Agent` sent with every completion request.
 ///
-/// Required, not cosmetic: cun.ai (the fallback provider) answers a request that carries **no**
-/// `User-Agent` with HTTP 403 (`error code: 1010`, a Cloudflare signature block), while any
-/// non-empty UA is accepted (measured 2026-10-12: none → 403 in 0.1 s; three different UA strings
-/// → 200 in ~2.8 s). Without this header the fallback would be silently unreachable.
+/// Cosmetic for the providers in use — crowbot and the apizio relay both answer with and without
+/// one (measured 2026-10-13: accepted either way, ~3 s) — but kept because a Cloudflare-fronted
+/// relay can reject a request carrying no `User-Agent` outright: the former cun.ai fallback
+/// answered HTTP 403 (`error code: 1010`) until one was sent. The header costs nothing.
 pub const DEFAULT_LLM_USER_AGENT: &str = "search-engine/0.1 (+https://github.com/agent-native-search)";
 
 /// The `User-Agent` for LLM requests: `SEARCH_LLM_USER_AGENT`, else [`DEFAULT_LLM_USER_AGENT`].
@@ -73,12 +80,12 @@ pub fn fallback_model() -> String {
     env_trim("SEARCH_LLM_FALLBACK_MODEL").unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
 }
 
-/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CUN_API_KEY`.
+/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CROWBOT_API_KEY`.
 ///
 /// `None` **disables** the fallback entirely — the primary provider is then the only one tried.
 /// A credential is read from the environment only, never from a file, never logged.
 pub fn fallback_api_key() -> Option<String> {
-    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
+    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CROWBOT_API_KEY"))
 }
 
 /// Resolved LLM configuration.
@@ -107,22 +114,22 @@ pub struct LlmConfig {
 impl LlmConfig {
     /// Build a configuration from the environment.
     ///
-    /// Each vendor-neutral `SEARCH_LLM_*` variable wins when set; the vendor-specific `KITANI_*`
+    /// Each vendor-neutral `SEARCH_LLM_*` variable wins when set; the vendor-specific `CROWBOT_*`
     /// variable is the fallback, so existing deployments keep working unchanged.
     ///
-    /// * `SEARCH_LLM_BASE_URL` / `KITANI_BASE_URL` — optional, defaults to [`DEFAULT_BASE_URL`].
-    /// * `SEARCH_LLM_API_KEY` / `KITANI_API_KEY` — **required**; an error naming `KITANI_API_KEY`
+    /// * `SEARCH_LLM_BASE_URL` / `CROWBOT_BASE_URL` — optional, defaults to [`DEFAULT_BASE_URL`].
+    /// * `SEARCH_LLM_API_KEY` / `CROWBOT_API_KEY` — **required**; an error naming `CROWBOT_API_KEY`
     ///   is returned when both are absent/empty. Read from the environment only.
-    /// * `SEARCH_LLM_MODEL` / `KITANI_MODEL` — optional primary model id.
-    /// * `KITANI_ESCALATE_MODEL` — optional escalation model id (no neutral override).
-    /// * `KITANI_TIMEOUT_S` — optional per-request timeout in seconds.
+    /// * `SEARCH_LLM_MODEL` / `CROWBOT_MODEL` — optional primary model id.
+    /// * `CROWBOT_ESCALATE_MODEL` — optional escalation model id (no neutral override).
+    /// * `CROWBOT_TIMEOUT_S` — optional per-request timeout in seconds.
     pub fn from_env() -> Result<Self, OrganizeError> {
         let base_url = std::env::var("SEARCH_LLM_BASE_URL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                std::env::var("KITANI_BASE_URL")
+                std::env::var("CROWBOT_BASE_URL")
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -133,11 +140,11 @@ impl LlmConfig {
             Ok(v) if !v.trim().is_empty() => v,
             _ => match std::env::var("OPENROUTER_API_KEY") {
                 Ok(v) if !v.trim().is_empty() => v,
-                _ => match std::env::var("KITANI_API_KEY") {
+                _ => match std::env::var("CROWBOT_API_KEY") {
                     Ok(v) if !v.trim().is_empty() => v,
                     _ => {
                         return Err(OrganizeError::MissingEnv(
-                            "KITANI_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
+                            "CROWBOT_API_KEY (or SEARCH_LLM_API_KEY / OPENROUTER_API_KEY)".to_string(),
                         ))
                     }
                 },
@@ -149,7 +156,7 @@ impl LlmConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                std::env::var("KITANI_MODEL")
+                std::env::var("CROWBOT_MODEL")
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -161,14 +168,14 @@ impl LlmConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                std::env::var("KITANI_ESCALATE_MODEL")
+                std::env::var("CROWBOT_ESCALATE_MODEL")
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_else(|| DEFAULT_ESCALATE_MODEL.to_string());
 
-        let timeout_s = std::env::var("KITANI_TIMEOUT_S")
+        let timeout_s = std::env::var("CROWBOT_TIMEOUT_S")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v > 0)
@@ -199,10 +206,10 @@ mod tests {
         "SEARCH_LLM_MODEL",
         "SEARCH_LLM_ESCALATE_MODEL",
         "OPENROUTER_API_KEY",
-        "KITANI_BASE_URL",
-        "KITANI_API_KEY",
-        "KITANI_MODEL",
-        "KITANI_ESCALATE_MODEL",
+        "CROWBOT_BASE_URL",
+        "CROWBOT_API_KEY",
+        "CROWBOT_MODEL",
+        "CROWBOT_ESCALATE_MODEL",
     ];
 
     /// Clear every variable `from_env` reads and run `f`; restore afterwards even on panic.
@@ -225,15 +232,15 @@ mod tests {
     }
 
     #[test]
-    fn search_llm_vars_take_precedence_over_kitani() {
+    fn search_llm_vars_take_precedence_over_crowbot() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
             std::env::set_var("SEARCH_LLM_BASE_URL", "https://neutral.example/v1");
             std::env::set_var("SEARCH_LLM_API_KEY", "neutral-key");
             std::env::set_var("SEARCH_LLM_MODEL", "neutral-model");
-            std::env::set_var("KITANI_BASE_URL", "https://kitani.example/v1");
-            std::env::set_var("KITANI_API_KEY", "kitani-key");
-            std::env::set_var("KITANI_MODEL", "kitani-model");
+            std::env::set_var("CROWBOT_BASE_URL", "https://crowbot.example/v1");
+            std::env::set_var("CROWBOT_API_KEY", "crowbot-key");
+            std::env::set_var("CROWBOT_MODEL", "crowbot-model");
 
             let cfg = LlmConfig::from_env().expect("neutral config");
             assert_eq!(cfg.base_url, "https://neutral.example/v1");
@@ -243,17 +250,17 @@ mod tests {
     }
 
     #[test]
-    fn kitani_vars_remain_the_fallback() {
+    fn crowbot_vars_remain_the_fallback() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
-            std::env::set_var("KITANI_BASE_URL", "https://kitani.example/v1");
-            std::env::set_var("KITANI_API_KEY", "kitani-key");
-            std::env::set_var("KITANI_MODEL", "kitani-model");
+            std::env::set_var("CROWBOT_BASE_URL", "https://crowbot.example/v1");
+            std::env::set_var("CROWBOT_API_KEY", "crowbot-key");
+            std::env::set_var("CROWBOT_MODEL", "crowbot-model");
 
-            let cfg = LlmConfig::from_env().expect("kitani config");
-            assert_eq!(cfg.base_url, "https://kitani.example/v1");
-            assert_eq!(cfg.model, "kitani-model");
-            assert_eq!(cfg.api_key.as_deref(), Some("kitani-key"));
+            let cfg = LlmConfig::from_env().expect("crowbot config");
+            assert_eq!(cfg.base_url, "https://crowbot.example/v1");
+            assert_eq!(cfg.model, "crowbot-model");
+            assert_eq!(cfg.api_key.as_deref(), Some("crowbot-key"));
         });
     }
 
@@ -262,13 +269,13 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
             std::env::set_var("SEARCH_LLM_BASE_URL", "https://neutral.example/v1");
-            std::env::set_var("KITANI_API_KEY", "kitani-key");
-            std::env::set_var("KITANI_MODEL", "kitani-model");
+            std::env::set_var("CROWBOT_API_KEY", "crowbot-key");
+            std::env::set_var("CROWBOT_MODEL", "crowbot-model");
 
             let cfg = LlmConfig::from_env().expect("mixed config");
             assert_eq!(cfg.base_url, "https://neutral.example/v1");
-            assert_eq!(cfg.model, "kitani-model", "model falls back independently");
-            assert_eq!(cfg.api_key.as_deref(), Some("kitani-key"));
+            assert_eq!(cfg.model, "crowbot-model", "model falls back independently");
+            assert_eq!(cfg.api_key.as_deref(), Some("crowbot-key"));
         });
     }
 
@@ -283,11 +290,11 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("SEARCH_LLM_API_KEY"), "{msg}");
             assert!(msg.contains("OPENROUTER_API_KEY"), "{msg}");
-            assert!(msg.contains("KITANI_API_KEY"), "{msg}");
+            assert!(msg.contains("CROWBOT_API_KEY"), "{msg}");
         });
     }
 
-    /// The OpenRouter key is accepted on its own (kitani is dead; OpenRouter is the search path's
+    /// The OpenRouter key is accepted on its own (crowbot is dead; OpenRouter is the search path's
     /// provider), and the neutral `SEARCH_LLM_*` names still win when both are present.
     #[test]
     fn openrouter_key_is_accepted() {
@@ -304,12 +311,12 @@ mod tests {
     }
 
     /// The escalate model has a vendor-neutral override, so an OpenRouter deployment is not stuck
-    /// with kitani's thinking-model id.
+    /// with crowbot's thinking-model id.
     #[test]
     fn neutral_escalate_model_override() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
-            std::env::set_var("KITANI_API_KEY", "k");
+            std::env::set_var("CROWBOT_API_KEY", "k");
             std::env::set_var("SEARCH_LLM_ESCALATE_MODEL", "google/gemma-4-31b-it:free");
 
             let cfg = LlmConfig::from_env().expect("config");

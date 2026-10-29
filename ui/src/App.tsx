@@ -137,6 +137,7 @@ export const App: React.FC = () => {
               <div className="hx-stats-bar">{statsText}</div>
 
               <SearchResultsView
+                usage={usage}
                 results={results}
                 isLoading={isLoading}
                 category={category}

@@ -212,7 +212,7 @@ if not_measured:
           "answer expectations cannot be judged:")
     for f in not_measured:
         print(" ~", f)
-    print("  Start it with SEARCH_ANSWER_ENABLED=1 and KITANI_API_KEY set to measure these.")
+    print("  Start it with SEARCH_ANSWER_ENABLED=1 and CROWBOT_API_KEY set to measure these.")
 
 report = {
     "base": base,

@@ -13,14 +13,14 @@
 //! Design guarantees, mirroring `search-answer`:
 //!
 //! * **Opt-in.** [`from_env`] returns `None` unless `SEARCH_PLANNER_ENABLED` is truthy *and*
-//!   `KITANI_API_KEY` is set. The caller then passes no planner and search behaves exactly as
+//!   `CROWBOT_API_KEY` is set. The caller then passes no planner and search behaves exactly as
 //!   before.
 //! * **Never blocks or fails a search.** A transport error, a timeout, or an unparseable
 //!   response becomes an empty plan plus a trace note; the engine ignores it.
 //! * **Cached.** Planning goes through the shared `search-organize` client, so a repeated query
 //!   costs no tokens and performs no network call.
 //! * **The slow model by default.** The planner defaults to the reasoning model
-//!   (`deepseek/deepseek-v4.1-flash-thinking`); set `SEARCH_PLANNER_MODEL` to trade latency for
+//!   (`deepseek-v4.1-flash`); set `SEARCH_PLANNER_MODEL` to trade latency for
 //!   cost.
 
 #![forbid(unsafe_code)]
@@ -38,7 +38,7 @@ pub use config::{
 
 /// Build the planner from the environment, or `None` when it is disabled.
 ///
-/// Returns `None` when `SEARCH_PLANNER_ENABLED` is unset/0, when `KITANI_API_KEY` is absent, or if
+/// Returns `None` when `SEARCH_PLANNER_ENABLED` is unset/0, when `CROWBOT_API_KEY` is absent, or if
 /// the client/runtime cannot be built — never panics, never reads a credential from a file. Use
 /// [`disabled_reason`] for the single explanatory log line.
 pub fn from_env() -> Option<LlmQueryPlanner> {

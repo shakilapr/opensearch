@@ -153,11 +153,20 @@ async fn stage0_full_lifecycle_restart_and_idempotency() {
         };
         assert!(generation >= 1, "generation must be nonzero");
 
-        // blob + text exist on disk under the configured data dir.
+        // Extracted text exists under the configured data dir; the raw HTML does not, because
+        // production stopped writing it (`SEARCH_KEEP_RAW_BLOBS` is off by default — raw pages were
+        // 38x the extracted text and nothing reads them, since `read_pipeline_bytes` falls back to
+        // the text file). This test asserted the blob's presence and had been failing since that
+        // default changed, which is the correct direction: the architecture keeps derived
+        // artifacts, not source bytes.
         let hex = content_id.trim_start_matches("cnt_");
         let blob = cfg.blob_path(hex);
         let text = cfg.text_path(hex);
-        assert!(blob.exists(), "raw blob written to {}", blob.display());
+        assert!(
+            !blob.exists(),
+            "raw HTML must not be kept by default: {}",
+            blob.display()
+        );
         assert!(text.exists(), "text written to {}", text.display());
         assert!(std::fs::read_to_string(&text)
             .unwrap()

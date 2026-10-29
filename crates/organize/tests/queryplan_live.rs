@@ -1,4 +1,4 @@
-//! Live check: does the kitani model actually produce usable query plans?
+//! Live check: does the crowbot model actually produce usable query plans?
 //!
 //! Ignored by default (it spends tokens, and the first run per distinct prompt is a real call).
 //! Run:
@@ -13,7 +13,7 @@ use search_organize::{LlmClient, LlmConfig};
 #[test]
 #[ignore = "makes real model calls (cached after the first run)"]
 fn the_planner_turns_questions_into_probes() {
-    let cfg = LlmConfig::from_env().expect("set KITANI_API_KEY to run this");
+    let cfg = LlmConfig::from_env().expect("set CROWBOT_API_KEY to run this");
     let cache = std::env::var("SEARCH_LLM_CACHE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/search/llm-cache"));

@@ -543,6 +543,17 @@ impl Pipeline {
 
     /// The searcher the HTTP API should be wired to (real Tantivy indexer behind
     /// the source-first lane).
+    /// Override whether raw HTML is kept, taking precedence over `SEARCH_KEEP_RAW_BLOBS`.
+    ///
+    /// Without this, `CrawlOptions::keep_raw_blobs` was decorative: the pipeline re-read the
+    /// environment variable at open time, so a caller that set the option on its own options
+    /// struct was silently ignored. Two callers then raced over a process-global variable — a
+    /// crawl test asserting "no raw copy by default" failed whenever another test in the same
+    /// binary set the variable, because the variable is not per-pipeline.
+    pub fn set_keep_raw_blobs(&mut self, keep: bool) {
+        self.keep_raw_blobs = keep;
+    }
+
     pub fn searcher(&self) -> Arc<dyn Searcher + Send + Sync> {
         Arc::new(SourceFirstSearcher::new(
             self.indexer.clone(),

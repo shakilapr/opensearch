@@ -112,7 +112,7 @@ multi-week architecture work, gated by the plan on proven quality.
   CallerAgent → Provider` (`crates/nav/src/policy.rs`); bounded/deadline/coverage-driven stopping.
   **Query deconstruction by a live model — built and wired.** `search_engine::QueryPlanner` is an
   injection seam (like `Answerer`/`EvidenceVerifier`); `crates/planner` implements it over the
-  cached kitani client (the slow reasoning model by default, cached, opt-in) and turns a
+  cached LLM client (crowbot's `deepseek-v4.1-flash` by default, cached, opt-in) and turns a
   conversational query into expansion probes — canonical entity names, phrase-with-slop probes —
   which the engine now actually *searches*: the §8 query variants `build_plan` always produced
   were previously computed and discarded, and are now launched in round 1 and fused per family

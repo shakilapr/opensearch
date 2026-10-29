@@ -76,7 +76,11 @@ fn migrations_create_watermark_and_all_expected_tables() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7], "each migration applied exactly once");
+    let expected: Vec<i64> = search_metadata::migrations::MIGRATIONS
+        .iter()
+        .map(|(v, _)| *v as i64)
+        .collect();
+    assert_eq!(versions, expected, "each migration applied exactly once");
 
     let tables: Vec<String> = {
         let mut stmt = conn
@@ -99,10 +103,13 @@ fn migrations_create_watermark_and_all_expected_tables() {
         "content",
         "crawl_policy",
         "doc_concept",
+        "doc_concept_dim",
+        "doc_feature",
         "document_version",
         "domain",
         "entity",
         "entity_alias",
+        "feature",
         "feed",
         "fetch_observation",
         "frontier_entry",

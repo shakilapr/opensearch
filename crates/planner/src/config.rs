@@ -1,21 +1,22 @@
 //! Planner configuration.
 //!
 //! Every knob is optional and read from the environment. The credential is read **only** from
-//! `KITANI_API_KEY` (the same variable `search-organize` and `search-answer` use) and is never
+//! `CROWBOT_API_KEY` (the same variable `search-organize` and `search-answer` use) and is never
 //! hardcoded, logged, or written anywhere.
 //!
-//! The default model is the **slow reasoning** one (`deepseek/deepseek-v4.1-flash-thinking`).
-//! Deconstructing a query into entity/phrase probes is the kind of task where the thinking model
-//! is worth the latency, and the on-disk cache means a given query is only ever paid for once.
-//! Set `SEARCH_PLANNER_MODEL` to the cheap model when the extra latency is not wanted.
+//! The default model is `deepseek-v4.1-flash` (crowbot), the project's default provider.
+//! Deconstructing a query into entity/phrase probes is the kind of task where a stronger model is
+//! worth the latency, and the on-disk cache means a given query is only ever paid for once, so this
+//! is a knob a deployment can raise with `SEARCH_PLANNER_MODEL` rather than a built-in choice.
 
 use std::path::PathBuf;
 
 use search_organize::{LlmConfig, DEFAULT_BASE_URL};
 
-/// Default planner model: the slow reasoning model, deliberately.
-pub const DEFAULT_PLANNER_MODEL: &str = "deepseek/deepseek-v4.1-flash-thinking";
-/// Default per-request timeout, seconds. The reasoning model is slow on a long prompt.
+/// Default planner model: crowbot's `deepseek-v4.1-flash`.
+pub const DEFAULT_PLANNER_MODEL: &str = "deepseek-v4.1-flash";
+/// Default per-request timeout, seconds. A generous cap: planning is off the hot path and the
+/// fallback chain may try more than one model.
 pub const DEFAULT_TIMEOUT_S: u64 = 180;
 /// Default bound on simultaneous in-flight planning calls.
 pub const DEFAULT_CONCURRENCY: usize = 2;
@@ -28,7 +29,7 @@ pub const DEFAULT_MAX_EXPANSIONS: usize = 3;
 pub enum Disabled {
     /// `SEARCH_PLANNER_ENABLED` is unset/0, so planning is opt-in.
     FeatureDisabled,
-    /// The feature is requested but `KITANI_API_KEY` is absent/empty.
+    /// The feature is requested but `CROWBOT_API_KEY` is absent/empty.
     MissingKey,
 }
 
@@ -40,7 +41,7 @@ impl Disabled {
                 "query planning disabled (SEARCH_PLANNER_ENABLED is unset or 0)"
             }
             Disabled::MissingKey => {
-                "query planning disabled (no API key: SEARCH_PLANNER_API_KEY / SEARCH_LLM_API_KEY / KITANI_API_KEY)"
+                "query planning disabled (no API key: SEARCH_PLANNER_API_KEY / SEARCH_LLM_API_KEY / CROWBOT_API_KEY)"
             }
         }
     }
@@ -84,7 +85,7 @@ fn parse_models(listed: &str) -> Vec<String> {
 }
 
 /// The API key. `SEARCH_PLANNER_API_KEY`, else the shared `SEARCH_LLM_API_KEY` /
-/// `OPENROUTER_API_KEY`, else `KITANI_API_KEY`. Never logged or persisted.
+/// `OPENROUTER_API_KEY`, else `CROWBOT_API_KEY`. Never logged or persisted.
 ///
 /// The shared names come first because the planner is part of the engine: when the engine rides
 /// one provider chain, the planner must ride the same one, or it plans against a dead vendor.
@@ -92,7 +93,7 @@ pub fn api_key() -> Option<String> {
     env_trim("SEARCH_PLANNER_API_KEY")
         .or_else(|| env_trim("SEARCH_LLM_API_KEY"))
         .or_else(|| env_trim("OPENROUTER_API_KEY"))
-        .or_else(|| env_trim("KITANI_API_KEY"))
+        .or_else(|| env_trim("CROWBOT_API_KEY"))
 }
 
 /// The reason the planner is disabled. Only meaningful when [`PlannerConfig::from_env`] returns
@@ -124,7 +125,7 @@ impl PlannerConfig {
     /// Build the configuration from the environment.
     ///
     /// Returns `Err(Disabled::FeatureDisabled)` when `SEARCH_PLANNER_ENABLED` is unset/0 and
-    /// `Err(Disabled::MissingKey)` when the feature is on but `KITANI_API_KEY` is absent.
+    /// `Err(Disabled::MissingKey)` when the feature is on but `CROWBOT_API_KEY` is absent.
     pub fn from_env() -> Result<PlannerConfig, Disabled> {
         if !is_enabled() {
             return Err(Disabled::FeatureDisabled);
@@ -137,13 +138,13 @@ impl PlannerConfig {
         let shared_base_url = env_trim("SEARCH_LLM_BASE_URL");
         let base_url = env_trim("SEARCH_PLANNER_BASE_URL")
             .or_else(|| shared_base_url.clone())
-            .or_else(|| env_trim("KITANI_BASE_URL"))
+            .or_else(|| env_trim("CROWBOT_BASE_URL"))
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
         let model = env_trim("SEARCH_PLANNER_MODEL")
             .or_else(|| env_trim("SEARCH_LLM_MODEL"))
-            .or_else(|| env_trim("KITANI_MODEL"))
+            .or_else(|| env_trim("CROWBOT_MODEL"))
             .unwrap_or_else(|| DEFAULT_PLANNER_MODEL.to_string());
         // Inherit the shared model list only when the planner actually points at the shared
         // provider: the ids in it name models of *that* vendor, so sending them anywhere else is a

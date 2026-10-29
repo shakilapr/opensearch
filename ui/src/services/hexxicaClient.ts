@@ -30,9 +30,9 @@ export const HEXXICA_DEFAULT_ENDPOINT = 'http://127.0.0.1:8080';
  * model-bound: retrieval answers in ~0.1 s, the generated answer in ~3-20 s (and the server caps
  * the answer at its own timeout, returning the results regardless). A 6 s abort here reported
  * "Search unavailable" for a server that was working and about to answer, so the budget must
- * exceed the server's answer timeout.
+ * exceed the server's answer timeout — currently 40 s.
  */
-const NETWORK_TIMEOUT_MS = 30000;
+const NETWORK_TIMEOUT_MS = 60000;
 const MAX_RESULTS = 100;
 
 /** Resolve the configured API base URL from the Vite env, else the default. */

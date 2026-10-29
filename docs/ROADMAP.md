@@ -37,7 +37,7 @@ generation, not the prose.
 
 The engine's §8 query expansion is no longer inert: an opt-in LLM planner
 (`crates/planner`, `search_engine::QueryPlanner`) deconstructs a query into entity/phrase probes
-that are searched as variants under the §10 family cap, on the cached kitani model. Off by
+that are searched as variants under the §10 family cap, on the cached crowbot model. Off by
 default; see `docs/PLANNER.md`. What is *not* done: a measured planner-on vs planner-off quality
 delta on the real corpus (the harness exists, the key and the run do not).
 

@@ -745,6 +745,15 @@ impl Indexer {
     /// document stamped with it becomes visible in the same step, so it counts.
     ///
     /// Cost: O(segments) + O(overlay).
+    /// Number of live (non-tombstoned, published) documents in base + overlay.
+    ///
+    /// Public because `_manifest.json` is only written by `publish_manifest`, so a caller that
+    /// indexes without publishing — `agent0 index build` — otherwise has no way to report what it
+    /// produced. This is the same accounting a publish uses.
+    pub fn doc_count(&self) -> AppResult<u64> {
+        Ok(self.stats(u64::MAX)?.0)
+    }
+
     fn stats(&self, published_generation: u64) -> AppResult<(u64, u64)> {
         let base_searcher = self.base_reader.searcher();
         let overlay_searcher = self.overlay_reader.searcher();

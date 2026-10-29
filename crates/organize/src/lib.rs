@@ -9,7 +9,7 @@
 //! * **bounded parallelism** via a semaphore, so `organize_all` never exceeds the configured
 //!   concurrency of in-flight transport calls.
 //!
-//! The credential comes from `SEARCH_LLM_API_KEY` (else `KITANI_API_KEY`) at runtime and is never
+//! The credential comes from `SEARCH_LLM_API_KEY` (else `CROWBOT_API_KEY`) at runtime and is never
 //! hardcoded. Tests are hermetic via the injectable [`Transport`] — no network, no real key, no
 //! sleeps.
 //!

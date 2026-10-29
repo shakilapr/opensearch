@@ -3,7 +3,7 @@
 //! Every knob is optional and read from the environment. The credential is read **only** from the
 //! environment and is never hardcoded, logged, or written anywhere. The vendor-neutral
 //! `SEARCH_LLM_*` variables take precedence over the vendor-specific `SEARCH_ANSWER_*` /
-//! `KITANI_API_KEY` ones, which remain the fallback.
+//! `CROWBOT_*` ones, which remain the fallback.
 //!
 //! Defaults are chosen for the search hot path: a short, bounded timeout (20 s) and a small
 //! token budget (1024). A reasoning model (id containing `thinking`/`reason`/`r1`/`o1`) needs a
@@ -13,9 +13,9 @@
 use std::path::PathBuf;
 
 /// Default base URL for the OpenAI-chat-compatible provider.
-pub const DEFAULT_BASE_URL: &str = "https://api.kitani.ai/v1";
+pub const DEFAULT_BASE_URL: &str = "https://api.crowbot.sh/v1";
 /// Default answer model id.
-pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 /// Default per-request timeout in milliseconds (the answer is on the search hot path).
 pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 /// Default `max_tokens` for the answer completion.
@@ -26,16 +26,17 @@ pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const REASONING_MIN_TOKENS: u32 = 8192;
 /// Minimum timeout (ms) for a reasoning model.
 pub const REASONING_TIMEOUT_MS: u64 = 120_000;
-/// Default base URL of the **fallback** provider (cun.ai), tried only when a primary call fails.
-pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://www.cun.ai/v1";
-/// Default **fallback** model id (cun.ai's DeepSeek-V4.1-Flash).
-pub const DEFAULT_FALLBACK_MODEL: &str = "DeepSeek-V4.1-Flash";
+/// Default base URL of the **fallback** provider (the apizio relay in front of Perplexity Sonar),
+/// tried only when a primary call fails.
+pub const DEFAULT_FALLBACK_BASE_URL: &str = "https://newapi.apizio.com/v1";
+/// Default **fallback** model id: `t/sonar`, the search-specialised model.
+pub const DEFAULT_FALLBACK_MODEL: &str = "t/sonar";
 /// The `User-Agent` sent with every completion request.
 ///
-/// Required, not cosmetic: cun.ai (the fallback provider) answers a request that carries **no**
-/// `User-Agent` with HTTP 403 (`error code: 1010`, a Cloudflare signature block), while any
-/// non-empty UA is accepted (measured 2026-10-12: none → 403 in 0.1 s; several UA strings → 200 in
-/// ~2.8 s). Without this header the fallback would be silently unreachable.
+/// Cosmetic for the providers in use — crowbot and the apizio relay both answer with and without
+/// one (measured 2026-10-13: accepted either way, ~3 s) — but kept because a Cloudflare-fronted
+/// relay can reject a request carrying no `User-Agent` outright: the former cun.ai fallback
+/// answered HTTP 403 (`error code: 1010`) until one was sent. The header costs nothing.
 pub const DEFAULT_LLM_USER_AGENT: &str =
     "search-engine/0.1 (+https://github.com/agent-native-search)";
 
@@ -44,7 +45,7 @@ pub const DEFAULT_LLM_USER_AGENT: &str =
 pub enum Disabled {
     /// `SEARCH_ANSWER_ENABLED` is unset/0, so answer generation is opt-out.
     FeatureDisabled,
-    /// The feature is requested but neither `SEARCH_LLM_API_KEY` nor `KITANI_API_KEY` is set.
+    /// The feature is requested but neither `SEARCH_LLM_API_KEY` nor `CROWBOT_API_KEY` is set.
     MissingKey,
 }
 
@@ -56,7 +57,7 @@ impl Disabled {
                 "answer generation disabled (SEARCH_ANSWER_ENABLED is unset or 0)"
             }
             Disabled::MissingKey => {
-                "answer generation disabled (SEARCH_LLM_API_KEY / KITANI_API_KEY is not set)"
+                "answer generation disabled (SEARCH_LLM_API_KEY / CROWBOT_API_KEY is not set)"
             }
         }
     }
@@ -95,11 +96,11 @@ pub fn is_enabled() -> bool {
 }
 
 /// The API key, read from `SEARCH_LLM_API_KEY` (preferred), else `OPENROUTER_API_KEY`, else
-/// `KITANI_API_KEY`. Never logged or persisted, and never read from a file.
+/// `CROWBOT_API_KEY`. Never logged or persisted, and never read from a file.
 pub fn api_key() -> Option<String> {
     env_trim("SEARCH_LLM_API_KEY")
         .or_else(|| env_trim("OPENROUTER_API_KEY"))
-        .or_else(|| env_trim("KITANI_API_KEY"))
+        .or_else(|| env_trim("CROWBOT_API_KEY"))
 }
 
 /// The fallback provider's base URL: `SEARCH_LLM_FALLBACK_BASE_URL`, else
@@ -114,12 +115,12 @@ pub fn fallback_model() -> String {
     env_trim("SEARCH_LLM_FALLBACK_MODEL").unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
 }
 
-/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CUN_API_KEY`.
+/// The fallback credential: `SEARCH_LLM_FALLBACK_API_KEY`, else `CROWBOT_API_KEY`.
 ///
 /// `None` **disables** the fallback: the primary provider is then the only one tried. Read from
 /// the environment only, never from a file, never logged.
 pub fn fallback_api_key() -> Option<String> {
-    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CUN_API_KEY"))
+    env_trim("SEARCH_LLM_FALLBACK_API_KEY").or_else(|| env_trim("CROWBOT_API_KEY"))
 }
 
 /// The ordered model list for the answer path: `SEARCH_LLM_MODELS` (comma-separated), else empty
@@ -175,7 +176,7 @@ impl AnswerConfig {
     /// Build the configuration from the environment.
     ///
     /// Each vendor-neutral `SEARCH_LLM_*` variable wins when set; the vendor-specific
-    /// `SEARCH_ANSWER_*` (and `KITANI_API_KEY`) variable is the fallback, so existing deployments
+    /// `SEARCH_ANSWER_*` (and `CROWBOT_API_KEY`) variable is the fallback, so existing deployments
     /// keep working unchanged.
     ///
     /// Returns `Err(Disabled::FeatureDisabled)` when `SEARCH_ANSWER_ENABLED` is unset/0 and
@@ -245,7 +246,7 @@ mod tests {
         "SEARCH_LLM_MODEL",
         "SEARCH_ANSWER_BASE_URL",
         "SEARCH_ANSWER_MODEL",
-        "KITANI_API_KEY",
+        "CROWBOT_API_KEY",
     ];
 
     /// Clear every variable `from_env` reads and run `f`; restore afterwards even on panic.
@@ -275,9 +276,9 @@ mod tests {
             std::env::set_var("SEARCH_LLM_BASE_URL", "https://neutral.example/v1");
             std::env::set_var("SEARCH_LLM_API_KEY", "neutral-key");
             std::env::set_var("SEARCH_LLM_MODEL", "neutral-model");
-            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://kitani.example/v1");
-            std::env::set_var("SEARCH_ANSWER_MODEL", "kitani-model");
-            std::env::set_var("KITANI_API_KEY", "kitani-key");
+            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://crowbot.example/v1");
+            std::env::set_var("SEARCH_ANSWER_MODEL", "crowbot-model");
+            std::env::set_var("CROWBOT_API_KEY", "crowbot-key");
 
             let cfg = AnswerConfig::from_env().expect("neutral config");
             assert_eq!(cfg.base_url, "https://neutral.example/v1");
@@ -287,21 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn answer_and_kitani_vars_remain_the_fallback() {
+    fn answer_and_crowbot_vars_remain_the_fallback() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         with_clean_env(|| {
             std::env::set_var("SEARCH_ANSWER_ENABLED", "1");
-            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://kitani.example/v1/");
-            std::env::set_var("SEARCH_ANSWER_MODEL", "kitani-model");
-            std::env::set_var("KITANI_API_KEY", "kitani-key");
+            std::env::set_var("SEARCH_ANSWER_BASE_URL", "https://crowbot.example/v1/");
+            std::env::set_var("SEARCH_ANSWER_MODEL", "crowbot-model");
+            std::env::set_var("CROWBOT_API_KEY", "crowbot-key");
 
             let cfg = AnswerConfig::from_env().expect("fallback config");
             assert_eq!(
-                cfg.base_url, "https://kitani.example/v1",
+                cfg.base_url, "https://crowbot.example/v1",
                 "trailing slash trimmed"
             );
-            assert_eq!(cfg.model, "kitani-model");
-            assert_eq!(api_key().as_deref(), Some("kitani-key"));
+            assert_eq!(cfg.model, "crowbot-model");
+            assert_eq!(api_key().as_deref(), Some("crowbot-key"));
         });
     }
 

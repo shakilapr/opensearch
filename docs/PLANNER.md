@@ -21,7 +21,7 @@ offline.
 Query planning is disabled unless **both** conditions hold:
 
 1. `SEARCH_PLANNER_ENABLED` is truthy (`1`, `true`, `on`, `yes`); and
-2. `KITANI_API_KEY` is set and non-empty.
+2. `CROWBOT_API_KEY` is set and non-empty.
 
 `search_planner::from_env()` then returns `Some(LlmQueryPlanner)`; otherwise it returns `None` and
 the caller injects no planner. `agent0 serve` logs exactly one info line naming the model it chose,
@@ -32,9 +32,9 @@ or the reason it is off (feature disabled vs. missing key).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SEARCH_PLANNER_ENABLED` | unset (off) | Opt-in switch. Unset/`0` = disabled. |
-| `KITANI_API_KEY` | — | Credential. Read **only** from the environment; never logged or written to disk. |
-| `SEARCH_PLANNER_MODEL` | `deepseek/deepseek-v4.1-flash-thinking` | Model id. The **slow reasoning** model by default; set it to `deepseek/deepseek-v4.1-flash` to trade latency for cost. |
-| `SEARCH_PLANNER_BASE_URL` | `https://api.kitani.ai/v1` | OpenAI-chat-compatible endpoint. |
+| `CROWBOT_API_KEY` | — | Credential. Read **only** from the environment; never logged or written to disk. |
+| `SEARCH_PLANNER_MODEL` | `deepseek-v4.1-flash` | Model id for planning. Point it at a stronger model to trade latency for plan quality; the on-disk cache means each query is paid for once. |
+| `SEARCH_PLANNER_BASE_URL` | `https://api.crowbot.sh/v1` | OpenAI-chat-compatible endpoint. |
 | `SEARCH_PLANNER_TIMEOUT_S` | `180` | Per-request HTTP timeout, seconds. |
 | `SEARCH_PLANNER_CONCURRENCY` | `2` | Bound on simultaneous in-flight planning calls. |
 | `SEARCH_PLANNER_MAX_EXPANSIONS` | `3` | Cap on expansions returned per query. The engine caps again (`plan::MAX_QUERY_VARIANTS` is 4 including the original). |
@@ -91,8 +91,9 @@ so this is the forward-looking half of the contract.
 
 One completion per uncached query, bounded by `SEARCH_PLANNER_TIMEOUT_S` and the client's token
 budget, with at most `SEARCH_PLANNER_CONCURRENCY` calls in flight. **A cached query costs nothing
-and performs no network call** — which is what makes the slow reasoning model affordable: a query
-is paid for once, then planned from disk forever.
+and performs no network call** — which is what makes a slower planner model affordable: a query
+is paid for once, then planned from disk forever. The default is crowbot's `deepseek-v4.1-flash`;
+set `SEARCH_PLANNER_MODEL` to trade latency for a stronger model per deployment.
 
 ## Cache
 
@@ -116,5 +117,5 @@ The engine's ablation harness (`crates/bench`) and the acceptance suite measure 
 fixture; neither currently exercises a live planner (it needs a key). What is pinned hermetically
 is the *mechanism*: that expansions are searched, that the family cap holds, that an empty or
 failing plan is a no-op, and that the planner reaches the engine end to end through
-`POST /search {engine:true}`. The prompt itself was checked live against kitani (three questions,
+`POST /search {engine:true}`. The prompt itself was checked live against crowbot (three questions,
 9.3 s — see the `queryplan` commit); the *quality* delta on the corpus is still unmeasured.

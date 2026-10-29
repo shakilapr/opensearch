@@ -21,7 +21,7 @@ fn resource(rid: &str) -> Mutation {
 /// The runner applies 0001..0006 in order on a fresh DB; SCHEMA_VERSION is 6.
 #[test]
 fn migration_runner_applies_0001_through_0004_in_order() {
-    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 6);
+    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 8);
 
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta.db");
@@ -38,7 +38,11 @@ fn migration_runner_applies_0001_through_0004_in_order() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7], "ledger records each version once, in order");
+    let expected: Vec<i64> = search_metadata::migrations::MIGRATIONS
+        .iter()
+        .map(|(v, _)| *v as i64)
+        .collect();
+    assert_eq!(versions, expected, "ledger records each version once, in order");
 }
 
 /// `resource.storage_tier` exists with the expected `TEXT NOT NULL DEFAULT 'hot'` shape, and the
