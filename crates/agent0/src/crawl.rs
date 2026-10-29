@@ -1482,7 +1482,7 @@ fn fill_discovery(
 /// same-origin document links one level deep.
 async fn discover_seed_urls(
     pipeline: &Pipeline,
-    fetcher: &Fetcher,
+    fetcher: &Arc<Fetcher>,
     seed: &str,
     follow_links: bool,
     feeds: &std::collections::HashMap<String, Vec<String>>,
@@ -1623,24 +1623,45 @@ fn feeds_by_host(pipeline: &Pipeline) -> std::collections::HashMap<String, Vec<S
 
 /// Fetch a sitemap; if it is an index, follow exactly one level of children.
 /// Returns every resource URL found.
-async fn expand_sitemap(fetcher: &Fetcher, origin: &str, sm_url: &str) -> Vec<String> {
+async fn expand_sitemap(fetcher: &Arc<Fetcher>, origin: &str, sm_url: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let Some(bytes) = fetch_body(fetcher, sm_url).await else {
         return out;
     };
     let children = sitemap_index_urls(&bytes).unwrap_or_default();
     if !children.is_empty() {
-        for child in children.into_iter().take(MAX_CHILD_SITEMAPS) {
-            let child = resolve_against(origin, &child);
-            if !child.starts_with("http") {
-                continue;
-            }
-            let Some(cb) = fetch_body(fetcher, &child).await else {
-                continue;
-            };
-            let resources = parse_sitemap(&cb, &child).unwrap_or_default();
-            for r in resources.into_iter().take(MAX_DISCOVERED) {
-                out.push(r.url);
+        // Fetch the child sitemaps concurrently. A sitemap index advertises up to 16 children and
+        // they are independent GETs on one origin: doing them serially put up to 16 round-trips in
+        // series inside a discovery task that already did robots + parent + seed page. Measured
+        // 2026-10-28, discovery delivered only 80 new origins/min against 250,000 available seeds,
+        // which is what kept the drain at 1.5% of its 1,024 fetch slots.
+        //
+        // Bounded by the same per-origin gate the rest of the crawler uses: the fetcher honours
+        // `ORIGIN_INTERVAL_MS`, so this widens one host's queue without exceeding its rate.
+        let urls: Vec<String> = children
+            .into_iter()
+            .take(MAX_CHILD_SITEMAPS)
+            .map(|c| resolve_against(origin, &c))
+            .filter(|c| c.starts_with("http"))
+            .collect();
+        let mut set: tokio::task::JoinSet<Vec<String>> = tokio::task::JoinSet::new();
+        for child in urls {
+            let f = Arc::clone(fetcher);
+            set.spawn(async move {
+                let Some(cb) = fetch_body(&f, &child).await else {
+                    return Vec::new();
+                };
+                parse_sitemap(&cb, &child)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(MAX_DISCOVERED)
+                    .map(|r| r.url)
+                    .collect()
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(mut urls) = res {
+                out.append(&mut urls);
             }
         }
     } else {
