@@ -237,9 +237,6 @@ pub fn tag(
     let title_l = title.to_ascii_lowercase();
     let headings_l = headings.to_ascii_lowercase();
     let body_l = body.to_ascii_lowercase();
-    // First `MECHANISM_WINDOW` characters of the body, used to detect that a concept is discussed
-    // as a process rather than merely named.
-    let lead_l: String = body_l.chars().take(MECHANISM_WINDOW).collect();
 
     let mut out: Vec<Association> = Vec::new();
     for seed in lexicon {
@@ -327,9 +324,6 @@ pub fn tag(
     });
     out
 }
-
-/// Characters of body inspected for mechanism markers.
-const MECHANISM_WINDOW: usize = 4_000;
 
 /// How close a marker must be to a concept mention to count as explaining it, in bytes.
 const PROXIMITY: usize = 240;
