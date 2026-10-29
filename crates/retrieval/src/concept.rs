@@ -39,6 +39,64 @@ const INFERRED_FACTOR: f32 = 0.5;
 /// hundreds of concepts cannot dominate merely by being broad.
 const MAX_CONCEPTS_PER_DOC: usize = 32;
 
+/// How much each dimension of `R(d,c)` counts for a particular query (v2 §6).
+///
+/// v2 §6's example: a query about *chemical processes involved in romance* should emphasise the
+/// mechanism dimension, while a query about *hormonal regulation* should emphasise direct topic.
+/// The same article then ranks differently for the two, with no reindex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DimensionWeights {
+    pub direct: f32,
+    pub contextual: f32,
+    pub mechanism: f32,
+}
+
+impl Default for DimensionWeights {
+    /// Balanced: direct dominates slightly, because a document that states a topic is the safest
+    /// result for an unqualified query. Mechanism is raised rather than dropped so a plain query
+    /// still finds explanatory pages.
+    fn default() -> Self {
+        Self {
+            direct: 1.0,
+            contextual: 0.6,
+            mechanism: 0.8,
+        }
+    }
+}
+
+impl DimensionWeights {
+    /// Weights for a query that asks how or why something happens.
+    pub fn mechanism_focused() -> Self {
+        Self {
+            direct: 0.7,
+            contextual: 0.5,
+            mechanism: 1.0,
+        }
+    }
+
+    /// Weights for a query that names a topic and wants coverage of it.
+    pub fn topic_focused() -> Self {
+        Self {
+            direct: 1.0,
+            contextual: 0.7,
+            mechanism: 0.4,
+        }
+    }
+
+    /// Weighted combination, normalised so the result stays in the range a scalar weight occupies
+    /// and fused scores remain comparable across lanes.
+    fn score(&self, direct: f64, contextual: f64, mechanism: f64) -> f32 {
+        let total = self.direct + self.contextual + self.mechanism;
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let s = direct as f32 * self.direct
+            + contextual as f32 * self.contextual
+            + mechanism as f32 * self.mechanism;
+        (s / total).clamp(0.0, 1.0)
+    }
+}
+
 /// The lane's read side: the metadata database, opened once.
 pub struct ConceptLane {
     db_path: PathBuf,
@@ -184,6 +242,25 @@ impl ConceptLane {
         concepts: &[String],
         limit: usize,
     ) -> AppResult<Vec<(String, f32)>> {
+        self.documents_for_dimensions(concepts, limit, &DimensionWeights::default())
+    }
+
+    /// Documents weighted for `concepts`, scoring each association's dimensions with `weights`.
+    ///
+    /// This is the v2 §6 requirement made operational: "When a user searches for chemical processes
+    /// involved in romance, the query model should emphasize the relevant biochemical and
+    /// relationship-oriented dimensions. When another user searches for hormonal regulation, the
+    /// same article could be ranked differently. The document does not need to be reindexed for
+    /// every query interpretation."
+    ///
+    /// With no `doc_concept_dim` rows the scalar `doc_concept.weight` is used, so a corpus tagged
+    /// before the dimensional pass still ranks correctly.
+    pub fn documents_for_dimensions(
+        &self,
+        concepts: &[String],
+        limit: usize,
+        dim_weights: &DimensionWeights,
+    ) -> AppResult<Vec<(String, f32)>> {
         if concepts.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,12 +268,24 @@ impl ConceptLane {
         let mut best: HashMap<String, f32> = HashMap::new();
         let mut per_doc: HashMap<String, usize> = HashMap::new();
 
+        // A document's dimensional breakdown, when the tagging pass wrote one. `LEFT JOIN` keeps
+        // documents whose associations only have a scalar weight: absence of dimensions must not
+        // remove them from results, it only means the scalar is the best available estimate.
         let mut stmt = conn
             .prepare(
-                "SELECT resource_id, weight, relation_kind
-                   FROM doc_concept
-                  WHERE concept_id = ?1
-                  ORDER BY weight DESC
+                "SELECT dc.resource_id,
+                        dc.weight,
+                        dc.relation_kind,
+                        MAX(CASE WHEN d.dim = 'direct'     THEN d.value END) AS r1,
+                        MAX(CASE WHEN d.dim = 'contextual' THEN d.value END) AS r2,
+                        MAX(CASE WHEN d.dim = 'mechanism'  THEN d.value END) AS r3
+                   FROM doc_concept dc
+                   LEFT JOIN doc_concept_dim d
+                          ON d.resource_id = dc.resource_id
+                         AND d.concept_id  = dc.concept_id
+                  WHERE dc.concept_id = ?1
+                  GROUP BY dc.resource_id, dc.concept_id, dc.relation_kind
+                  ORDER BY MAX(COALESCE(d.value, dc.weight)) DESC
                   LIMIT ?2",
             )
             .map_err(search_metadata::db_err)?;
@@ -210,6 +299,9 @@ impl ConceptLane {
                             r.get::<_, String>(0)?,
                             r.get::<_, f64>(1)?,
                             r.get::<_, String>(2)?,
+                            r.get::<_, Option<f64>>(3)?,
+                            r.get::<_, Option<f64>>(4)?,
+                            r.get::<_, Option<f64>>(5)?,
                         ))
                     },
                 )
@@ -217,7 +309,7 @@ impl ConceptLane {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(search_metadata::db_err)?;
 
-            for (doc, weight, kind) in rows {
+            for (doc, scalar, kind, r1, r2, r3) in rows {
                 let seen = per_doc.entry(doc.clone()).or_insert(0);
                 if *seen >= MAX_CONCEPTS_PER_DOC {
                     continue;
@@ -228,7 +320,13 @@ impl ConceptLane {
                 } else {
                     INFERRED_FACTOR
                 };
-                let contribution = weight as f32 * factor;
+                // Prefer the dimensional score when the tagger wrote one; the scalar is the
+                // fallback for corpora tagged before dimensions existed.
+                let base = match (r1, r2, r3) {
+                    (None, None, None) => scalar as f32,
+                    _ => dim_weights.score(r1.unwrap_or(0.0), r2.unwrap_or(0.0), r3.unwrap_or(0.0)),
+                };
+                let contribution = base * factor;
                 // Sum across concepts: a document weighting both `oxytocin` and `romance` is a
                 // better answer than one weighting either alone, which is the whole point of a
                 // multi-axis matrix.
@@ -413,6 +511,131 @@ mod tests {
             concepts.contains(&"c-love".to_string()),
             "alias did not resolve: {concepts:?}"
         );
+    }
+
+    /// v2 §6's acceptance claim, tested directly: the same article must rank differently under
+    /// different query interpretations *without being reindexed*.
+    ///
+    /// Two documents, one concept. `mechanism-paper` explains how the concept works but mentions it
+    /// only in the body; `topic-page` is titled about the concept but never explains it. A
+    /// mechanism-focused query must prefer the first, a topic-focused query the second — from the
+    /// same stored rows.
+    #[test]
+    fn the_same_article_ranks_differently_per_query_without_reindexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.sqlite");
+        {
+            let mut w = MetadataWriter::from_path(&path).unwrap();
+            let now = 1_700_000_000;
+            w.apply_batch(&[
+                Mutation::UpsertConcept {
+                    concept_id: "c-hormones".into(),
+                    name: "hormones".into(),
+                    description: None,
+                    kind: "topic".into(),
+                    created_at: now,
+                },
+                Mutation::UpsertDomain {
+                    domain_id: "d.test".into(),
+                    host: "d.test".into(),
+                },
+                Mutation::UpsertResource {
+                    resource_id: "mechanism-paper".into(),
+                    url: "https://d.test/m".into(),
+                    canonical_url: "https://d.test/m".into(),
+                    domain_id: "d.test".into(),
+                    source_id: None,
+                    kind: "html".into(),
+                },
+                Mutation::UpsertResource {
+                    resource_id: "topic-page".into(),
+                    url: "https://d.test/t".into(),
+                    canonical_url: "https://d.test/t".into(),
+                    domain_id: "d.test".into(),
+                    source_id: None,
+                    kind: "html".into(),
+                },
+            ])
+            .unwrap();
+            // Equal scalar weights, so only the dimensions can separate them.
+            w.apply_batch(&[
+                Mutation::UpsertDocConcept {
+                    resource_id: "mechanism-paper".into(),
+                    concept_id: "c-hormones".into(),
+                    weight: 0.5,
+                    relation_kind: "direct".into(),
+                    evidence: None,
+                    passage_id: None,
+                    via_concept_id: None,
+                    model_version: Some("t".into()),
+                    work_id: None,
+                    created_at: now,
+                },
+                Mutation::UpsertDocConcept {
+                    resource_id: "topic-page".into(),
+                    concept_id: "c-hormones".into(),
+                    weight: 0.5,
+                    relation_kind: "direct".into(),
+                    evidence: None,
+                    passage_id: None,
+                    via_concept_id: None,
+                    model_version: Some("t".into()),
+                    work_id: None,
+                    created_at: now,
+                },
+            ])
+            .unwrap();
+            for (doc, dims) in [
+                ("mechanism-paper", [("direct", 0.3), ("contextual", 0.2), ("mechanism", 0.95)]),
+                ("topic-page", [("direct", 0.95), ("contextual", 0.2), ("mechanism", 0.1)]),
+            ] {
+                for (dim, value) in dims {
+                    w.apply_batch(&[Mutation::UpsertDocConceptDim {
+                        resource_id: doc.into(),
+                        concept_id: "c-hormones".into(),
+                        dim: dim.into(),
+                        value,
+                        model_version: Some("t".into()),
+                        created_at: now,
+                    }])
+                    .unwrap();
+                }
+            }
+        }
+
+        let lane = ConceptLane::new(&path);
+        let concepts = vec!["c-hormones".to_string()];
+
+        let mech = lane
+            .documents_for_dimensions(&concepts, 10, &DimensionWeights::mechanism_focused())
+            .unwrap();
+        assert_eq!(mech[0].0, "mechanism-paper", "mechanism query: {mech:?}");
+
+        let topic = lane
+            .documents_for_dimensions(&concepts, 10, &DimensionWeights::topic_focused())
+            .unwrap();
+        assert_eq!(topic[0].0, "topic-page", "topic query: {topic:?}");
+
+        // The scalar path is unchanged, so a corpus without dimensions still ranks.
+        let scalar = lane.documents_for(&concepts, 10).unwrap();
+        assert_eq!(scalar.len(), 2, "scalar fallback lost documents: {scalar:?}");
+    }
+
+    /// Documents with only a scalar weight are not dropped when dimensions exist for others.
+    #[test]
+    fn a_document_without_dimensions_still_appears() {
+        let (_d, lane) = corpus(&[
+            ("with-dims", "c-love", 0.7, "direct"),
+            ("scalar-only", "c-love", 0.6, "direct"),
+        ]);
+        let hits = lane
+            .documents_for_dimensions(
+                &["c-love".to_string()],
+                10,
+                &DimensionWeights::mechanism_focused(),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2, "a scalar-only document vanished: {hits:?}");
     }
 
     /// No associations means no lane at all, rather than an empty lane taking fusion weight.

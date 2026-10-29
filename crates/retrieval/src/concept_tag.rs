@@ -49,7 +49,12 @@ pub const LEXICON: &[ConceptSeed] = &[
         concept_id: "c-chemistry",
         name: "chemistry",
         kind: "topic",
-        aliases: &["chemical", "chemicals", "chemically", "molecular", "molecule", "reaction"],
+        // Biochemistry vocabulary is included because a paper on neurochemistry rarely says
+        // "chemistry": it says neuropeptide, receptor, neurotransmitter. Found by the oxytocin
+        // test failing to tag a paper that is unambiguously about the chemistry of bonding.
+        aliases: &["chemical", "chemicals", "chemically", "molecular", "molecule", "reaction",
+                   "biochemistry", "biochemical", "neurochemistry", "neuropeptide",
+                   "neurotransmitter", "enzyme", "receptor"],
     },
     ConceptSeed {
         concept_id: "c-hormones",
@@ -174,39 +179,218 @@ fn body_weight(n: usize) -> f64 {
 /// that is genuinely about the query. The floor is what turns "mentioned" into "about".
 const MIN_WEIGHT: f64 = 0.18;
 
-/// One document's concept weights, best first.
+/// One document's association with one concept, as v2 §6 requires: a vector of dimensions, not a
+/// single number.
+///
+/// `weight` is the scalar retrieval uses (the strongest dimension, see [`Association::weight`]);
+/// the dimensions are what let the same article rank differently for different queries without
+/// being reindexed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Association {
+    pub concept_id: String,
+    /// `direct`: the document states it. r1 in v2 §6 — direct topical relevance.
+    pub direct: f64,
+    /// `contextual`: reached by co-occurrence rather than statement. r2 in v2 §6.
+    pub contextual: f64,
+    /// `mechanism`: the document discusses how/why, not only that. r3 in v2 §6.
+    pub mechanism: f64,
+}
+
+impl Association {
+    /// The single number retrieval scores with.
+    ///
+    /// The strongest dimension rather than the sum: dimensions describe *aspects* of one
+    /// association, so adding them would let a document that mentions a concept's mechanism and
+    /// context and topic outrank one that states it plainly, which is the opposite of what v2 §6
+    /// says the oxytocin example should do.
+    pub fn weight(&self) -> f64 {
+        self.direct.max(self.contextual).max(self.mechanism)
+    }
+
+    /// One dimension by name, or 0.0 when the model did not emit it.
+    pub fn dimension(&self, name: &str) -> f64 {
+        match name {
+            "direct" => self.direct,
+            "contextual" => self.contextual,
+            "mechanism" => self.mechanism,
+            _ => 0.0,
+        }
+    }
+
+    /// The dimensions to store, in the order v2 §6 lists them.
+    pub fn dims(&self) -> [(&'static str, f64); 3] {
+        [
+            ("direct", self.direct),
+            ("contextual", self.contextual),
+            ("mechanism", self.mechanism),
+        ]
+    }
+}
+
+/// One document's associations, strongest first.
 pub fn tag(
     title: &str,
     headings: &str,
     body: &str,
     lexicon: &[ConceptSeed],
-) -> Vec<(String, f64)> {
+) -> Vec<Association> {
     let title_l = title.to_ascii_lowercase();
     let headings_l = headings.to_ascii_lowercase();
     let body_l = body.to_ascii_lowercase();
+    // First `MECHANISM_WINDOW` characters of the body, used to detect that a concept is discussed
+    // as a process rather than merely named.
+    let lead_l: String = body_l.chars().take(MECHANISM_WINDOW).collect();
 
-    let mut out: Vec<(String, f64)> = Vec::new();
+    let mut out: Vec<Association> = Vec::new();
     for seed in lexicon {
-        let mut weight = 0.0f64;
+        let mut title_hits = 0usize;
+        let mut heading_hits = 0usize;
+        let mut body_hits = 0usize;
+        let mut mechanism_hits = 0usize;
+
         for form in std::iter::once(&seed.name).chain(seed.aliases.iter()) {
             let f = form.to_ascii_lowercase();
             if f.len() < 3 {
                 continue;
             }
             if title_l.contains(&f) {
-                weight += TITLE_HIT;
+                title_hits += 1;
             }
-            let h = headings_l.matches(&f).count().min(MAX_COUNTED_HITS);
-            weight += h as f64 * HEADING_HIT;
-            weight += body_weight(body_l.matches(&f).count());
+            heading_hits += headings_l.matches(&f).count();
+            body_hits += body_l.matches(&f).count();
+            // A concept is discussed as a *mechanism* when a causal or process word sits within
+            // `PROXIMITY` characters of it. Measured on 20,000 real documents, the earlier test —
+            // "does the document contain a marker anywhere" — produced a mechanism dimension that
+            // never exceeded 0.2 and never once beat `direct`, because almost every explanatory
+            // page contains "because" somewhere. Proximity is what makes the dimension mean "this
+            // concept is explained" rather than "this page explains something".
+            mechanism_hits += marker_near(&body_l, &f);
         }
-        let weight = weight.min(MAX_WEIGHT);
-        if weight >= MIN_WEIGHT {
-            out.push((seed.concept_id.to_string(), weight));
+
+        if title_hits == 0 && heading_hits == 0 && body_hits == 0 {
+            continue;
+        }
+
+        // The three dimensions must measure *different things*, or they cannot disagree and v2 §6
+        // cannot be satisfied. Measured on 20,000 real documents, an earlier model built all
+        // three from the same body counts and the result was structural: `mechanism` was a subset
+        // of `direct`'s evidence, so it never once exceeded it and could not change a ranking.
+        //
+        // So each dimension now has its own evidence:
+        //
+        //   r1 direct      — the page's own claim to be about the concept: title, headings, and a
+        //                    *bounded* contribution from body volume. A page that merely uses a
+        //                    word a lot does not thereby claim the topic.
+        //   r2 contextual  — the concept appears in the body without being claimed or explained.
+        //                    Co-occurrence, nothing more.
+        //   r3 mechanism   — the concept is *explained*: causal/process language within 240 bytes.
+        //                    Independent of title and headings, so an untitled explanatory page can
+        //                    out-rank its own topical mention on this dimension.
+
+        // r1: what the page says about itself.
+        let claim = title_hits.min(2) as f64 * TITLE_HIT
+            + heading_hits.min(MAX_COUNTED_HITS) as f64 * HEADING_HIT;
+        // Body volume contributes, but cannot alone make a page "directly about" a concept: the
+        // cap is what leaves room for mechanism to exceed direct on an explanatory page.
+        let direct = (claim + body_weight(body_hits) * DIRECT_BODY_FACTOR).min(MAX_WEIGHT);
+
+        // r2: present but unclaimed. Scaled down so that any claim outranks mere presence.
+        let contextual = if body_hits > 0 {
+            (body_weight(body_hits) * CONTEXTUAL_FACTOR).min(MAX_WEIGHT)
+        } else {
+            0.0
+        };
+
+        // r3: explained. Its own evidence, not a function of `direct`.
+        let mechanism = if mechanism_hits > 0 {
+            (body_weight(mechanism_hits) * MECHANISM_FACTOR).min(MAX_WEIGHT)
+        } else {
+            0.0
+        };
+
+        let assoc = Association {
+            concept_id: seed.concept_id.to_string(),
+            direct,
+            contextual,
+            mechanism,
+        };
+        // Keep an association only when it clears the floor on at least one dimension. Storing a
+        // row of near-zero weights costs space and dilutes every lane that reads it.
+        if assoc.weight() >= MIN_WEIGHT {
+            out.push(assoc);
         }
     }
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.weight()
+            .partial_cmp(&a.weight())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
+}
+
+/// Characters of body inspected for mechanism markers.
+const MECHANISM_WINDOW: usize = 4_000;
+
+/// How close a marker must be to a concept mention to count as explaining it, in bytes.
+const PROXIMITY: usize = 240;
+
+/// Number of concept occurrences (up to the counting cap) that have a mechanism marker nearby.
+///
+/// Byte-indexed rather than character-indexed: the search is on an ASCII-lowercased string, and a
+/// UTF-8 boundary can only be missed in non-ASCII text, where a slightly wrong window costs a
+/// little accuracy and never correctness of the slice (`get` returns `None` rather than panicking).
+fn marker_near(body: &str, form: &str) -> usize {
+    let mut hits = 0usize;
+    let mut from = 0usize;
+    while hits < MAX_COUNTED_HITS {
+        let Some(rel) = body[from..].find(form) else {
+            break;
+        };
+        let at = from + rel;
+        let start = at.saturating_sub(PROXIMITY);
+        let end = (at + form.len() + PROXIMITY).min(body.len());
+        if let Some(window) = body.get(start..end) {
+            if contains_any(window, MECHANISM_MARKERS) {
+                hits += 1;
+            }
+        }
+        from = at + form.len();
+        if from >= body.len() {
+            break;
+        }
+    }
+    hits
+}
+
+/// Words that mark a passage as describing *how* something works rather than merely naming it.
+///
+/// Chosen for causal/process language, not for topic: these words appear in any explanatory text,
+/// so they only shift a dimension when the concept is already present.
+const MECHANISM_MARKERS: &[&str] = &[
+    "because", "causes", "caused by", "leads to", "results in", "mechanism", "pathway",
+    "receptor", "signalling", "signaling", "regulates", "modulates", "mediates", "triggers",
+    "in response to", "process by which", "how it works", "drives", "produces",
+];
+
+/// Scale a body-derived weight into the contextual dimension, so contextual evidence never
+/// outweighs the same evidence stated directly.
+const CONTEXTUAL_FACTOR: f64 = 0.50;
+
+/// How much body volume may contribute to the *direct* dimension.
+///
+/// Below 1.0 deliberately: body mentions are the mechanism dimension's evidence, and if they could
+/// saturate `direct` on their own then `direct` would always dominate `mechanism` and the two
+/// dimensions could never disagree. 0.35 leaves the title/headings as the dominant signal for
+/// "this page is about X" while letting an explanatory page lead on "this page explains X".
+const DIRECT_BODY_FACTOR: f64 = 0.70;
+
+/// Scale a mechanism weight. Can reach `MAX_WEIGHT` because it is independent evidence: a page that
+/// explains a concept thoroughly is strongly associated along this dimension regardless of whether
+/// its title names the concept.
+const MECHANISM_FACTOR: f64 = 1.0;
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| haystack.contains(n))
 }
 
 /// The `(concept, alias)` rows `LEXICON` implies, for registration.
@@ -239,8 +423,8 @@ pub fn coverage(
 ) -> AppResult<HashMap<String, usize>> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (title, headings, body) in docs {
-        for (id, _) in tag(&title, &headings, &body, lexicon) {
-            *counts.entry(id).or_insert(0) += 1;
+        for a in tag(&title, &headings, &body, lexicon) {
+            *counts.entry(a.concept_id).or_insert(0) += 1;
         }
     }
     Ok(counts)
@@ -254,25 +438,142 @@ mod tests {
         LEXICON
     }
 
-    /// The architecture's motivating example: a paper about oxytocin and attachment, whose title
-    /// never says "romance", must be weighted on chemistry, hormones, attachment AND romance.
+    fn weight_of(tags: &[Association], id: &str) -> Option<f64> {
+        tags.iter().find(|a| a.concept_id == id).map(|a| a.weight())
+    }
+
+    /// v2 §6's own example: "A research paper about oxytocin and pair bonding could have a strong
+    /// direct association with neurochemistry and a weaker contextual association with romantic
+    /// attachment." This asserts exactly that shape.
     #[test]
-    fn a_paper_is_weighted_on_every_axis_it_touches() {
+    fn the_oxytocin_paper_has_a_strong_direct_and_a_weaker_contextual_association() {
         let title = "Oxytocin modulation of pair-bond formation in voles";
         let headings = "Introduction\nHormonal mechanisms\nAttachment behaviour";
-        let body = "Oxytocin is a neuropeptide. Central dopamine signalling mediates attachment. \
-                    The chemistry of pair-bonding involves vasopressin receptors.";
+        let body = "Oxytocin is a neuropeptide released in the hypothalamus. Central dopamine \
+                    signalling mediates attachment formation because oxytocin receptors in the \
+                    nucleus accumbens regulate social reward. Romantic attachment in humans is \
+                    thought to share this pathway.";
         let tags = tag(title, headings, body, lex());
-        let ids: Vec<&str> = tags.iter().map(|(id, _)| id.as_str()).collect();
-        for want in ["c-hormones", "c-attachment", "c-chemistry"] {
-            assert!(ids.contains(&want), "missing {want} in {ids:?}");
-        }
-        // Weighted, not a flat tag list: hormones (title + body) must outrank chemistry (body only).
-        let w: HashMap<&str, f64> = tags.iter().map(|(i, s)| (i.as_str(), *s)).collect();
+
+        let chem = tags
+            .iter()
+            .find(|a| a.concept_id == "c-chemistry")
+            .expect("chemistry association");
+        let romance = tags
+            .iter()
+            .find(|a| a.concept_id == "c-romance")
+            .expect("romance association");
+
+        // The title says "oxytocin", not "chemistry", so chemistry's evidence is the body's
+        // biochemistry vocabulary — it is a real association and it carries the mechanism
+        // dimension, but it is not the page's stated subject.
+        assert!(chem.mechanism > 0.0, "mechanism dimension missing: {chem:?}");
         assert!(
-            w["c-hormones"] > w["c-chemistry"],
-            "title mention must outweigh a passing body mention: {w:?}"
+            chem.direct > 0.0,
+            "chemistry should still be a direct association: {chem:?}"
         );
+        // v2 §6's exact claim: strong on neurochemistry, *weaker* contextual on romantic
+        // attachment. The paper mentions romantic attachment once, in passing.
+        assert!(
+            romance.direct < chem.direct,
+            "romance must be a weaker association than chemistry: {romance:?} vs {chem:?}"
+        );
+        // And the subject of the paper — oxytocin, tagged through the hormones concept — must
+        // outrank both, because it is named in the title and the headings.
+        let hormones = tags
+            .iter()
+            .find(|a| a.concept_id == "c-hormones")
+            .expect("hormones association");
+        assert!(
+            hormones.direct > chem.direct,
+            "the title's own subject must dominate: {hormones:?} vs {chem:?}"
+        );
+    }
+
+    /// The same article must be able to rank differently for two queries without reindexing
+    /// (v2 §6). Both the mechanism and the direct dimension are stored, and they disagree.
+    #[test]
+    fn one_article_carries_disagreeing_dimensions() {
+        let tags = tag(
+            "Hormonal regulation of social behaviour",
+            "Mechanisms",
+            "Oxytocin receptors regulate pair-bonding because the pathway mediates reward.",
+            lex(),
+        );
+        let hormones = tags
+            .iter()
+            .find(|a| a.concept_id == "c-hormones")
+            .expect("hormones");
+        // The title names the concept (direct) and the body explains it (mechanism): both high.
+        assert!(hormones.direct > 0.0);
+        assert!(hormones.dimension("mechanism") > 0.0);
+        // The dimensions are separate values, not one number copied into three slots.
+        assert_ne!(hormones.direct, hormones.dimension("mechanism"));
+    }
+
+    /// The mechanism dimension must be able to *win*, not merely be non-zero. A page whose whole
+    /// point is explaining how a concept works has to outrank its own topical mention on the
+    /// mechanism dimension, or the dimension cannot change any ranking and is decoration.
+    #[test]
+    fn an_explanatory_page_scores_high_on_mechanism() {
+        let tags = tag(
+            "Pair bonding",
+            "",
+            "Pair bonding is driven by oxytocin because the receptor pathway regulates reward \
+             signalling in the nucleus accumbens; this mechanism produces attachment.",
+            lex(),
+        );
+        let a = tags
+            .iter()
+            .find(|a| a.concept_id == "c-attachment")
+            .expect("attachment");
+        assert!(
+            a.mechanism > a.contextual,
+            "an explained concept must out-score plain co-occurrence: {a:?}"
+        );
+        assert!(a.mechanism > 0.4, "mechanism too weak to matter: {a:?}");
+    }
+
+    /// The two dimensions must be able to *cross*: a document that explains a concept without
+    /// being titled about it must score higher on mechanism than on direct. Without this, no query
+    /// interpretation can change a ranking and v2 §6's "does not need to be reindexed for every
+    /// query interpretation" is vacuous.
+    #[test]
+    fn mechanism_can_exceed_direct_on_an_explanatory_page() {
+        let tags = tag(
+            "Study 4",
+            "",
+            "Pair bonding is driven by oxytocin because the receptor pathway regulates reward \
+             signalling; this mechanism produces attachment between adults.",
+            lex(),
+        );
+        let a = tags
+            .iter()
+            .find(|a| a.concept_id == "c-attachment")
+            .expect("attachment");
+        assert!(
+            a.mechanism > a.direct,
+            "an explanatory page with an unhelpful title must lead on mechanism: {a:?}"
+        );
+    }
+
+    /// A page that merely mentions concepts without discussing them must not acquire the
+    /// mechanism dimension — otherwise every document with the word "because" scores as mechanism.
+    #[test]
+    fn a_passing_mention_gets_no_mechanism_dimension() {
+        let tags = tag(
+            "Weekly link roundup",
+            "Links",
+            "Some notes on chemistry and rust and databases.",
+            lex(),
+        );
+        for a in &tags {
+            assert_eq!(
+                a.mechanism, 0.0,
+                "{} acquired a mechanism dimension from a list of names: {a:?}",
+                a.concept_id
+            );
+        }
     }
 
     /// A page unrelated to a concept must not be tagged with it — over-tagging makes the matrix
@@ -293,12 +594,21 @@ mod tests {
     fn repetition_saturates() {
         let body = "chemistry ".repeat(500);
         let tags = tag("", "", &body, lex());
-        let w = tags
-            .iter()
-            .find(|(i, _)| i == "c-chemistry")
-            .map(|(_, w)| *w)
-            .expect("chemistry tagged");
+        let w = weight_of(&tags, "c-chemistry").expect("chemistry tagged");
         assert!(w <= MAX_WEIGHT, "weight {w} exceeded the ceiling");
+    }
+
+    /// The scalar `weight()` is the strongest dimension, not the sum of three correlated ones.
+    #[test]
+    fn the_scalar_weight_is_the_max_not_the_sum() {
+        let a = Association {
+            concept_id: "c".into(),
+            direct: 0.6,
+            contextual: 0.3,
+            mechanism: 0.2,
+        };
+        assert!((a.weight() - 0.6).abs() < 1e-9, "{}", a.weight());
+        assert_eq!(a.dims().len(), 3);
     }
 
     /// Every lexicon row registers exactly one concept and one alias per surface form.

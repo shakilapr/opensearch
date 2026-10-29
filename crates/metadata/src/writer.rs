@@ -75,6 +75,19 @@ pub enum Mutation {
         work_id: Option<String>,
         created_at: i64,
     },
+    /// Record one dimension of a document↔concept association (v2 §6).
+    ///
+    /// `doc_concept` holds the scalar weight retrieval uses; this holds the breakdown that lets one
+    /// article rank differently for "chemical processes involved in romance" and "hormonal
+    /// regulation" without being reindexed (v2 §6).
+    UpsertDocConceptDim {
+        resource_id: String,
+        concept_id: String,
+        dim: String,
+        value: f64,
+        model_version: Option<String>,
+        created_at: i64,
+    },
     /// Append a fetch observation.
     RecordFetch {
         resource_id: String,
@@ -1071,6 +1084,34 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     work_id,
                     created_at,
                 ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertDocConceptDim {
+            resource_id,
+            concept_id,
+            dim,
+            value,
+            model_version,
+            created_at,
+        } => {
+            // `model_version` is part of the key and may legitimately be NULL, which SQLite treats
+            // as distinct-but-not-equal in a UNIQUE index: two NULLs never conflict, so an
+            // `ON CONFLICT` upsert would silently insert duplicates. `IFNULL` in the key is not
+            // available here, so the delete-then-insert below makes the write idempotent for the
+            // unversioned case as well as the versioned one.
+            tx.execute(
+                "DELETE FROM doc_concept_dim
+                  WHERE resource_id = ?1 AND concept_id = ?2 AND dim = ?3
+                    AND IFNULL(model_version, '') = IFNULL(?4, '')",
+                rusqlite::params![resource_id, concept_id, dim, model_version],
+            )
+            .map_err(crate::db_err)?;
+            tx.execute(
+                "INSERT INTO doc_concept_dim
+                     (resource_id, concept_id, dim, value, model_version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                rusqlite::params![resource_id, concept_id, dim, value, model_version, created_at],
             )
             .map_err(crate::db_err)?;
         }

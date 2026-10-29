@@ -28,6 +28,10 @@ use search_retrieval::concept_tag;
 /// seconds of work.
 const BATCH_DOCS: usize = 2_000;
 
+/// Stamped on every association and dimension row produced by this pass, so a later better
+/// teacher can be introduced without guessing which rows it produced (v2 §4, §6).
+const MODEL_VERSION: &str = "lexicon-v1";
+
 fn flag_usize(args: &[String], flag: &str) -> Option<usize> {
     let idx = args.iter().position(|a| a == flag)?;
     args.get(idx + 1)?.parse().ok()
@@ -175,6 +179,7 @@ fn build_root(cfg: &Config, batch: usize, limit: usize, dry_run: bool) -> AppRes
     let mut seen = 0usize;
     let mut tagged = 0usize;
     let mut assocs = 0usize;
+    let mut dims = 0usize;
 
     'pages: loop {
         let docs = page_of_docs(&reader, &after, batch.min(limit.saturating_sub(seen)).max(1))?;
@@ -192,26 +197,45 @@ fn build_root(cfg: &Config, batch: usize, limit: usize, dry_run: bool) -> AppRes
             if body.trim().is_empty() {
                 continue;
             }
-            let weights = concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON);
+            // Headings live in the body text for extracted pages, so they are searched through the
+            // body; a page's title comes from the metadata row.
+            let assocs_for_doc = concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON);
             after = d.resource_id.clone();
-            if weights.is_empty() {
+            if assocs_for_doc.is_empty() {
                 continue;
             }
             tagged += 1;
-            for (concept_id, weight) in weights {
+            for assoc in assocs_for_doc {
                 assocs += 1;
                 mutations.push(Mutation::UpsertDocConcept {
                     resource_id: d.resource_id.clone(),
-                    concept_id,
-                    weight,
+                    concept_id: assoc.concept_id.clone(),
+                    // The scalar retrieval uses, derived from the strongest dimension.
+                    weight: assoc.weight(),
                     relation_kind: "direct".into(),
                     evidence: None,
                     passage_id: None,
                     via_concept_id: None,
-                    model_version: Some("lexicon-v1".into()),
+                    model_version: Some(MODEL_VERSION.into()),
                     work_id: None,
                     created_at: now,
                 });
+                // The dimensional breakdown (v2 §6): one row per non-zero dimension, so the same
+                // article can rank differently for a topic query and a mechanism query.
+                for (dim, value) in assoc.dims() {
+                    if value <= 0.0 {
+                        continue;
+                    }
+                    dims += 1;
+                    mutations.push(Mutation::UpsertDocConceptDim {
+                        resource_id: d.resource_id.clone(),
+                        concept_id: assoc.concept_id.clone(),
+                        dim: dim.to_string(),
+                        value,
+                        model_version: Some(MODEL_VERSION.into()),
+                        created_at: now,
+                    });
+                }
             }
         }
         if !mutations.is_empty() && !dry_run {
@@ -224,8 +248,8 @@ fn build_root(cfg: &Config, batch: usize, limit: usize, dry_run: bool) -> AppRes
 
     let secs = started.elapsed().as_secs_f64().max(0.001);
     println!(
-        "  tagged {tagged} of {seen} document(s), {assocs} association(s) in {:.1}s ({:.0} docs/s)",
-        secs,
+        "  tagged {tagged} of {seen} document(s): {assocs} association(s), {dims} dimension row(s) \
+         in {secs:.1}s ({:.0} docs/s)",
         seen as f64 / secs
     );
     Ok(())

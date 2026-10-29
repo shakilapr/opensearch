@@ -13,7 +13,7 @@
 //! edit a released version.
 
 /// Highest schema version known to this build.
-pub const SCHEMA_VERSION: u64 = 6;
+pub const SCHEMA_VERSION: u64 = 8;
 
 /// Ordered `(version, DDL)` migrations. Kept as string constants so migration
 /// `0001` is byte-exact.
@@ -25,6 +25,7 @@ pub const MIGRATIONS: &[(u64, &str)] = &[
     (5, include_str!("../migrations/0005_semantic_index.sql")),
     (6, include_str!("../migrations/0006_identity_layer.sql")),
     (7, include_str!("../migrations/0007_frontier_dispatch_index.sql")),
+    (8, include_str!("../migrations/0008_v2_semantic_tables.sql")),
 ];
 
 /// Migration ledger: records the version of every migration already applied.

@@ -172,6 +172,8 @@ const PERSIST_FULL_EVERY: u64 = 150;
 
 /// The denial reason `Pipeline::crawl_one` reports when the site root itself is disallowed. The
 /// drain matches on it to retire the host's queue instead of retrying each of its URLs.
+use crate::backfill::REFILL_BATCH;
+
 const DENY_ALL_REASON: &str = "robots.txt disallows / (site denies all)";
 
 /// Default free-space floor for the crawl's disk guard, in GiB.
@@ -372,6 +374,10 @@ pub struct CrawlSummary {
     /// because the seed list, the document budget or the URL budget was exhausted. A caller
     /// (the watcher, a supervisor) can restart the run once space is reclaimed.
     pub stopped_for_disk: bool,
+    /// URLs supplied by the frontier refill. Zero means discovery alone kept the drain fed;
+    /// a large number means the corpus is being driven by previously-discovered URLs, which is
+    /// the point of the refill.
+    pub refilled: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +617,10 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // summary reports so a supervisor can tell "budget exhausted" from "stopped to save the disk".
     let mut loop_ticks: u64 = 0;
     let mut stopped_for_disk = false;
+    // URLs supplied by the frontier refill, reported in the summary so "did the refill matter?"
+    // is answerable from the run's own output.
+    let mut refilled: usize = 0;
+    let now_unix = search_core::time::now_unix_s();
 
     loop {
         // Stream every completed discovery task: enqueue its URLs and seed, then
@@ -637,6 +647,26 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
 
         // Reap finished fetches and dispatch new ones (never blocks).
         drain.pump(&mut drain_set);
+
+        // Frontier refill: the drain's queue only holds what discovery produced this run, while
+        // `frontier_entry` accumulates every URL the sitemaps ever advertised and nothing fetches
+        // them (measured 2026-10-28: 557,001 rows sat in `READY`, dispatchable and unused). When
+        // the drain runs dry, pull dispatchable URLs from the frontier so the fetch slots stay
+        // busy instead of idling at 1% utilisation waiting for seed discovery.
+        if drain.needs_work() {
+            if let Ok(urls) = pipeline.with_meta_conn(|_c| {
+                // A reader keeps the frontier query off the single-writer lock.
+                let reader = search_metadata::MetadataReader::from_path(&cfg.meta_db())?;
+                crate::backfill::dispatchable_urls(&reader, now_unix, REFILL_BATCH)
+            }) {
+                if !urls.is_empty() {
+                    refilled += urls.len();
+                    for u in urls {
+                        drain.enqueue(u);
+                    }
+                }
+            }
+        }
 
         // Disk guard: a crawl that fills the filesystem takes the serving index's write path
         // (and, on this host, the answer cache) down with it. Checked every 32 turns of the
@@ -740,7 +770,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // because `remaining` is empty.
     drain.final_persist();
 
-    Ok(drain.summary(resumed_from, started.elapsed(), stopped_for_disk))
+    Ok(drain.summary(resumed_from, started.elapsed(), stopped_for_disk, refilled))
 }
 
 // ---------------------------------------------------------------------------
@@ -967,6 +997,20 @@ impl Drainer {
         self.queues.values().all(|q| q.is_empty())
     }
 
+    /// Whether the drain has less work queued than its fetch slots can use.
+    ///
+    /// The signal for a frontier refill: at 1% slot utilisation measured 2026-10-28, the queue was
+    /// the limiting factor, not the network. Comparing queued URLs against `concurrency` is the
+    /// cheapest proxy for "could I dispatch more right now"; the refill itself is throttled by the
+    /// caller so a full queue never triggers a query.
+    fn needs_work(&self) -> bool {
+        if self.bound_reached() {
+            return false;
+        }
+        let queued: usize = self.queues.values().map(|q| q.len()).sum();
+        queued < self.opts.concurrency
+    }
+
     /// Time until the earliest backed-off origin becomes dispatchable again.
     /// Zero when nothing is in rate-limit backoff.
     fn next_ready_delay(&self) -> Duration {
@@ -1024,7 +1068,13 @@ impl Drainer {
         self.pending_adds.clear();
     }
 
-    fn summary(&self, resumed_from: usize, elapsed: Duration, stopped_for_disk: bool) -> CrawlSummary {
+    fn summary(
+        &self,
+        resumed_from: usize,
+        elapsed: Duration,
+        stopped_for_disk: bool,
+        refilled: usize,
+    ) -> CrawlSummary {
         CrawlSummary {
             ingested: self.counters.ingested,
             unchanged: self.counters.unchanged,
@@ -1039,6 +1089,7 @@ impl Drainer {
             elapsed_ms: elapsed.as_millis() as u64,
             resumed_from,
             stopped_for_disk,
+            refilled,
         }
     }
 
