@@ -820,9 +820,37 @@ pub fn run_engine_search(
         .iter()
         .any(|r| !docmap.contains_key(&r.doc_id));
     if any_missing {
-        if let Ok(hits) = searcher.search(&query, MAX_LIMIT, None) {
-            for h in hits {
-                docmap.entry(h.doc_id.clone()).or_insert(h);
+        // A lane that is not index-backed — the dense lane over `vectors.bin`, the §9.4 graph lane,
+        // and the concept lane over `doc_concept` — returns only `doc_id`s and has no `IndexHit` of
+        // its own. When such a lane contributes a document the lexical lanes did not return, that
+        // document has no entry in `docmap` and the `filter_map` below silently drops it.
+        //
+        // The effect was that no extra lane could ever *extend* the candidate set: it could only
+        // re-rank documents BM25 already found. Measured 2026-10-29 with the concept lane fused at
+        // weight 0.8: the lane returned 10 hits in 1.46 s, and none of them reached the response.
+        //
+        // Fetching each missing id individually is what makes lane-only candidates renderable, and
+        // it costs one lookup per added document (bounded by the result limit and the number of
+        // lanes), not a corpus scan.
+        for row in engine_resp.results.iter() {
+            if docmap.contains_key(&row.doc_id) {
+                continue;
+            }
+            if let Some(hit) = searcher.lookup_doc(&row.doc_id) {
+                docmap.insert(row.doc_id.clone(), hit);
+            }
+        }
+        // Anything still missing after a direct lookup keeps the old behaviour: a lexical sweep, so
+        // a document the searcher can only find by text is not lost either.
+        if engine_resp
+            .results
+            .iter()
+            .any(|r| !docmap.contains_key(&r.doc_id))
+        {
+            if let Ok(hits) = searcher.search(&query, MAX_LIMIT, None) {
+                for h in hits {
+                    docmap.entry(h.doc_id.clone()).or_insert(h);
+                }
             }
         }
     }

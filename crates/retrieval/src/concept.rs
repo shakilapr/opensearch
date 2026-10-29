@@ -390,6 +390,81 @@ pub fn from_data_dir(data_dir: &Path) -> Option<ConceptLane> {
     Some(ConceptLane::new(db))
 }
 
+/// A concept lane over several data roots, fused by score.
+///
+/// `serve` answers from four shards, each with its own metadata database and its own
+/// `doc_concept` rows (measured 2026-10-29: 855,519 associations split across them). A lane over
+/// only the primary root found no associations at all, because the primary is the 19K serving root
+/// while the matrix was built on the fleet.
+///
+/// Resource ids are globally stable across shards (verified earlier: 0 mismatches in a 20,000-URL
+/// sample), so unioning the shards' hits needs no id rewriting — the same document cannot appear
+/// twice with different ids.
+pub struct FederatedConceptLane {
+    lanes: Vec<ConceptLane>,
+}
+
+impl FederatedConceptLane {
+    /// Build over every root that has associations. Returns `None` when none does, so an absent
+    /// corpus yields no lane rather than an empty one.
+    pub fn from_dirs(dirs: &[std::path::PathBuf]) -> Option<Self> {
+        let lanes: Vec<ConceptLane> = dirs.iter().filter_map(|d| from_data_dir(d)).collect();
+        if lanes.is_empty() {
+            None
+        } else {
+            Some(Self { lanes })
+        }
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.lanes.len()
+    }
+}
+
+impl LaneSearcher for FederatedConceptLane {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        source_id: Option<&str>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        // Ask each shard for its own best `limit` and fuse by summed score, the same rule the
+        // document-level federation uses. A document may only exist on one shard, so summing is
+        // equivalent to taking the best — but summing is also correct if a later re-shard
+        // duplicates one, where taking the best would hide a scoring disagreement.
+        let mut merged: HashMap<String, Candidate> = HashMap::new();
+        let mut errors = 0usize;
+        for lane in &self.lanes {
+            match lane.search(query, limit, source_id) {
+                Ok(hits) => {
+                    for h in hits {
+                        merged
+                            .entry(h.doc_id.clone())
+                            .and_modify(|e| e.score += h.score)
+                            .or_insert(h);
+                    }
+                }
+                Err(_) => errors += 1,
+            }
+        }
+        // Every shard failing is an error; one failing is a degraded answer, which a federated
+        // search should still return.
+        if errors == self.lanes.len() && errors > 0 {
+            return Err(RetrievalError::index(
+                "concept lane: every shard failed".to_string(),
+            ));
+        }
+        let mut out: Vec<Candidate> = merged.into_values().collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

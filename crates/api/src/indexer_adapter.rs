@@ -22,6 +22,34 @@ impl IndexerSearcher {
 }
 
 impl Searcher for IndexerSearcher {
+    fn lookup_doc(&self, doc_id: &str) -> Option<IndexHit> {
+        // A lane that knows only a doc_id (dense, graph, concept) needs this to have its candidates
+        // rendered at all.
+        let doc = self.indexer.doc_by_id(doc_id).ok().flatten()?;
+        Some(IndexHit {
+            doc_id: doc.doc_id,
+            version: doc.version,
+            resource_id: doc.resource_id,
+            work_id: doc.work_id,
+            content_id: doc.content_id,
+            url: doc.url,
+            title: doc.title,
+            // No query, so no snippet: the engine renders the title and the answer path fetches
+            // the body through `doc_text` when it needs real content.
+            snippet: String::new(),
+            source_id: doc.source_id,
+            doc_type: Some(doc.doc_type).filter(|s| !s.is_empty()),
+            language: Some(doc.language).filter(|s| !s.is_empty()),
+            published_at: doc.published_at,
+            modified_at: doc.modified_at,
+            fetched_at: doc.fetched_at,
+            lane: "lookup".to_string(),
+            provenance: search_core::Provenance::Snapshot,
+            score: 0.0,
+            signals: Vec::new(),
+        })
+    }
+
     fn search(
         &self,
         q: &str,

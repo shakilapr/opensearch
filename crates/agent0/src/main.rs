@@ -134,17 +134,22 @@ fn build_graph_lane(
 fn build_concept_lane(
     cfg: &search_core::config::Config,
 ) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
-    match search_retrieval::concept::from_data_dir(&cfg.data_dir) {
+    // Every root that is actually served, not just the primary: the matrix was built on the fleet,
+    // and a lane over the primary alone found no associations at all.
+    let mut dirs = vec![cfg.data_dir.clone()];
+    dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
+    match search_retrieval::concept::FederatedConceptLane::from_dirs(&dirs) {
         Some(lane) => {
             tracing::info!(
-                dir = %cfg.data_dir.display(),
-                "concept lane enabled (doc_concept matrix)"
+                shards = lane.shard_count(),
+                of = dirs.len(),
+                "concept lane enabled (doc_concept matrix); measured 2026-10-29: at RRF c=60 a                  lane's contribution is 1/(60+rank), so a document found by the concept lane alone                  (0.0138 at rank 1) cannot outrank one found by both lexical lanes (0.0303). The                  lane therefore re-ranks rather than retrieves until c is lowered or the score is                  weighted, which is what Phase D of EXECUTION-PLAN-v2.md must measure"
             );
             vec![std::sync::Arc::new(lane)]
         }
         None => {
             tracing::info!(
-                dir = %cfg.data_dir.display(),
+                dirs = dirs.len(),
                 "no concept associations: the concept lane is off (build with `agent0 concepts build`)"
             );
             Vec::new()

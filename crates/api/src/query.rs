@@ -299,6 +299,19 @@ pub trait Searcher: Send + Sync {
         self.search(q, limit, filters)
     }
 
+    /// One document's metadata by id, when this implementation can look it up.
+    ///
+    /// Needed because a non-lexical lane (dense, graph, concept) returns only `doc_id`s and has no
+    /// `IndexHit` of its own. Without this, the engine could only render a lane's contribution if
+    /// the lexical lanes had *already* returned the same document — so no extra lane could ever
+    /// extend the candidate set, only re-rank it. Measured 2026-10-29: the concept lane returned 10
+    /// hits in 1.46 s and not one reached the response.
+    ///
+    /// Defaulted to `None` so a stub stays a stub; a searcher that can fetch by id overrides it.
+    fn lookup_doc(&self, _doc_id: &str) -> Option<IndexHit> {
+        None
+    }
+
     /// The stored text of one document, when this implementation can read it.
     ///
     /// Defaulted to `Ok(None)` so a stub searcher stays a stub: the engine is

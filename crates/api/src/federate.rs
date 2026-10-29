@@ -113,6 +113,21 @@ impl FederatedSearcher {
 }
 
 impl Searcher for FederatedSearcher {
+    /// Find one document by id across the shards.
+    ///
+    /// A shard is chosen by `Ask` order, which is cheapest because ids do not encode a shard — so
+    /// this is a small linear probe with an early return. It exists because a non-lexical lane
+    /// (dense, graph, concept) returns ids found in *its* data, which may live on any shard; without
+    /// it those candidates were dropped before rendering.
+    fn lookup_doc(&self, doc_id: &str) -> Option<IndexHit> {
+        for shard in &self.shards {
+            if let Some(hit) = shard.searcher.lookup_doc(doc_id) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
     fn search(
         &self,
         q: &str,

@@ -692,6 +692,65 @@ impl Indexer {
         Ok(None)
     }
 
+    /// One document's stored metadata by id — the fields `search` would have returned for it.
+    ///
+    /// Exists so a retrieval lane that knows only a `doc_id` (dense, graph, concept) can have its
+    /// candidates rendered: without this the engine could only show a lane's document if the
+    /// lexical lanes had already found it, which made every extra lane a re-ranker rather than a
+    /// retriever.
+    ///
+    /// A term lookup on `doc_id`, scoped to the same base-then-overlay order `doc_text` uses, so a
+    /// newer overlay copy wins. Returns `None` for an unknown id or a tombstoned document.
+    pub fn doc_by_id(&self, doc_id: &str) -> AppResult<Option<IndexDoc>> {
+        for reader in [&self.overlay_reader, &self.base_reader] {
+            reader.reload().ix()?;
+            let searcher = reader.searcher();
+            let term = Term::from_field_text(self.fields.doc_id, doc_id);
+            let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            let top = searcher.search(&query, &TopDocs::with_limit(1)).ix()?;
+            let Some((_, addr)) = top.first() else {
+                continue;
+            };
+            if fast_u64(&searcher, *addr, "tombstone") != 0 {
+                return Ok(None);
+            }
+            let doc: TantivyDocument = searcher.doc(*addr).ix()?;
+            let text = |field| {
+                doc.get_first(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let url = text(self.fields.url);
+            let title = text(self.fields.title);
+            let source_id = text(self.fields.source_id);
+            let body = text(self.fields.body);
+            let resource_id = text(self.fields.resource_id);
+            let content_id = text(self.fields.content_id);
+            let work_id = text(self.fields.work_id);
+            return Ok(Some(IndexDoc {
+                doc_id: doc_id.to_string(),
+                url,
+                title,
+
+                source_id: if source_id.is_empty() {
+                    None
+                } else {
+                    Some(source_id)
+                },
+                resource_id,
+                content_id: if content_id.is_empty() {
+                    None
+                } else {
+                    Some(content_id)
+                },
+                work_id: if work_id.is_empty() { None } else { Some(work_id) },
+                ..IndexDoc::new(doc_id, "", "", "", "")
+            }));
+        }
+        Ok(None)
+    }
+
     /// Every live (non-tombstoned, visible) document in base ∪ overlay as full
     /// `IndexDoc`s — everything the schema STOREs (`url`, `title`, `body`,
     /// `source_id`, `published_at`, ids), i.e. enough to rebuild a document
