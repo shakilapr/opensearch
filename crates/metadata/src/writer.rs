@@ -88,6 +88,19 @@ pub enum Mutation {
         model_version: Option<String>,
         created_at: i64,
     },
+    /// Delete every association and dimension row produced by one `model_version`.
+    ///
+    /// Needed because tagging is an upsert: a corrected lexicon adds and updates but never removes,
+    /// so an association the old aliases created survives forever. Measured 2026-10-29 after fixing
+    /// the "attachment" homonym (which had tagged 290 documents, three quarters of them software
+    /// docs): a re-run left all the stale rows in place, so the fix had no effect on the matrix.
+    ///
+    /// Scoped by `model_version` so a purge can never delete another model's work — the whole point
+    /// of stamping it. `doc_concept_dim` has no `relation_kind`, so its key is
+    /// `(resource_id, concept_id, dim, model_version)` and the same filter applies.
+    PurgeModelVersion {
+        model_version: String,
+    },
     /// Append a fetch observation.
     RecordFetch {
         resource_id: String,
@@ -1112,6 +1125,18 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                      (resource_id, concept_id, dim, value, model_version, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 rusqlite::params![resource_id, concept_id, dim, value, model_version, created_at],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::PurgeModelVersion { model_version } => {
+            tx.execute(
+                "DELETE FROM doc_concept_dim WHERE model_version = ?1",
+                rusqlite::params![model_version],
+            )
+            .map_err(crate::db_err)?;
+            tx.execute(
+                "DELETE FROM doc_concept WHERE model_version = ?1",
+                rusqlite::params![model_version],
             )
             .map_err(crate::db_err)?;
         }

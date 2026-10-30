@@ -35,6 +35,14 @@ pub struct ConceptSeed {
     pub name: &'static str,
     pub kind: &'static str,
     pub aliases: &'static [&'static str],
+    /// Whether the concept's own `name` may be matched as a surface form.
+    ///
+    /// `true` for most concepts: a page saying "chemistry" is about chemistry. `false` when the
+    /// name is a homonym that dominates the corpus in its other sense — measured 2026-10-29,
+    /// "attachment" tagged 290 documents of which three quarters were Elasticsearch reference
+    /// pages, and the name alone was the only remaining source of those false positives after the
+    /// aliases were narrowed. Such a concept is reachable only through its multi-word aliases.
+    pub match_name: bool,
 }
 
 /// The bundled starting lexicon.
@@ -49,6 +57,9 @@ pub const LEXICON: &[ConceptSeed] = &[
         concept_id: "c-chemistry",
         name: "chemistry",
         kind: "topic",
+        // "chemical" is a band name and a laundry-product word; keep the name but rely on the
+        // sense guard for the band case (measured: 0.49 on a tour-news page).
+        match_name: true,
         // Biochemistry vocabulary is included because a paper on neurochemistry rarely says
         // "chemistry": it says neuropeptide, receptor, neurotransmitter. Found by the oxytocin
         // test failing to tag a paper that is unambiguously about the chemistry of bonding.
@@ -60,6 +71,7 @@ pub const LEXICON: &[ConceptSeed] = &[
         concept_id: "c-hormones",
         name: "hormones",
         kind: "topic",
+        match_name: true,
         aliases: &["hormone", "hormonal", "endocrine", "oxytocin", "dopamine", "serotonin",
                    "vasopressin", "cortisol", "testosterone", "estrogen"],
     },
@@ -67,80 +79,108 @@ pub const LEXICON: &[ConceptSeed] = &[
         concept_id: "c-attachment",
         name: "attachment",
         kind: "topic",
-        aliases: &["bonding", "bond", "bonded", "pair-bonding", "affiliation", "closeness"],
+        match_name: false,
+        // NOT the bare word "attachment" and not "bond": measured 2026-10-29 on the serving root,
+        // 15 of 20 documents tagged `c-attachment` were software documentation — Elasticsearch
+        // "attachment field type", Docker "attach", email attachments, "bond" in finance and
+        // networking. Only multi-word forms that name the psychological construct are kept.
+        aliases: &["pair bonding", "pair-bonding", "emotional bond", "emotional bonding",
+                   "human bonding", "social bonding", "attachment theory", "attachment style",
+                   "affiliation", "closeness"],
     },
     ConceptSeed {
         concept_id: "c-romance",
         name: "romance",
         kind: "topic",
-        aliases: &["romantic", "romantic love", "love", "limerence", "attraction",
-                   "falling in love", "romantic relationship"],
+        // "romance" alone is a fiction genre and a band name; the aliases carry the construct.
+        match_name: false,
+        // "love" alone is excluded for the same reason as "attachment": it appears in product
+        // copy, tennis scores and software docs. The phrases below are unambiguous.
+        aliases: &["romantic", "romantic love", "limerence", "romantic attraction",
+                   "falling in love", "romantic relationship", "romantic partner"],
     },
     ConceptSeed {
         concept_id: "c-neuroscience",
         name: "neuroscience",
         kind: "field",
+        match_name: true,
         aliases: &["neural", "neuron", "neurons", "brain", "cortical", "cognitive"],
     },
     ConceptSeed {
         concept_id: "c-psychology",
         name: "psychology",
         kind: "field",
-        aliases: &["psychological", "behaviour", "behavior", "emotion", "emotional", "affect"],
+        match_name: true,
+        // Single generic adjectives are excluded. Measured 2026-10-29: "behavioral" alone tagged
+        // the Elasticsearch "Geoshape field type" reference page as psychology, because
+        // "behavioral" is also a product feature name. Only multi-word psychological phrases remain,
+        // plus the field's own name, which is specific enough to be safe.
+        aliases: &["psychological", "emotion regulation", "emotional response",
+                   "emotional state", "cognitive psychology", "clinical psychology",
+                   "developmental psychology"],
     },
     // --- technical vocabulary the corpus actually holds ---
     ConceptSeed {
         concept_id: "c-retrieval",
         name: "information retrieval",
         kind: "field",
+        match_name: true,
         aliases: &["retrieval", "search engine", "bm25", "ranking", "relevance"],
     },
     ConceptSeed {
         concept_id: "c-embeddings",
         name: "embeddings",
         kind: "topic",
+        match_name: true,
         aliases: &["embedding", "vector", "vectors", "dense retrieval", "semantic search"],
     },
     ConceptSeed {
         concept_id: "c-rust",
         name: "rust",
         kind: "topic",
+        match_name: true,
         aliases: &["rustlang", "cargo", "borrow checker", "ownership"],
     },
     ConceptSeed {
         concept_id: "c-databases",
         name: "databases",
         kind: "topic",
+        match_name: true,
         aliases: &["database", "sql", "sqlite", "postgres", "query engine", "indexing"],
     },
     ConceptSeed {
         concept_id: "c-ml",
         name: "machine learning",
         kind: "field",
+        match_name: true,
         aliases: &["neural network", "model training", "inference", "training", "classifier"],
     },
     ConceptSeed {
         concept_id: "c-web-crawling",
         name: "web crawling",
         kind: "topic",
+        match_name: true,
         aliases: &["crawler", "crawl", "spider", "sitemap", "robots.txt", "scraping"],
     },
     ConceptSeed {
         concept_id: "c-distributed-systems",
         name: "distributed systems",
         kind: "field",
+        match_name: true,
         aliases: &["consensus", "replication", "distributed", "fault tolerance", "raft", "paxos"],
     },
     ConceptSeed {
         concept_id: "c-security",
         name: "security",
         kind: "topic",
+        match_name: true,
         aliases: &["vulnerability", "exploit", "authentication", "encryption", "cryptography"],
     },
     ConceptSeed {
         concept_id: "c-climate",
         name: "climate",
         kind: "topic",
+        match_name: true,
         aliases: &["climate change", "global warming", "emissions", "carbon", "greenhouse"],
     },
 ];
@@ -292,7 +332,12 @@ pub fn tag(
         let mut body_hits = 0usize;
         let mut mechanism_hits = 0usize;
 
-        for form in std::iter::once(&seed.name).chain(seed.aliases.iter()) {
+        let forms: Vec<&str> = if seed.match_name {
+            std::iter::once(seed.name).chain(seed.aliases.iter().copied()).collect()
+        } else {
+            seed.aliases.to_vec()
+        };
+        for form in forms {
             let f = form.to_ascii_lowercase();
             if f.len() < 3 {
                 continue;
@@ -579,7 +624,9 @@ mod tests {
             "Pair bonding",
             "",
             "Pair bonding is driven by oxytocin because the receptor pathway regulates reward \
-             signalling in the nucleus accumbens; this mechanism produces attachment.",
+             signalling in the nucleus accumbens. The mechanism produces a lasting emotional \
+             bond, and pair bonding in voles depends on vasopressin, which also causes the \
+             attachment behaviour observed after mating.",
             lex(),
         );
         let a = tags

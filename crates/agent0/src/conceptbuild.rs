@@ -126,7 +126,11 @@ fn page_of_docs(
         .collect())
 }
 
-/// `agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]`
+/// `agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--rebuild] [--dry-run]`
+///
+/// `--rebuild` purges this pass's own `model_version` before tagging. Tagging is otherwise an
+/// upsert, so a corrected lexicon cannot remove an association the previous lexicon created — a
+/// fix to the vocabulary would appear to have no effect on the matrix.
 pub async fn run(args: &[String]) -> ExitCode {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut i = 3;
@@ -149,6 +153,7 @@ pub async fn run(args: &[String]) -> ExitCode {
     let batch = flag_usize(args, "--batch").unwrap_or(BATCH_DOCS).max(1);
     let limit = flag_usize(args, "--limit").unwrap_or(usize::MAX);
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let rebuild = args.iter().any(|a| a == "--rebuild");
     let _ = flag_str(args, "--unknown");
 
     let mut failed = false;
@@ -156,7 +161,7 @@ pub async fn run(args: &[String]) -> ExitCode {
         let mut cfg = Config::from_env();
         cfg.data_dir = dir.clone();
         println!("{}:", dir.display());
-        match build_root(&cfg, batch, limit, dry_run) {
+        match build_root(&cfg, batch, limit, dry_run, rebuild) {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
@@ -171,10 +176,22 @@ pub async fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn build_root(cfg: &Config, batch: usize, limit: usize, dry_run: bool) -> AppResult<()> {
+fn build_root(
+    cfg: &Config,
+    batch: usize,
+    limit: usize,
+    dry_run: bool,
+    rebuild: bool,
+) -> AppResult<()> {
     let started = Instant::now();
     let now = search_core::time::now_unix_s();
     let mut writer = MetadataWriter::from_path(&cfg.meta_db())?;
+    if rebuild && !dry_run {
+        writer.apply_batch(&[Mutation::PurgeModelVersion {
+            model_version: MODEL_VERSION.to_string(),
+        }])?;
+        println!("  purged associations from {MODEL_VERSION}");
+    }
     let registered = register_lexicon(&mut writer, now)?;
     println!("  lexicon: {registered} concept/alias rows registered");
     if dry_run {
