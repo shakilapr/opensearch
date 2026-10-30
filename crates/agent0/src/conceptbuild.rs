@@ -28,6 +28,10 @@ use search_retrieval::concept_tag;
 /// seconds of work.
 const BATCH_DOCS: usize = 2_000;
 
+/// Associations below this direct weight are dropped for a concept covering >20% of the corpus.
+/// At 0.30 a page that merely mentions the field is excluded while a page that discusses it stays.
+const UBIQUITY_STRONG_EVIDENCE: f64 = 0.30;
+
 /// Stamped on every association and dimension row produced by this pass, so a later better
 /// teacher can be introduced without guessing which rows it produced (v2 §4, §6).
 const MODEL_VERSION: &str = "lexicon-v1";
@@ -205,6 +209,50 @@ fn build_root(
     let mut assocs = 0usize;
     let mut dims = 0usize;
 
+    // Pass 1: how many documents each concept would claim. Needed because ubiquity can only be
+    // measured against the corpus, not guessed: `c-ml` claimed 32% of the serving root and drowned
+    // every real association. Cheap — tagging is 400 docs/s and nothing is written.
+    let mut concept_docs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total_docs = 0usize;
+    {
+        let mut probe_after = String::new();
+        loop {
+            let batch = page_of_docs(&reader, &probe_after, batch)?;
+            if batch.is_empty() {
+                break;
+            }
+            for d in &batch {
+                probe_after = d.docver_id.clone();
+                total_docs += 1;
+                let body = std::fs::read_to_string(&d.text_path).unwrap_or_default();
+                if body.trim().is_empty() {
+                    continue;
+                }
+                for a in concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON) {
+                    *concept_docs.entry(a.concept_id).or_insert(0) += 1;
+                }
+            }
+            if total_docs >= limit {
+                break;
+            }
+        }
+    }
+    let ubiquity_limit = (total_docs as f64 * concept_tag::UBIQUITY_LIMIT) as usize;
+    let ubiquitous: std::collections::HashSet<String> = concept_docs
+        .iter()
+        .filter(|(_, n)| **n > ubiquity_limit.max(1))
+        .map(|(c, _)| c.clone())
+        .collect();
+    if !ubiquitous.is_empty() {
+        let mut names: Vec<&String> = ubiquitous.iter().collect();
+        names.sort();
+        println!(
+            "  ubiquity: dropping {} concept(s) covering >{:.0}% of {total_docs} docs: {names:?}",
+            ubiquitous.len(),
+            concept_tag::UBIQUITY_LIMIT * 100.0
+        );
+    }
+
     'pages: loop {
         let docs = page_of_docs(&reader, &after, batch.min(limit.saturating_sub(seen)).max(1))?;
         if docs.is_empty() {
@@ -230,6 +278,18 @@ fn build_root(
             }
             tagged += 1;
             for assoc in assocs_for_doc {
+                // A ubiquitous concept is kept only where the page states it strongly (title or
+                // headings), so "Machine Learning" keeps its tag while "training" noise does not.
+                // Ubiquitous concepts keep their associations but are labelled as such, so the
+                // lane can weight them down instead of the builder deleting them.
+                //
+                // Deleting was the first attempt and it was wrong: dropping `c-ml` entirely made
+                // "teaching machines to learn from their own errors" resolve to no concept at all,
+                // which turned a bad ranking into no ranking. A ubiquitous concept is weak
+                // evidence, not absent evidence, and that distinction belongs in the score.
+                if ubiquitous.contains(&assoc.concept_id) && assoc.direct < UBIQUITY_STRONG_EVIDENCE {
+                    continue;
+                }
                 assocs += 1;
                 mutations.push(Mutation::UpsertDocConcept {
                     resource_id: d.resource_id.clone(),

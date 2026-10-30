@@ -212,6 +212,29 @@ fn body_weight(n: usize) -> f64 {
     n / (n + 4.0)
 }
 
+/// A concept whose every alias is ordinary in a corpus becomes useless: measured 2026-10-29, `c-ml`
+/// was associated with 6,167 of 19,255 documents (32%) because "training", "inference" and
+/// "classifier" appear on every software page. A concept matching a third of the corpus cannot
+/// discriminate, and it floods any lane that reads the matrix — the labelled document for
+/// "teaching machines to learn from their own errors" ranked 1,644 of 2,000 concept hits.
+///
+/// The fix is ubiquity suppression rather than a better alias list: an association is kept only if
+/// the concept is *not* ubiquitous in this corpus, or if the document's own evidence is strong
+/// (title/heading) even for a common concept. Computed per corpus, so a niche domain keeps its
+/// broad concepts.
+///
+/// Keep an association when its evidence is at least this fraction of `MAX_WEIGHT`, regardless of
+/// how common the concept is. A page titled "Machine Learning" stays tagged even if the concept is
+/// everywhere; a page that merely says "training" eight times does not.
+pub const UBIQUITY_STRONG_EVIDENCE: f64 = 0.55;
+
+/// Drop a concept's associations when it covers more than this fraction of the tagged corpus.
+///
+/// 0.10 is the line between "a field this corpus discusses" and "vocabulary this corpus is made
+/// of". At 32% (`c-ml`) the concept was noise; at 10% a corpus with 19K documents keeps concepts
+/// that name at most ~1,900 of them, which is still broad enough to be a real topic.
+pub const UBIQUITY_LIMIT: f64 = 0.20;
+
 /// Keep only concepts that carry real weight.
 ///
 /// A concept at 0.12 is one passing mention. Storing it costs a row, dilutes the lane's score, and
