@@ -174,15 +174,21 @@ impl ConceptLane {
         /// Whether two words share a stem, compared on a bounded prefix so "chemical"/"chemistry"
         /// (both stem to "chem") match without letting short words collide wildly.
         fn same_stem(a: &str, b: &str) -> bool {
-            const STEM_LEN: usize = 4;
+            // Compared by *characters*, never bytes. Slicing a `String` at a fixed byte offset
+            // panics on any non-ASCII text: the graded query set contains Russian and Chinese
+            // titles, and `sa[..4]` on "进程程" splits a three-byte character, which aborted the
+            // process mid-benchmark with "byte index 4 is not a char boundary". A panic in a
+            // serving path is worse than a missed match, so this must be char-safe.
+            const STEM_CHARS: usize = 4;
             let (sa, sb) = (stem(a), stem(b));
-            if sa.len() < STEM_LEN || sb.len() < STEM_LEN {
+            let ca: Vec<char> = sa.chars().collect();
+            let cb: Vec<char> = sb.chars().collect();
+            if ca.len() < STEM_CHARS || cb.len() < STEM_CHARS {
                 return sa == sb;
             }
-            sa[..STEM_LEN] == sb[..STEM_LEN] && (sa.starts_with(&sb[..STEM_LEN]) || sb.starts_with(&sa[..STEM_LEN]))
+            ca[..STEM_CHARS] == cb[..STEM_CHARS]
         }
 
-        let term_stems: Vec<String> = terms.iter().map(|t| stem(t)).collect();
         let mut found: Vec<String> = Vec::new();
         let mut stmt = conn
             .prepare(
@@ -228,7 +234,6 @@ impl ConceptLane {
                     })
                 })
                 .unwrap_or(false);
-            let _ = &term_stems;
             if (name_hit || alias_hit) && !found.contains(&id) {
                 found.push(id);
             }
@@ -711,6 +716,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits.len(), 2, "a scalar-only document vanished: {hits:?}");
+    }
+
+    /// A non-ASCII query must not panic. The graded set contains Russian and Chinese titles, and
+    /// an earlier stemmer sliced `String` at a fixed *byte* offset, which panicked mid-benchmark:
+    /// "byte index 4 is not a char boundary; it is inside '程'". A crash in the query path is worse
+    /// than a missed match.
+    #[test]
+    fn a_non_ascii_query_does_not_panic() {
+        let (_d, lane) = corpus(&[("doc", "c-love", 0.7, "direct")]);
+        for q in [
+            "Логи системных компонентов | Kubernetes",
+            "进程程 进程程",
+            "日本語のクエリ",
+            "café ☕ romance",
+            "Ω≈ç√∫˜µ≤≥÷",
+        ] {
+            // Must return, not unwind.
+            let concepts = lane.concepts_for(q).expect("no panic on non-ASCII");
+            let hits = lane.search(q, 5, None).expect("no panic on non-ASCII search");
+            let _ = (concepts, hits);
+        }
     }
 
     /// No associations means no lane at all, rather than an empty lane taking fusion weight.

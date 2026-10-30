@@ -131,7 +131,7 @@ fn build_graph_lane(
 ///
 /// The lane reads each shard's own `doc_concept` table. Federation fuses the shards after retrieval,
 /// so a document's id is the same on every shard and needs no rewriting here.
-fn build_concept_lane(
+pub(crate) fn build_concept_lane(
     cfg: &search_core::config::Config,
 ) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
     // Every root that is actually served, not just the primary: the matrix was built on the fleet,

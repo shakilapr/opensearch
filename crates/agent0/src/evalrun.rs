@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use search_core::contract::SearchRequest;
 use search_eval::{aggregate, load_cases, RunResult};
 
-use crate::{build_dense_lane, build_graph_lane};
+use crate::{build_concept_lane, build_dense_lane, build_graph_lane};
 
 pub struct Options {
     set: PathBuf,
@@ -145,6 +145,13 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     }
     if matches!(opts.lanes.as_str(), "all" | "graph") {
         extra_lanes.extend(build_graph_lane(&cfg));
+    }
+    // The concept lane reads `doc_concept`, the weighted matrix v2 §6 specifies. Measuring it is
+    // the whole point of `--lanes concept`: the lane existed and was tested for a day before
+    // anything served it, so a configuration that cannot be measured is a configuration that
+    // silently does nothing.
+    if matches!(opts.lanes.as_str(), "all" | "concept") {
+        extra_lanes.extend(build_concept_lane(&cfg));
     }
     eprintln!(
         "lanes: {} injected beside the index-backed lanes (--lanes {})",
