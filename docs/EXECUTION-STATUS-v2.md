@@ -101,6 +101,25 @@ such case is in it. The instrument the plan names is the wrong instrument for th
 
 The lane needs a hand-judged cross-disciplinary set before it can be judged at all.
 
+## Cross-disciplinary measurement — the result the other set could not see
+
+The corpus-derived set is built as "this document's title is the query", so lexical search is
+near-optimal on it by construction. The new set is the opposite shape: a conceptual query whose
+answer shares no content word with its title.
+
+| lane | nDCG@10 | recall@10 | vs BM25 |
+|---|---|---|---|
+| BM25 | 0.0645 | 0.1667 | — |
+| **concept** | **0.2500** | **0.3333** | **+0.1855 (3.9×)** |
+| dense | 0.2384 | 0.3333 | +0.1739 (3.7×) |
+
+The semantic lanes are 3.9× better on the shape the architecture exists for, and were noise-to-harm
+on the set that cannot represent that shape. Both facts are true; only the first justifies the
+architecture.
+
+Caveat: n=6. Enough to establish that the lanes do something lexical cannot, not enough to move a
+fusion weight — one case shifts nDCG by ~0.017. Needs ~50 cases.
+
 ## Gates
 
 | Gate | Target | Actual |
