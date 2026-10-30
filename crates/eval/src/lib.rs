@@ -42,6 +42,10 @@ pub enum QueryClass {
     Github,
     Community,
     MultiHop,
+    /// A conceptual query whose answer shares no content word with it — the oxytocin shape from
+    /// PLAN-v2 §5. Kept distinct from `LongSemantic` because it is the class the semantic lanes
+    /// exist for, and mixing it into a title-derived set hides whether they work.
+    CrossDisciplinary,
 }
 
 impl QueryClass {
@@ -60,6 +64,7 @@ impl QueryClass {
             "docs" => Self::Docs,
             "github" => Self::Github,
             "community" => Self::Community,
+            "crossdisciplinary" => Self::CrossDisciplinary,
             "multihop" => Self::MultiHop,
             _ => return None,
         })

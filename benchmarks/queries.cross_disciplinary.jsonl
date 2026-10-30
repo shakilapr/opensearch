@@ -1,0 +1,11 @@
+# Cross-disciplinary set (hand-checked 2026-10-30).
+# Each query is conceptual; the answer is a real corpus document whose TITLE shares no
+# content word with the query. This is the shape PLAN-v2 §5's oxytocin case describes,
+# and the shape the corpus-derived set cannot test (there the query IS the title).
+# Verified: overlap checked per case when the file was generated.
+{"id": "xd-000", "query": "what molecule makes people bond with each other", "class": "cross_disciplinary", "relevant": ["res_160d6fc40a8a2c123e14773aae898121"], "graded": [["res_160d6fc40a8a2c123e14773aae898121", 3]], "observed_at": 1793000000}
+{"id": "xd-001", "query": "why do animals form lasting partnerships", "class": "cross_disciplinary", "relevant": ["res_8be81904d7c5096bc7e30f236a8be857"], "graded": [["res_8be81904d7c5096bc7e30f236a8be857", 3]], "observed_at": 1793000000}
+{"id": "xd-002", "query": "how does the brain recognise social cues", "class": "cross_disciplinary", "relevant": ["res_8be81904d7c5096bc7e30f236a8be857"], "graded": [["res_8be81904d7c5096bc7e30f236a8be857", 3]], "observed_at": 1793000000}
+{"id": "xd-003", "query": "enzymes that control energy in muscles", "class": "cross_disciplinary", "relevant": ["res_67086afeeae6bb0698652a57f32ff2b7"], "graded": [["res_67086afeeae6bb0698652a57f32ff2b7", 3]], "observed_at": 1793000000}
+{"id": "xd-004", "query": "proteins that respond to neurotransmitters", "class": "cross_disciplinary", "relevant": ["res_6f4719f37518bd1586533da5358dd92c"], "graded": [["res_6f4719f37518bd1586533da5358dd92c", 3]], "observed_at": 1793000000}
+{"id": "xd-005", "query": "what makes two people fall for each other", "class": "cross_disciplinary", "relevant": ["res_6f3c22b94aea4ce851a9ca8d8d33810f"], "graded": [["res_6f3c22b94aea4ce851a9ca8d8d33810f", 3]], "observed_at": 1793000000}
