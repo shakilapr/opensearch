@@ -71,6 +71,36 @@ Current fleet storage: **41 GB** (tantivy 17.3, text 15.6, meta 7.2).
 No `crates/features`, `feature`/`doc_feature` empty, no feature postings in the schema. This is the
 v2 core (§5.2/§9/§14) and cannot start until dense vectors exist, because Model B trains on them.
 
+## Graded-set measurements (600 queries, Fast mode, one process per config)
+
+| config | nDCG@10 | Δ vs baseline | recall@10 | MRR | p50 |
+|---|---|---|---|---|---|
+| bm25_only (baseline) | 0.4813 | — | 0.4983 | 0.4757 | 166 ms |
+| dense_only (w=0.8) | 0.4830 | **+0.0017** | 0.4933 | 0.4794 | 206 ms |
+| graph_only (w=0.8) | 0.4813 | +0.0000 | 0.4983 | 0.4757 | 305 ms |
+| concept_only (w=0.8) | 0.4699 | **−0.0114** | 0.4983 | 0.4604 | 170 ms |
+
+The concept lane's harm is monotonic in its weight, so it is not a tuning artifact:
+
+| weight | nDCG@10 |
+|---|---|
+| 0.0 | 0.4813 |
+| 0.1 | 0.4801 |
+| 0.2 | 0.4767 |
+| 0.3 | 0.4766 |
+| 0.8 | 0.4699 |
+
+**Decision: `SEARCH_FUSION_CONCEPT` stays 0.0.** That is now a measured decision, not caution.
+
+**Why it fails here, and why that is not the whole story.** The graded cases are constructed as
+"This document's title is the query" — one known-relevant document per case. A lexical lane is close
+to optimal for that shape, and a concept lane that scores semantic overlap displaces exact-title
+matches with conceptually adjacent pages. So this set *cannot* reward the capability the concept
+lane exists for (find the oxytocin paper for "chemical reactions that affect romance"), because no
+such case is in it. The instrument the plan names is the wrong instrument for this specific gate.
+
+The lane needs a hand-judged cross-disciplinary set before it can be judged at all.
+
 ## Gates
 
 | Gate | Target | Actual |
@@ -79,7 +109,7 @@ v2 core (§5.2/§9/§14) and cannot start until dense vectors exist, because Mod
 | Cross-disciplinary acceptance | oxytocin paper for a romance query | **fails on corpus** — 1.34M docs, 2 with "oxytocin" in the title |
 | Storage ≤15 GB | after Phase C rebuild | 41 GB (rebuild pending) |
 | Dense lane covers corpus | all shards have vectors | 0 of 4 (in progress) |
-| nDCG@10 semantic > BM25 | strictly better on 604 graded queries | **not measured** — requires Phases B and D |
+| nDCG@10 semantic > BM25 | strictly better | **measured: dense +0.0017, graph 0.0000, concept −0.0114** |
 
 ## Honest summary
 
