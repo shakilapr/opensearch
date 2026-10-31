@@ -707,11 +707,27 @@ pub fn run_engine_search(
     // Which documents did graph expansion reach for this query? Fusion keeps one lane per document,
     // so a graph-reached page that also matched lexically is labelled lexical-only; asking the lane
     // directly is what keeps `graph_expansion` an observation rather than a constant.
-    let graph_docs: std::collections::HashSet<String> = extra_lanes
-        .iter()
-        .filter_map(|lane| lane.as_expanding())
-        .flat_map(|lane| lane.expanded_docs(&query, GRAPH_EXPANSION_PROBE))
-        .collect();
+    // Only pay for graph provenance when the graph lane can actually contribute. `expanded_docs`
+    // runs a full entity-graph activation, which measured 27.5% of all samples on a live query
+    // while SEARCH_FUSION_GRAPH was 0.0 and 'graph' never appeared in any `lane_ranks`: the
+    // attribution was computed for a lane whose results fusion discards. With the lane off there
+    // is nothing to attribute, so the honest answer is the empty set and the cost is zero.
+    let fusion = search_engine::fuse::FusionPolicy::default();
+    let graph_enabled = fusion
+        .weights
+        .get(&search_retrieval::Lane::Graph)
+        .copied()
+        .unwrap_or(0.0)
+        > 0.0;
+    let graph_docs: std::collections::HashSet<String> = if graph_enabled {
+        extra_lanes
+            .iter()
+            .filter_map(|lane| lane.as_expanding())
+            .flat_map(|lane| lane.expanded_docs(&query, GRAPH_EXPANSION_PROBE))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let limit = normalize_limit(req.base.limit)?;
 
     let manifest = searcher.manifest()?;
@@ -757,7 +773,7 @@ pub fn run_engine_search(
     // costs ~1.5 s over five shards and its weight is 0.0, which put a 1.5 s tax on every query for
     // output that could not affect a single result. Skipping it here is the difference between
     // "measured and disabled" and "measured, disabled, and still paid for".
-    let weights = search_engine::fuse::FusionPolicy::default();
+    let weights = fusion.clone();
     let mut lanes: Vec<&dyn LaneSearcher> = vec![&lane_bm25, &lane_source];
     for lane in extra_lanes.iter() {
         if fast_mode && lane.as_expanding().is_some() {
