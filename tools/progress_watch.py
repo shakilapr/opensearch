@@ -347,7 +347,21 @@ def collect() -> dict:
         # stalled shard used to look running; the socket count also misses a wedged crawler that
         # holds a connection open. `ingest_age` cannot be faked by error output.
         ingest_age = last_ingest_age_s(s)
-        stalled = (ingest_age is not None and ingest_age > INGEST_STALL_S) or (
+        # Ingest age alone is not enough to call a shard dead. A crawl working through a
+        # robots-denied region legitimately ingests nothing for half an hour while advancing the
+        # frontier: measured 2026-10-31, shards 1 and 3 showed 1900 s without an ingest and were
+        # flagged STALLED while both were writing robots-denial lines right up to the current
+        # second. The 429 case that started this is different in kind: the log stays fresh with
+        # rate-limit warnings and nothing else, because the same origins are retried forever.
+        # So: no ingest AND the recent log is dominated by rate limiting.
+        rate_limit_loop = False
+        if ingest_age is not None and ingest_age > INGEST_STALL_S and logf.exists():
+            rc, recent = sh(f"tail -200 {logf} | grep -c 'HTTP 429'")
+            try:
+                rate_limit_loop = int(recent.strip() or 0) >= 20
+            except ValueError:
+                rate_limit_loop = False
+        stalled = rate_limit_loop or (
             age is not None and age > SHARD_STALL_S and sockets == 0
         )
         entry = {
@@ -357,6 +371,7 @@ def collect() -> dict:
             "pid": proc or None,
             "log_age_s": age,
             "ingest_age_s": ingest_age,
+            "rate_limit_loop": rate_limit_loop,
             "sockets": sockets,
             "stalled": stalled,
             "running": bool(proc) and not stalled,
