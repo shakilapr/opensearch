@@ -144,6 +144,19 @@ pub trait LaneSearcher: Send + Sync {
     fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
         None
     }
+
+    /// Which fusion lane this searcher contributes to, when it knows.
+    ///
+    /// Lets the caller skip a lane whose fusion weight is zero *before* paying for it. `fuse` drops
+    /// zero-weight lanes at scoring time, so a lane that is not skipped still does all its work and
+    /// then has its output discarded: measured 2026-10-31, the concept lane cost ~1.5 s per query
+    /// over five shards while its weight was 0.0, a tax on every request for no possible effect.
+    ///
+    /// Defaults to `None` — "unknown, run it". A lane that does not declare its identity is never
+    /// silently dropped, so this cannot be the reason a result goes missing.
+    fn lane_hint(&self) -> Option<Lane> {
+        None
+    }
 }
 
 /// A lane that can name the documents it reached, independently of how fusion labelled them.

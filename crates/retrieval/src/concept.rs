@@ -348,6 +348,10 @@ impl ConceptLane {
 }
 
 impl LaneSearcher for ConceptLane {
+    fn lane_hint(&self) -> Option<Lane> {
+        Some(Lane::Concept)
+    }
+
     fn search(
         &self,
         query: &str,
@@ -427,6 +431,10 @@ impl FederatedConceptLane {
 }
 
 impl LaneSearcher for FederatedConceptLane {
+    fn lane_hint(&self) -> Option<Lane> {
+        Some(Lane::Concept)
+    }
+
     fn search(
         &self,
         query: &str,

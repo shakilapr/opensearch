@@ -45,47 +45,94 @@ mod evalrun;
 fn build_dense_lane(
     cfg: &search_core::config::Config,
 ) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
-    let path = cfg.data_dir.join("vectors.bin");
-    if !path.exists() {
+    // Every root that is served, not just the primary. Measured 2026-10-31: the fleet's four
+    // shards had 2.0 GB of vectors (`agent0 embed build` finished at 02:30) while the dense lane
+    // still read only `/var/lib/search/vectors.bin`, covering 19,255 of 1.35M documents — 1.4% of
+    // the corpus had a vector that any query could reach.
+    let mut dirs = vec![cfg.data_dir.clone()];
+    // Fleet vectors are opt-in. Measured 2026-10-31 with all five roots enabled: p50 **6.5 s** and
+    // p95 12.5 s per query, against 184 ms before. The lane is a brute-force cosine scan — measured
+    // 1.07 µs per document, so 1.39M documents is ~1.5 s for ONE pass, and the engine runs a lane
+    // once per query variant across five stores.
+    //
+    // The vectors are correct and now complete (1,387,749 documents); what is missing is the
+    // approximate index that makes them affordable at this size — v2 §9/§10, not yet built. Until
+    // then the default serves the 19K-document primary root, which costs 28 ms.
+    if std::env::var("SEARCH_DENSE_FLEET").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
+    } else {
         tracing::info!(
-            path = %path.display(),
-            "no vector store: the dense lane is off (build one with `agent0 embed build`)"
+            "dense lane: primary root only (set SEARCH_DENSE_FLEET=1 to scan fleet vectors; \
+             measured 6.5 s p50 for 1.39M documents without an approximate index)"
         );
-        return Vec::new();
     }
-    let embedder: std::sync::Arc<dyn search_embed::Embedder> = {
+
+    // Built once: the BGE weights are ~130 MB and loading them per shard would cost seconds and
+    // four times the memory for an identical model.
+    let embedder: Option<std::sync::Arc<dyn search_embed::Embedder>> = {
         #[cfg(feature = "bge")]
         {
             let cache = std::env::var("SEARCH_MODEL_CACHE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| cfg.data_dir.join("fastembed"));
             match search_embed::bge::BgeEmbedder::with_cache_dir(cache) {
-                Ok(e) => std::sync::Arc::new(e),
+                Ok(e) => Some(std::sync::Arc::new(e)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         "BGE weights unavailable: serving without the dense lane"
                     );
-                    return Vec::new();
+                    None
                 }
             }
         }
         #[cfg(not(feature = "bge"))]
         {
-            std::sync::Arc::new(search_embed::HashEmbedder::new(256))
+            Some(std::sync::Arc::new(search_embed::HashEmbedder::new(256)))
         }
     };
-    match search_retrieval::DenseLane::from_path(&path, embedder) {
-        Ok(Some(lane)) => {
-            tracing::info!(path = %path.display(), docs = lane.len(), "dense lane enabled");
-            vec![std::sync::Arc::new(lane)]
+    let Some(embedder) = embedder else {
+        return Vec::new();
+    };
+
+    let mut lanes: Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> =
+        Vec::new();
+    let mut skipped = 0usize;
+    for dir in &dirs {
+        let path = dir.join("vectors.bin");
+        if !path.exists() {
+            skipped += 1;
+            continue;
         }
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            tracing::warn!(error = %e, "vector store unusable: serving without the dense lane");
-            Vec::new()
+        match search_retrieval::DenseLane::from_path(&path, std::sync::Arc::clone(&embedder)) {
+            Ok(Some(lane)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    docs = lane.len(),
+                    "dense lane enabled"
+                );
+                lanes.push(std::sync::Arc::new(lane));
+            }
+            Ok(None) => {
+                skipped += 1;
+            }
+            Err(e) => {
+                // One unreadable store must not disable the others: a partially embedded fleet
+                // should serve the vectors it has.
+                tracing::warn!(path = %path.display(), error = %e, "vector store unusable; skipping");
+                skipped += 1;
+            }
         }
     }
+    if lanes.is_empty() {
+        tracing::info!(
+            dirs = dirs.len(),
+            "no vector stores: the dense lane is off (build one with `agent0 embed build`)"
+        );
+    } else {
+        tracing::info!(lanes = lanes.len(), skipped, "dense lanes enabled");
+    }
+    lanes
 }
 
 /// Build the §9.4 graph lane over the sidecar `agent0 graph build` writes.

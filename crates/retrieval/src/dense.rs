@@ -84,6 +84,10 @@ impl DenseLane {
 }
 
 impl LaneSearcher for DenseLane {
+    fn lane_hint(&self) -> Option<Lane> {
+        Some(Lane::Dense)
+    }
+
     fn search(
         &self,
         query: &str,

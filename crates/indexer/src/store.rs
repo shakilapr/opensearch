@@ -702,8 +702,13 @@ impl Indexer {
     /// A term lookup on `doc_id`, scoped to the same base-then-overlay order `doc_text` uses, so a
     /// newer overlay copy wins. Returns `None` for an unknown id or a tombstoned document.
     pub fn doc_by_id(&self, doc_id: &str) -> AppResult<Option<IndexDoc>> {
+        // No `reload()` here, deliberately. This runs once per candidate a semantic lane returns,
+        // and `reload()` stats/opens segments — expensive against an index a crawler is writing.
+        // Measured 2026-10-31: a query with the dense lane at weight 0.5 took **2.4 s** versus
+        // 0.49 s with it off, because each of its candidates probed every federated shard and each
+        // probe reloaded. Serving a document committed microseconds ago is not worth a 2 s tax: the
+        // readers are refreshed by the search path itself, which is where freshness matters.
         for reader in [&self.overlay_reader, &self.base_reader] {
-            reader.reload().ix()?;
             let searcher = reader.searcher();
             let term = Term::from_field_text(self.fields.doc_id, doc_id);
             let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
@@ -724,7 +729,12 @@ impl Indexer {
             let url = text(self.fields.url);
             let title = text(self.fields.title);
             let source_id = text(self.fields.source_id);
-            let body = text(self.fields.body);
+            // The body is deliberately NOT read. It is STORED and can be 1.8 MB; a caller that
+            // wants a document's metadata (a semantic lane's candidate, which the engine renders as
+            // a result row) does not want the article, and `doc_text` exists for callers that do.
+            // Measured 2026-10-31: fetching it here made the dense lane cost ~1.7 s per query,
+            // because every candidate the lane returned pulled its whole body through `doc()`.
+            let body = String::new();
             let resource_id = text(self.fields.resource_id);
             let content_id = text(self.fields.content_id);
             let work_id = text(self.fields.work_id);

@@ -168,6 +168,10 @@ impl ExpandingLane for GraphLaneSearcher {
 }
 
 impl LaneSearcher for GraphLaneSearcher {
+    fn lane_hint(&self) -> Option<search_retrieval::Lane> {
+        Some(search_retrieval::Lane::Graph)
+    }
+
     fn as_expanding(&self) -> Option<&dyn ExpandingLane> {
         Some(self)
     }

@@ -40,10 +40,17 @@ pub use indexer_adapter::IndexerSearcher;
 /// [`serve`] can call it again safely. Logs go to stderr; no credentials or
 /// document bodies are ever logged by this crate.
 pub fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // ANSI only to a terminal. `tracing_subscriber::fmt()` colours unconditionally by default, so
+    // every crawler log written through `>> shard-N.log` contained escape sequences: the field
+    // values came out as `origin=\x1b[2m\x1b[0mhttps://host`, which defeated grep, awk and the
+    // progress watcher's own parsing. Measured 2026-10-31 while diagnosing a stall: the watcher
+    // could not read a single ingest timestamp out of a log it had been writing for days.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
         .try_init();
 }

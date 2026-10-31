@@ -752,10 +752,22 @@ pub fn run_engine_search(
     // so this needs no lane registry and cannot accidentally drop another lane.
     let fast_mode = matches!(req.mode, EngineMode::Fast);
     let graph_skipped = fast_mode && extra_lanes.iter().any(|l| l.as_expanding().is_some());
+    // A lane whose fusion weight is zero is never *run*. `fuse` already skipped it when scoring,
+    // so its results were computed and then thrown away: measured 2026-10-31, the concept lane
+    // costs ~1.5 s over five shards and its weight is 0.0, which put a 1.5 s tax on every query for
+    // output that could not affect a single result. Skipping it here is the difference between
+    // "measured and disabled" and "measured, disabled, and still paid for".
+    let weights = search_engine::fuse::FusionPolicy::default();
     let mut lanes: Vec<&dyn LaneSearcher> = vec![&lane_bm25, &lane_source];
     for lane in extra_lanes.iter() {
         if fast_mode && lane.as_expanding().is_some() {
             continue;
+        }
+        // No weight, no work. `fuse` would discard the output anyway.
+        if let Some(id) = lane.lane_hint() {
+            if weights.weights.get(&id).copied().unwrap_or(0.0) == 0.0 {
+                continue;
+            }
         }
         lanes.push(&**lane as &dyn LaneSearcher);
     }

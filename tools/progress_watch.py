@@ -22,6 +22,7 @@ Usage:  python3 tools/progress_watch.py [--interval 300] [--once] [--no-dispatch
 from __future__ import annotations
 
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -62,6 +63,13 @@ CRAWL_ORIGIN_CAP = 250
 # threads on futex_wait_queue, zero open sockets, zero index writes) — a wedged process, not a
 # slow one. 5 minutes is far longer than any healthy gap between ingested documents.
 SHARD_STALL_S = 300
+
+# A crawler is alive only if it INGESTS. Log freshness was the old liveness test and it is wrong:
+# a shard stuck in a 429 backoff loop writes a warning every five minutes, so its log is always
+# fresh while it ingests nothing. Measured 2026-10-31: shard-1 and shard-2 had 0 ingests and ~92
+# rate-limit warnings each over two hours, and the watcher reported them as running for 11 hours
+# because the log kept moving. Thirty minutes without an ingest is a stall.
+INGEST_STALL_S = 1800
 SIDECAR_LOG = DATA / "sidecar-build.log"
 # The user's stated failure criterion: below this, the box is being wasted, whatever the
 # throughput number says. The supervisor must measure it, report it as a failure, act on what it
@@ -182,6 +190,33 @@ def ram_utilization() -> float | None:
 
 
 # --------------------------------------------------------------------------- metrics
+
+
+def last_ingest_age_s(shard: int) -> int | None:
+    """Seconds since this shard last ingested a document, or None when it never has.
+
+    This is the honest liveness signal. `log_age_s` measures file writes, and a shard that only
+    writes rate-limit warnings looks perfectly healthy by that measure while producing nothing.
+    """
+    logf = FLEET / f"shard-{shard}.log"
+    if not logf.exists():
+        return None
+    # Tail, then scan backwards: the logs are hundreds of MB and grow during the read.
+    # Strip ANSI: logs written before the crawler stopped colouring non-TTY output contain
+    # `\x1b[2m` before the timestamp, which made every parse attempt return None.
+    rc, out = sh(f"grep 'ingested new document' {logf} | tail -1 | sed -r 's/\\x1b\\[[0-9;]*m//g'")
+    line = out.strip()
+    if not line:
+        return None
+    # `2026-10-31T04:05:17.793987Z  INFO ingested new document ...`
+    stamp = line.split(" ", 1)[0].rstrip("Z")
+    try:
+        when = datetime.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0, int((datetime.datetime.now(datetime.timezone.utc) - when).total_seconds()))
 
 
 def shard_docs(shard: int) -> int | None:
@@ -308,13 +343,20 @@ def collect() -> dict:
                 sockets = int(out.strip().splitlines()[0])
             except (ValueError, IndexError):
                 sockets = None
-        stalled = age is not None and age > SHARD_STALL_S and sockets == 0
+        # Liveness by ingest, not by file mtime. A 429 loop keeps the log fresh forever, so a
+        # stalled shard used to look running; the socket count also misses a wedged crawler that
+        # holds a connection open. `ingest_age` cannot be faked by error output.
+        ingest_age = last_ingest_age_s(s)
+        stalled = (ingest_age is not None and ingest_age > INGEST_STALL_S) or (
+            age is not None and age > SHARD_STALL_S and sockets == 0
+        )
         entry = {
             "docs": docs,
             "raw_bytes": dir_bytes(REPO / "raw-dataset" / f"shard-{s}"),
             "pack_records": pack_records(s),
             "pid": proc or None,
             "log_age_s": age,
+            "ingest_age_s": ingest_age,
             "sockets": sockets,
             "stalled": stalled,
             "running": bool(proc) and not stalled,

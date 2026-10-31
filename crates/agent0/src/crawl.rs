@@ -159,6 +159,20 @@ const BASE_RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
 /// Ceiling for the exponential per-origin rate-limit backoff.
 const MAX_RATE_LIMIT_BACKOFF_MS: u64 = 300_000;
 
+/// Consecutive 429s after which an origin is retired for the rest of the run.
+///
+/// Without this the crawler deadlocks against a handful of hosts. Measured 2026-10-31: shard-1 and
+/// shard-2 sat at **0 ingests and ~92 rate-limit warnings per 2 hours**, with backoff levels
+/// reaching **214** on `viconisdz.com` (845 warnings), `hobbii.no` (758) and `seniorsite.org`
+/// (744). `rate_limit_backoff` caps the delay at 300 s, so every 5 minutes each of those origins
+/// re-enters the ready queue, gets another 429, and consumes a dispatch slot — while 2.3M
+/// dispatchable URLs wait behind them.
+///
+/// A host that has refused eight times in a row is not going to start answering within this run,
+/// and continuing to ask is both useless and impolite. Retiring it converts an unbounded stall into
+/// a bounded loss of that host's URLs.
+const RATE_LIMIT_RETIRE_AFTER: u32 = 8;
+
 /// Discovery fan-out bounds (mirror the pipeline's own limits).
 const MAX_SITEMAPS: usize = 8;
 const MAX_CHILD_SITEMAPS: usize = 16;
@@ -847,6 +861,8 @@ struct Drainer {
     /// after an HTTP 429. This only ever *adds* delay on top of
     /// `opts.origin_interval`; it never shortens the configured floor.
     backoff_until: HashMap<String, Instant>,
+    /// Origins that answered 429 too many times in a row and are no longer asked this run.
+    rate_limit_retired: std::collections::HashSet<String>,
     /// Consecutive 429s per origin, driving the exponential backoff. Cleared by
     /// any healthy (`ingested`/`unchanged`) response from that origin.
     backoff_level: HashMap<String, u32>,
@@ -903,6 +919,7 @@ impl Drainer {
             in_flight: 0,
             origin_attempts: HashMap::new(),
             backoff_until: HashMap::new(),
+            rate_limit_retired: std::collections::HashSet::new(),
             backoff_level: HashMap::new(),
             attempts: 0,
             ingested: 0,
@@ -1206,6 +1223,11 @@ impl Drainer {
             }
             // Rate-limit backoff: an origin that answered 429 is skipped until its delay
             // elapses. The slot goes to whichever other origin is ready — that is the point.
+            if self.rate_limit_retired.contains(&o) {
+                // Retired: never asked again this run. The origin's queued URLs simply stop being
+                // offered, which is what lets the remaining 2.3M URLs through.
+                continue;
+            }
             if let Some(until) = self.backoff_until.get(&o) {
                 if now < *until {
                     self.ready.push_back(o);
@@ -1301,6 +1323,15 @@ impl Drainer {
             self.backoff_until
                 .insert(per.origin.clone(), Instant::now() + delay);
             self.counters.rate_limited += 1;
+            if *level >= RATE_LIMIT_RETIRE_AFTER && self.rate_limit_retired.insert(per.origin.clone())
+            {
+                tracing::warn!(
+                    target: "agent0::crawl",
+                    origin = %per.origin,
+                    level = *level,
+                    "HTTP 429 repeatedly: retiring this origin for the rest of the run"
+                );
+            }
             tracing::warn!(
                 target: "agent0::crawl",
                 origin = %per.origin,
@@ -2372,6 +2403,34 @@ mod tests {
     }
 
     #[test]
+    /// An origin that keeps answering 429 is retired instead of being retried forever.
+    ///
+    /// Measured 2026-10-31: eight hostile origins held both stalled shards at zero throughput while
+    /// 2.3M dispatchable URLs waited. The backoff delay caps at 300 s, so without retirement each
+    /// of those origins re-enters the queue every five minutes indefinitely.
+    #[test]
+    fn the_retirement_threshold_is_reachable_and_small() {
+        // The bug was an unbounded counter (observed level 214) with a capped delay, so the guard
+        // has to fire at a level a real crawl actually reaches.
+        assert!(
+            RATE_LIMIT_RETIRE_AFTER >= 3,
+            "retiring on the first 429 would drop hosts that are merely busy"
+        );
+        assert!(
+            RATE_LIMIT_RETIRE_AFTER <= 16,
+            "a threshold above 16 lets a hostile host hold a dispatch slot for over an hour"
+        );
+        // Retirement happens after a genuine backoff, not instead of one: by the threshold the
+        // delay is minutes, so a host is never dropped without having been given time to recover.
+        // At level 8 the exponential is 128 s; the 300 s cap is reached by level 9.
+        let d = rate_limit_backoff(None, RATE_LIMIT_RETIRE_AFTER);
+        assert!(
+            d.as_secs() >= 60,
+            "backoff at the retirement threshold should be minutes, got {:?}",
+            d
+        );
+    }
+
     fn rate_limit_backoff_honours_retry_after_and_caps() {
         // `Retry-After` wins outright over the exponential value.
         assert_eq!(rate_limit_backoff(Some(3), 1), Duration::from_secs(3));
