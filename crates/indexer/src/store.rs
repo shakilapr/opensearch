@@ -49,6 +49,20 @@ fn writer_budget() -> usize {
 const MANIFEST_FILE: &str = "_manifest.json";
 const SCHEMA_HASH_FILE: &str = "_schema_hash";
 
+/// Minimum interval between reader refreshes on a **read-only** index, in milliseconds.
+///
+/// `reload()` asks the index for its latest segments and reopens any that changed. Against a static
+/// index that is nearly free; against one a crawler commits to every second it means reopening
+/// segments on every lane call, every query variant and every engine round.
+///
+/// Measured 2026-10-31, same query, same binary:
+///   crawlers paused → 0.49 s    crawlers ingesting → 11.5 s   (load 0.88, so not CPU)
+/// Freshness inside half a second is invisible to a search result; 23× latency is not.
+///
+/// A writer-holding `Indexer` is never throttled (see `refresh_readers`): a caller that just
+/// committed expects to see its own commit, which is what the tombstone and watermark tests assert.
+const RELOAD_THROTTLE_MS: u64 = 500;
+
 /// Paths for the two indices.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
@@ -283,6 +297,8 @@ pub struct Indexer {
     overlay_writer: Option<Mutex<IndexWriter>>,
     base_reader: IndexReader,
     overlay_reader: IndexReader,
+    /// Unix ms of the last reader refresh, for [`Indexer::refresh_readers`].
+    last_reload_ms: std::sync::atomic::AtomicU64,
     state: Mutex<State>,
 }
 
@@ -316,6 +332,7 @@ impl Indexer {
             base_writer,
             overlay_writer,
             base_reader,
+            last_reload_ms: std::sync::atomic::AtomicU64::new(0),
             overlay_reader,
             state: Mutex::new(State { manifest }),
         })
@@ -489,9 +506,34 @@ impl Indexer {
 
     /// Search base + overlay, dedupe by `doc_id` keeping the newest version,
     /// drop tombstones and not-yet-visible docs, tag each hit with provenance.
-    pub fn search(&self, query: &str, limit: usize) -> AppResult<Vec<SearchResult>> {
+    /// Refresh both readers before a read.
+    ///
+    /// A read-only `Indexer` (the serving path, and every federated shard) throttles to
+    /// [`RELOAD_THROTTLE_MS`] so a busy crawl cannot make every query reopen segments. An
+    /// `Indexer` holding writers always reloads, because its caller may have just committed and
+    /// the read-your-writes contract is what the watermark and tombstone tests pin.
+    fn refresh_readers(&self) -> AppResult<()> {
+        if self.base_writer.is_some() {
+            self.base_reader.reload().ix()?;
+            self.overlay_reader.reload().ix()?;
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_reload_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < RELOAD_THROTTLE_MS {
+            return Ok(());
+        }
         self.base_reader.reload().ix()?;
         self.overlay_reader.reload().ix()?;
+        self.last_reload_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> AppResult<Vec<SearchResult>> {
+        self.refresh_readers()?;
         let watermark = self.visible_generation();
 
         let fetch = limit.clamp(1, 1000) * 4 + 16;
