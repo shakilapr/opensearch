@@ -37,6 +37,10 @@ search-eval = { path = "../eval" }
 # Stage-1 §21 browser escalation (mock by default; real Chromium behind `chromium`).
 search-browser = { path = "../browser" }
 search-retrieval = { path = "../retrieval" }
+# v2 §5.2/§9 learned sparse features: `agent0 features train|build`.
+search-features = { path = "../features" }
+# Already in the graph via Tantivy; the feature build encodes chunks in parallel.
+rayon = "1"
 # Stage-3 freshness scheduler wired into the crawl loop.
 search-scheduler = { path = "../scheduler" }
 # Stage-4 deep navigation (Navigator + SearchExecutor over the index).

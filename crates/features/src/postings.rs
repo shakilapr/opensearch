@@ -76,11 +76,49 @@ pub struct SparseIndex {
 }
 
 impl SparseIndex {
+    /// An empty index with room for `features` postings.
+    ///
+    /// Used by the streaming build, where the document count is only known once every chunk has
+    /// been pushed; `build` is a thin wrapper over this so there is one code path for the
+    /// postings invariants (ascending doc index, `df` always agreeing with the lists).
+    pub fn new(features: usize) -> Self {
+        Self { docs: Vec::new(), postings: vec![Vec::new(); features], df: vec![0; features] }
+    }
+
+    /// Append one already-coded document and return its index.
+    ///
+    /// The doc index is the insertion order, so a caller that pushes in sorted-id order gets a
+    /// file identical to [`SparseIndex::build`]'s. Hits outside the vocabulary are ignored rather
+    /// than panicking: a postings build must not be abortable by a stale encoder.
+    pub fn push_coded(
+        &mut self,
+        doc_id: String,
+        source_id: Option<String>,
+        hits: &[FeatureHit],
+    ) -> u32 {
+        let idx = self.docs.len() as u32;
+        self.docs.push(DocRef { doc_id, source_id });
+        for h in hits {
+            let f = h.feature as usize;
+            if f >= self.postings.len() {
+                continue;
+            }
+            self.postings[f].push((idx, quantise(h.activation)));
+            self.df[f] += 1;
+        }
+        idx
+    }
+
     /// Build an index over `entries`, keeping the `active` strongest features of each document.
     ///
     /// Entries may arrive in any order; the build sorts by document id so the output file is
     /// reproducible. Documents whose text yielded no vector at all (zero vector) contribute no
     /// postings — an empty document must not become a wildcard match.
+    ///
+    /// This collects every vector it is given, so it is the right call for a corpus that fits in
+    /// memory. `agent0 features build` uses [`SparseIndex::push_coded`] directly instead: a
+    /// 350K-document shard's vectors do not fit beside the store they came from, and holding both
+    /// made the build die on the memory cgroup rather than finish.
     pub fn build<I>(entries: I, encoder: &Encoder, active: usize) -> Result<Self, PostingsError>
     where
         I: IntoIterator<Item = (String, Option<String>, Vec<f32>)>,
@@ -96,23 +134,11 @@ impl SparseIndex {
             .map(|(_, _, v)| encoder.encode(v, active))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let features = encoder.features();
-        let mut postings: Vec<Vec<(u32, u8)>> = vec![Vec::new(); features];
-        let mut df = vec![0u32; features];
-        for (i, hits) in coded.iter().enumerate() {
-            for h in hits {
-                let q = quantise(h.activation);
-                postings[h.feature as usize].push((i as u32, q));
-                df[h.feature as usize] += 1;
-            }
+        let mut index = Self::new(encoder.features());
+        for ((doc_id, source_id, _), hits) in rows.into_iter().zip(coded.iter()) {
+            index.push_coded(doc_id, source_id, hits);
         }
-        // Parallel iteration above completes before this loop; each list is already ascending in
-        // doc index because `i` ascends.
-        let docs = rows
-            .into_iter()
-            .map(|(doc_id, source_id, _)| DocRef { doc_id, source_id })
-            .collect();
-        Ok(Self { docs, postings, df })
+        Ok(index)
     }
 
     /// Number of documents.
@@ -137,8 +163,12 @@ impl SparseIndex {
 
     /// The `n` features with the most postings — the ones whose lists dominate a scan.
     pub fn heaviest_features(&self, n: usize) -> Vec<(u32, u32)> {
-        let mut v: Vec<(u32, u32)> =
-            self.df.iter().enumerate().map(|(f, d)| (f as u32, *d)).collect();
+        let mut v: Vec<(u32, u32)> = self
+            .df
+            .iter()
+            .enumerate()
+            .map(|(f, d)| (f as u32, *d))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v.truncate(n);
         v
@@ -166,7 +196,9 @@ impl SparseIndex {
         let mut touched: Vec<u32> = Vec::new();
         for h in query {
             let f = h.feature as usize;
-            let Some(list) = self.postings.get(f) else { continue };
+            let Some(list) = self.postings.get(f) else {
+                continue;
+            };
             if list.is_empty() {
                 continue;
             }
@@ -192,7 +224,11 @@ impl SparseIndex {
         out.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.docs[a.0 as usize].doc_id.cmp(&self.docs[b.0 as usize].doc_id))
+                .then_with(|| {
+                    self.docs[a.0 as usize]
+                        .doc_id
+                        .cmp(&self.docs[b.0 as usize].doc_id)
+                })
         });
         out.truncate(limit);
         out.into_iter()
@@ -260,7 +296,9 @@ impl SparseIndex {
         let mut magic = [0u8; 9];
         r.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            return Err(PostingsError::Format("not a postings index (bad magic)".into()));
+            return Err(PostingsError::Format(
+                "not a postings index (bad magic)".into(),
+            ));
         }
         let features = read_u32(&mut r)? as usize;
         let docs_len = read_u64(&mut r)? as usize;
@@ -273,17 +311,17 @@ impl SparseIndex {
                 .map_err(|e| PostingsError::Format(format!("doc id is not UTF-8: {e}")))?;
             let mut flag = [0u8; 1];
             r.read_exact(&mut flag)?;
-            let source_id = if flag[0] == 1 {
-                let len = read_u32(&mut r)? as usize;
-                let mut s = vec![0u8; len];
-                r.read_exact(&mut s)?;
-                Some(
-                    String::from_utf8(s)
-                        .map_err(|e| PostingsError::Format(format!("source id is not UTF-8: {e}")))?,
-                )
-            } else {
-                None
-            };
+            let source_id =
+                if flag[0] == 1 {
+                    let len = read_u32(&mut r)? as usize;
+                    let mut s = vec![0u8; len];
+                    r.read_exact(&mut s)?;
+                    Some(String::from_utf8(s).map_err(|e| {
+                        PostingsError::Format(format!("source id is not UTF-8: {e}"))
+                    })?)
+                } else {
+                    None
+                };
             docs.push(DocRef { doc_id, source_id });
         }
         let mut postings = Vec::with_capacity(features);
@@ -363,7 +401,13 @@ mod tests {
         train(
             &samples,
             8,
-            &TrainOptions { features: 32, active: 4, epochs: 8, batch: 32, ..Default::default() },
+            &TrainOptions {
+                features: 32,
+                active: 4,
+                epochs: 8,
+                batch: 32,
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -386,11 +430,11 @@ mod tests {
         let hits = index.search(&q, 5, None);
         assert!(!hits.is_empty());
         assert!(hits[0].1 > 0.0);
-        let cluster = |id: &str| -> usize {
-            id.trim_start_matches("doc-").parse::<usize>().unwrap() % 4
-        };
+        let cluster =
+            |id: &str| -> usize { id.trim_start_matches("doc-").parse::<usize>().unwrap() % 4 };
         assert!(
-            hits.iter().all(|(id, _)| cluster(id) == cluster(&rows[probe].0)),
+            hits.iter()
+                .all(|(id, _)| cluster(id) == cluster(&rows[probe].0)),
             "every top hit must come from the query's cluster: {hits:?}"
         );
         // Every document in the cluster carries the same code, so *which* one leads a five-item

@@ -104,6 +104,14 @@ impl VectorStore {
         self.entries.iter().find(|e| e.doc_id == doc_id).map(|e| e.v.as_slice())
     }
 
+    /// Every entry, in file order.
+    ///
+    /// The feature build needs the documents *and* their vectors to project a whole shard through
+    /// `W`; going through `get` per id would be a linear scan per document.
+    pub fn entries(&self) -> &[VectorEntry] {
+        &self.entries
+    }
+
     /// The source that owns `doc_id`, when known.
     pub fn source_of(&self, doc_id: &str) -> Option<&str> {
         self.entries

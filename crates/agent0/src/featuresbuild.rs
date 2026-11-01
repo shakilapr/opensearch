@@ -19,6 +19,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use rayon::prelude::*;
+
 use search_core::config::Config;
 use search_embed::VectorStore;
 use search_features::{train, Encoder, SparseIndex, TrainOptions};
@@ -85,7 +87,10 @@ pub fn run_train(args: &[String]) -> ExitCode {
     let vector_paths: Vec<PathBuf> = match f.get("vectors") {
         Some(list) => list.split(',').map(PathBuf::from).collect(),
         None => {
-            let mut v: Vec<PathBuf> = roots(&cfg).into_iter().map(|d| d.join("vectors.bin")).collect();
+            let mut v: Vec<PathBuf> = roots(&cfg)
+                .into_iter()
+                .map(|d| d.join("vectors.bin"))
+                .collect();
             v.retain(|p| p.is_file());
             v
         }
@@ -235,21 +240,31 @@ pub fn run_build(args: &[String]) -> ExitCode {
     let encoder = match Encoder::load(&encoder_path) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("{}: {e} (train one with `agent0 features train`)", encoder_path.display());
+            eprintln!(
+                "{}: {e} (train one with `agent0 features train`)",
+                encoder_path.display()
+            );
             return ExitCode::from(2);
         }
     };
     let active = usize_flag(&f, "active", encoder.active());
     let limit = f.get("limit").and_then(|v| v.parse::<usize>().ok());
     let forward = f.contains_key("forward-index");
-    let model_id = f.get("model-id").cloned().unwrap_or_else(|| "model-b".to_string());
+    let model_id = f
+        .get("model-id")
+        .cloned()
+        .unwrap_or_else(|| "model-b".to_string());
     let version = usize_flag(&f, "version", 1) as i64;
 
     let mut built = 0usize;
     for dir in &dirs {
         let vectors = dir.join("vectors.bin");
         if !vectors.is_file() {
-            eprintln!("{}: no vectors.bin (run `agent0 embed build --out {}` first)", dir.display(), vectors.display());
+            eprintln!(
+                "{}: no vectors.bin (run `agent0 embed build --out {}` first)",
+                dir.display(),
+                vectors.display()
+            );
             continue;
         }
         let store = match VectorStore::load(&vectors) {
@@ -269,20 +284,74 @@ pub fn run_build(args: &[String]) -> ExitCode {
             continue;
         }
         let started = std::time::Instant::now();
-        let mut entries: Vec<(String, Option<String>, Vec<f32>)> = store
-            .entries()
-            .iter()
-            .map(|e| (e.doc_id.clone(), e.source_id.clone(), e.v.clone()))
-            .collect();
+        // Sort by document id *first*, then encode chunk by chunk. `SparseIndex::build` would
+        // collect every vector — for a 350K-document shard that is the store plus a second copy of
+        // it, and the process was killed by the memory cgroup (4.1 GB RSS) before it finished.
+        // Only ids are held here: ~30 bytes per document, versus 1.5 KB per vector.
+        let mut order: Vec<usize> = (0..store.len()).collect();
+        order.sort_by(|a, b| store.entries()[*a].doc_id.cmp(&store.entries()[*b].doc_id));
+        order.dedup_by(|a, b| {
+            let same = store.entries()[*a].doc_id == store.entries()[*b].doc_id;
+            if same {
+                // Keep the first occurrence; `dedup_by` removes `a` when it returns true.
+                *b = *a;
+            }
+            same
+        });
         if let Some(n) = limit {
-            entries.truncate(n);
+            order.truncate(n);
         }
-        let index = match SparseIndex::build(entries, &encoder, active) {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("{}: build failed: {e}", dir.display());
+
+        let mut index = SparseIndex::new(encoder.features());
+        let mut forward_writer = match (forward, ForwardWriter::new(dir, &model_id, version, encoder.features())) {
+            (true, Ok(w)) => Some(w),
+            (true, Err(e)) => {
+                eprintln!("  forward index failed: {e}");
                 return ExitCode::from(1);
             }
+            (false, _) => None,
+        };
+        let mut chunk_rows = 0usize;
+        for chunk in order.chunks(BUILD_CHUNK) {
+            // Encode the chunk in parallel, then push in id order: the postings' doc indices must
+            // ascend, and the output file must stay byte-identical between runs.
+            let coded: Vec<Vec<search_features::FeatureHit>> = match chunk
+                .par_iter()
+                .map(|&i| encoder.encode(&store.entries()[i].v, active))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}: encode failed: {e}", dir.display());
+                    return ExitCode::from(1);
+                }
+            };
+            let mut batch: Vec<(String, Vec<search_features::FeatureHit>)> = Vec::with_capacity(chunk.len());
+            for (&i, hits) in chunk.iter().zip(coded.iter()) {
+                let e = &store.entries()[i];
+                index.push_coded(e.doc_id.clone(), e.source_id.clone(), hits);
+                batch.push((e.doc_id.clone(), hits.to_vec()));
+            }
+            if let Some(w) = forward_writer.as_mut() {
+                match w.put_batch(&batch) {
+                    Ok(n) => chunk_rows += n,
+                    Err(err) => {
+                        eprintln!("  forward index failed: {err}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+        }
+        let index = index;
+        let forward_rows = match forward_writer {
+            Some(w) => match w.finish() {
+                Ok(()) => chunk_rows,
+                Err(e) => {
+                    eprintln!("  forward index failed: {e}");
+                    return ExitCode::from(1);
+                }
+            },
+            None => 0,
         };
         let out = dir.join("features").join("postings.bin");
         if let Err(e) = index.save(&out) {
@@ -304,16 +373,10 @@ pub fn run_build(args: &[String]) -> ExitCode {
             out.display()
         );
         if forward {
-            match write_forward_index(dir, &index, &encoder, &model_id, version) {
-                Ok((features, rows)) => println!(
-                    "  forward index: {} feature rows, {} doc_feature rows",
-                    features, rows
-                ),
-                Err(e) => {
-                    eprintln!("  forward index failed: {e}");
-                    return ExitCode::from(1);
-                }
-            }
+            println!(
+                "  forward index: {} feature rows, {forward_rows} doc_feature rows",
+                encoder.features()
+            );
         }
         built += 1;
     }
@@ -324,70 +387,103 @@ pub fn run_build(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write `feature` and `doc_feature` rows for one shard (v2 §4/§5.2/§9).
+/// How many documents a streaming build encodes and writes at a time.
+///
+/// 8,192 documents is ~13 MB of vectors plus ~1 MB of codes: small enough that the build's memory
+/// is dominated by the vector store it is reading rather than by a second copy of it, large enough
+/// that the per-chunk transaction is amortised over ~131K rows.
+const BUILD_CHUNK: usize = 8_192;
+
+/// Writes `feature` and `doc_feature` rows while a build is streaming (v2 §4/§5.2/§9).
 ///
 /// `doc_feature` has a foreign key to `resource`, and a document can legitimately be absent from
-/// a shard's metadata (a vector sidecar built from a pre-rebuild index). Those rows are skipped
-/// by the `WHERE EXISTS` in the insert and counted, rather than aborting the whole shard.
-fn write_forward_index(
-    dir: &Path,
-    index: &SparseIndex,
-    encoder: &Encoder,
-    model_id: &str,
+/// a shard's metadata (a vector sidecar built from a pre-rebuild index). Those rows are skipped by
+/// the `WHERE EXISTS` in the insert and simply do not count, rather than aborting the whole shard.
+///
+/// One transaction per chunk rather than per document: a per-row implicit transaction on 5.6M
+/// rows is minutes of fsync, and one transaction for the whole shard is the memory the streaming
+/// build exists to avoid.
+struct ForwardWriter {
+    conn: rusqlite::Connection,
+    model_id: String,
     version: i64,
-) -> Result<(usize, usize), String> {
-    let db = dir.join("meta").join("meta.sqlite");
-    if !db.is_file() {
-        return Err(format!("{} does not exist", db.display()));
-    }
-    let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
-    conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let space_id = format!("{model_id}-v{version}");
+    space_id: String,
+    now: i64,
+}
 
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    {
-        let mut feat = tx
-            .prepare(
-                "INSERT OR REPLACE INTO feature
-                   (feature_id, model_id, version, space_id, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-            )
-            .map_err(|e| e.to_string())?;
-        for f in 0..encoder.features() as i64 {
-            feat.execute(rusqlite::params![f, model_id, version, space_id, now])
-                .map_err(|e| e.to_string())?;
+impl ForwardWriter {
+    fn new(dir: &Path, model_id: &str, version: i64, features: usize) -> Result<Self, String> {
+        let db = dir.join("meta").join("meta.sqlite");
+        if !db.is_file() {
+            return Err(format!("{} does not exist", db.display()));
         }
+        let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let space_id = format!("{model_id}-v{version}");
+        let w = Self { conn, model_id: model_id.to_string(), version, space_id, now };
+        w.declare_features(features)?;
+        Ok(w)
     }
-    let mut rows = 0usize;
-    {
-        let mut stmt = tx
-            .prepare(
-                "INSERT OR REPLACE INTO doc_feature
-                   (resource_id, feature_id, model_id, version, space_id, activation, created_at)
-                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-                  WHERE EXISTS (SELECT 1 FROM resource r WHERE r.resource_id = ?1)",
-            )
-            .map_err(|e| e.to_string())?;
-        for (doc_id, hits) in index.codes() {
-            for h in hits {
-                rows += stmt
-                    .execute(rusqlite::params![
-                        doc_id,
-                        h.feature as i64,
-                        model_id,
-                        version,
-                        space_id,
-                        h.activation as f64,
-                        now
-                    ])
+
+    /// Register the `feature` rows. Idempotent, so a rebuild of the same space is safe.
+    fn declare_features(&self, features: usize) -> Result<(), String> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        {
+            let mut feat = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO feature
+                       (feature_id, model_id, version, space_id, label, created_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                )
+                .map_err(|e| e.to_string())?;
+            for f in 0..features as i64 {
+                feat.execute(rusqlite::params![f, self.model_id, self.version, self.space_id, self.now])
                     .map_err(|e| e.to_string())?;
             }
         }
+        tx.commit().map_err(|e| e.to_string())
     }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok((encoder.features(), rows))
+
+    /// Write one chunk's rows; returns how many rows actually landed.
+    fn put_batch(&mut self, batch: &[(String, Vec<search_features::FeatureHit>)]) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let mut rows = 0usize;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO doc_feature
+                       (resource_id, feature_id, model_id, version, space_id, activation, created_at)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                      WHERE EXISTS (SELECT 1 FROM resource r WHERE r.resource_id = ?1)",
+                )
+                .map_err(|e| e.to_string())?;
+            for (doc_id, hits) in batch {
+                for h in hits {
+                    rows += stmt
+                        .execute(rusqlite::params![
+                            doc_id,
+                            h.feature as i64,
+                            self.model_id,
+                            self.version,
+                            self.space_id,
+                            h.activation as f64,
+                            self.now
+                        ])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// No trailing work: every chunk committed as it was written, so an interrupted build leaves
+    /// the rows it finished rather than nothing.
+    fn finish(self) -> Result<(), String> {
+        Ok(())
+    }
 }
