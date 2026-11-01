@@ -215,6 +215,117 @@ fn occupancy(encoder: &Encoder, samples: &[Vec<f32>]) -> usize {
 }
 
 /// `agent0 features build`
+/// `agent0 features probe` — how often does the lane alone reach the labelled document?
+///
+/// A fusion weight can only help if the lane's candidate list contains the answer. Measuring that
+/// directly separates two very different failures: a lane whose target is *absent* from its top-k
+/// cannot be fixed by tuning weights (the features do not encode the relationship), while a lane
+/// that merely ranks it too low can be. Reported as recall@k for several k plus the median rank of
+/// the target when it is found.
+pub fn run_probe(args: &[String]) -> ExitCode {
+    let f = flags(args);
+    let set = f.get("set").cloned().unwrap_or("benchmarks/queries.corpus.jsonl".to_string());
+    let cap = usize_flag(&f, "k", 500);
+    let encoder_path = std::path::PathBuf::from(
+        f.get("encoder").cloned().unwrap_or("/var/lib/search/features/encoder.bin".to_string()),
+    );
+    // `--dirs a:b:c` rather than a repeated `--dir`: the flag parser here is a map, and a repeated
+    // key would silently keep only the last value.
+    let mut dirs: Vec<std::path::PathBuf> = f
+        .get("dirs")
+        .map(|raw| raw.split(':').map(std::path::PathBuf::from).collect())
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        dirs.push(std::path::PathBuf::from("/var/lib/search"));
+    }
+
+    #[cfg(feature = "bge")]
+    let embedder: std::sync::Arc<dyn search_embed::Embedder> = {
+        let cache = std::env::var("SEARCH_MODEL_CACHE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/search/fastembed"));
+        match search_embed::bge::BgeEmbedder::with_cache_dir(cache) {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(e) => {
+                eprintln!("probe needs the BGE weights the encoder was trained against: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    #[cfg(not(feature = "bge"))]
+    {
+        eprintln!("probe requires building with --features bge: the lane's query side must be the model the postings were built from");
+        return ExitCode::from(1);
+    }
+
+    let lane = match search_features::FeatureLane::from_paths(&encoder_path, &dirs, embedder) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            eprintln!("no postings under {:?}", dirs);
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("lane failed to load: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let cases = match search_eval::load_cases(std::path::Path::new(&set)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load {set}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "probe: {} cases, lane over {} documents across {} shard(s), k={cap}",
+        cases.len(),
+        lane.len(),
+        lane.shard_summary().len()
+    );
+
+    let ks = [10usize, 50, 100, cap];
+    let mut hits = [0usize; 4];
+    let mut ranks: Vec<f64> = Vec::new();
+    let mut empty = 0usize;
+    for case in &cases {
+        let found = match search_retrieval::LaneSearcher::search(&lane, &case.query, cap, None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("lane error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if found.is_empty() {
+            empty += 1;
+        }
+        let rank = found
+            .iter()
+            .position(|c| case.relevant.iter().any(|r| r == &c.doc_id))
+            .map(|p| p + 1);
+        if let Some(r) = rank {
+            ranks.push(r as f64);
+            for (i, k) in ks.iter().enumerate() {
+                if r <= *k {
+                    hits[i] += 1;
+                }
+            }
+        }
+    }
+    let n = cases.len().max(1) as f64;
+    for (i, k) in ks.iter().enumerate() {
+        println!("  recall@{k:<4}: {:.4}", hits[i] as f64 / n);
+    }
+    ranks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = ranks.get(ranks.len() / 2).copied().unwrap_or(f64::NAN);
+    println!(
+        "  found      : {} of {} (median rank {median:.0})",
+        ranks.len(),
+        cases.len()
+    );
+    println!("  empty lane : {empty} queries returned no candidates");
+    ExitCode::SUCCESS
+}
+
 pub fn run_build(args: &[String]) -> ExitCode {
     let cfg = Config::from_env();
     let f = flags(args);
@@ -248,6 +359,12 @@ pub fn run_build(args: &[String]) -> ExitCode {
         }
     };
     let active = usize_flag(&f, "active", encoder.active());
+    // How a document's activations are scaled before quantisation. `max` makes every document's
+    // strongest feature exactly 1.0, which throws away how *well* a document is represented;
+    // `l2` keeps the direction and a magnitude that is comparable across documents (a cosine-ish
+    // score), and `none` keeps the raw ReLU output clipped at 1.0. The query side stays
+    // max-normalised in every case: a query is a direction, while a document has a degree.
+    let norm = std::env::var("SEARCH_FEATURE_NORM").unwrap_or_else(|_| "max".to_string());
     let limit = f.get("limit").and_then(|v| v.parse::<usize>().ok());
     let forward = f.contains_key("forward-index");
     let model_id = f
@@ -312,12 +429,22 @@ pub fn run_build(args: &[String]) -> ExitCode {
             (false, _) => None,
         };
         let mut chunk_rows = 0usize;
+        // A document can own several vectors (`res_x:1`, `res_x:2`, … for its text chunks), and the
+        // pipeline's document ids are the bare resource. Postings keyed on the chunk id could never
+        // be joined by anything downstream: measured on the shards, every posting carried a `:1`
+        // suffix while `POST /search` returns bare ids, so the fleet lane's hits were unresolvable
+        // by construction. Chunks of one document are adjacent in the sorted order, so the code is
+        // merged per document and pushed once — that also keeps a document from appearing twice in
+        // its own postings list.
+        let mut pending: Option<(String, Option<String>, std::collections::BTreeMap<u32, f32>)> =
+            None;
+        let mut batch: Vec<(String, Vec<search_features::FeatureHit>)> = Vec::new();
         for chunk in order.chunks(BUILD_CHUNK) {
             // Encode the chunk in parallel, then push in id order: the postings' doc indices must
             // ascend, and the output file must stay byte-identical between runs.
             let coded: Vec<Vec<search_features::FeatureHit>> = match chunk
                 .par_iter()
-                .map(|&i| encoder.encode(&store.entries()[i].v, active))
+                .map(|&i| encoder.code_topk(&store.entries()[i].v, active))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(c) => c,
@@ -326,11 +453,24 @@ pub fn run_build(args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            let mut batch: Vec<(String, Vec<search_features::FeatureHit>)> = Vec::with_capacity(chunk.len());
-            for (&i, hits) in chunk.iter().zip(coded.iter()) {
+            for (&i, raw) in chunk.iter().zip(coded.into_iter()) {
                 let e = &store.entries()[i];
-                index.push_coded(e.doc_id.clone(), e.source_id.clone(), hits);
-                batch.push((e.doc_id.clone(), hits.to_vec()));
+                let base = base_resource_id(&e.doc_id).to_string();
+                let same = matches!(&pending, Some((id, _, _)) if *id == base);
+                if !same {
+                    if let Some((id, source, merged)) = pending.take() {
+                        emit_doc(&mut index, &mut batch, id, source, merged, active, &norm);
+                    }
+                    pending = Some((base, e.source_id.clone(), std::collections::BTreeMap::new()));
+                }
+                if let Some((_, _, merged)) = pending.as_mut() {
+                    for h in raw {
+                        let slot = merged.entry(h.feature).or_insert(f32::MIN);
+                        if h.activation > *slot {
+                            *slot = h.activation;
+                        }
+                    }
+                }
             }
             if let Some(w) = forward_writer.as_mut() {
                 match w.put_batch(&batch) {
@@ -339,6 +479,19 @@ pub fn run_build(args: &[String]) -> ExitCode {
                         eprintln!("  forward index failed: {err}");
                         return ExitCode::from(1);
                     }
+                }
+            }
+            batch.clear();
+        }
+        if let Some((id, source, merged)) = pending.take() {
+            emit_doc(&mut index, &mut batch, id, source, merged, active, &norm);
+        }
+        if let Some(w) = forward_writer.as_mut() {
+            match w.put_batch(&batch) {
+                Ok(n) => chunk_rows += n,
+                Err(err) => {
+                    eprintln!("  forward index failed: {err}");
+                    return ExitCode::from(1);
                 }
             }
         }
@@ -385,6 +538,71 @@ pub fn run_build(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// Turn one document's merged activations into its code and push it into both indexes.
+///
+/// The `active` strongest features survive, which is the document's own TopK — merging chunks first
+/// and truncating after is what makes a long document's code represent the document rather than one
+/// arbitrary chunk of it.
+fn emit_doc(
+    index: &mut search_features::SparseIndex,
+    batch: &mut Vec<(String, Vec<search_features::FeatureHit>)>,
+    doc_id: String,
+    source_id: Option<String>,
+    merged: std::collections::BTreeMap<u32, f32>,
+    active: usize,
+    norm: &str,
+) {
+    let mut hits: Vec<search_features::FeatureHit> = merged
+        .into_iter()
+        .map(|(feature, activation)| search_features::FeatureHit { feature, activation })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.activation
+            .partial_cmp(&a.activation)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.feature.cmp(&b.feature))
+    });
+    hits.truncate(active);
+    let hits = rescale(hits, norm);
+    index.push_coded(doc_id.clone(), source_id, &hits);
+    batch.push((doc_id, hits));
+}
+
+/// Scale one document's code according to the normalisation the build was asked for.
+///
+/// Every mode leaves the *ranking inside a document* alone and only changes the document's overall
+/// weight, which is exactly the quantity [`search_features::SparseIndex::search`] compares across
+/// documents when it accumulates `query · document · idf`.
+fn rescale(mut hits: Vec<search_features::FeatureHit>, mode: &str) -> Vec<search_features::FeatureHit> {
+    match mode {
+        "l2" => {
+            let sum: f32 = hits.iter().map(|h| h.activation * h.activation).sum();
+            let norm = sum.sqrt();
+            if norm > 0.0 {
+                for h in &mut hits {
+                    h.activation /= norm;
+                }
+            }
+            hits
+        }
+        "none" => {
+            for h in &mut hits {
+                h.activation = h.activation.min(1.0);
+            }
+            hits
+        }
+        _ => {
+            let max = hits.first().map(|h| h.activation).unwrap_or(0.0);
+            if max > 0.0 {
+                for h in &mut hits {
+                    h.activation /= max;
+                }
+            }
+            hits
+        }
+    }
 }
 
 /// The resource a vector belongs to: `res_<hash>:3` (chunk 3) is a chunk of `res_<hash>`.

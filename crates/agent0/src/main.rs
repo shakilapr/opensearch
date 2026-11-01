@@ -376,6 +376,7 @@ async fn main() -> ExitCode {
         Some("features") => match args.get(2).map(String::as_str) {
             Some("train") => search_agent0::featuresbuild::run_train(&args),
             Some("build") => search_agent0::featuresbuild::run_build(&args),
+            Some("probe") => search_agent0::featuresbuild::run_probe(&args),
             _ => {
                 eprintln!(
                     "usage: agent0 features train --vectors PATH[,PATH...] [--out DIR] [--features N] [--active N] [--epochs N] [--sample N] [--lr F] [--resample-every N] [--train-bias]\n       agent0 features build [--dir PATH]... [--encoder PATH] [--active N] [--limit N] [--forward-index]"
