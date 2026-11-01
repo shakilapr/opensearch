@@ -138,7 +138,17 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    let searcher = pipeline.searcher();
+    // Federate exactly as `serve` does, so a measurement is of the corpus the server answers for.
+    // Measured 2026-11-01: without this the eval opened only the 19,255-document primary root even
+    // with `SEARCH_FEDERATE_DIRS` set, and every graded number in `docs/EXECUTION-STATUS-v2.md` was
+    // therefore a measurement of 1.4% of the corpus the fleet actually serves.
+    let searcher = match search_agent0::fedserve::searcher(pipeline.searcher(), &cfg.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to build the federated searcher: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
     let mut extra_lanes = Vec::new();
     // `--lanes features` exists so the lane can be measured on its own: fusion weights default to
     // 0.0 for every semantic lane, so without an arm that builds only this lane a "features"

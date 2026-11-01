@@ -188,3 +188,18 @@ trade-off is explicit and logged — while the crawler holds the lock the server
 query-time refresh — rather than the two processes refusing to coexist. Both were verified
 running together: crawl ingesting, `GET /health` at generation 12094, `POST /search {"engine":
 true}` returning coverage 1.0 with a cited answer, no SQLite lock errors (WAL).
+
+## v2 retrieval architecture — where it stands (2026-11-01)
+
+The v2 plan (`docs/PLAN-v2.md`, `docs/architecture-update-v2.md`) is tracked in
+`docs/EXECUTION-STATUS-v2.md` with measured numbers. In one paragraph: the concept layer (A), the
+dense fleet vectors (B) and the learned sparse-feature index (D) are built and serving-reachable;
+routing and stage-3 rerank (E) are implemented behind `SEARCH_ROUTE` / `SEARCH_RERANK` and off by
+default; the storage rebuild (C) is the one phase still pending, and it must run after B and D so
+the corpus is not re-embedded for nothing.
+
+Every semantic lane exists and none of them yet beats BM25 on the 600-query graded set: dense
++0.0017 nDCG, graph 0.0000, concept −0.0114, learned features −0.0910 at weight 0.8. Each lane's
+fusion weight is therefore whatever was measured, and for features that is **0.0** — the lane is
+built, tested, and deliberately absent from scoring. The sparse index itself is complete: 1.39M
+documents, 16.0 postings each, 30.9M `doc_feature` rows, 87.6–100% resource coverage.
