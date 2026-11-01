@@ -22,7 +22,7 @@ run() {
     echo "=== $name (lanes=$lanes ${fusion:-default weights}) ==="
     # `env -u` every fusion variable first, so one configuration cannot inherit another's weight.
     env -u SEARCH_FUSION_CONCEPT -u SEARCH_FUSION_DENSE -u SEARCH_FUSION_GRAPH \
-        -u SEARCH_FUSION_BM25 -u SEARCH_FUSION_SOURCE_FIRST \
+        -u SEARCH_FUSION_FEATURES -u SEARCH_FUSION_BM25 -u SEARCH_FUSION_SOURCE_FIRST \
         SEARCH_DATA_DIR="$DIR" SEARCH_MODEL_CACHE=/models/fastembed \
         $fusion "$BIN" eval run --set "$SET" --lanes "$lanes" --mode fast \
         --out "$OUT/$name.json" 2>&1 | grep -E "^  (n|ndcg_at_10|mrr|recall_at_10|p50_ms|p95_ms)|^lanes"
@@ -35,6 +35,9 @@ run bm25_only none ""
 run dense_only dense "SEARCH_FUSION_DENSE=0.8"
 run concept_only concept "SEARCH_FUSION_CONCEPT=0.8"
 run graph_only graph "SEARCH_FUSION_GRAPH=0.8"
+# The v2 sparse-feature lane: `--lanes features` builds it even when its fusion weight is 0, so
+# the weight below is the experiment and the lane is not silently absent.
+run features_only features "SEARCH_FUSION_FEATURES=0.8"
 
 # All lanes, to see whether they compose.
 run all_lanes all "SEARCH_FUSION_DENSE=0.5 SEARCH_FUSION_CONCEPT=0.8 SEARCH_FUSION_GRAPH=0.3"
@@ -45,7 +48,7 @@ python3 - "$OUT" <<'PY'
 import json, sys, pathlib
 d = pathlib.Path(sys.argv[1])
 rows = []
-for f in ["bm25_only", "dense_only", "concept_only", "graph_only", "all_lanes"]:
+for f in ["bm25_only", "dense_only", "concept_only", "graph_only", "features_only", "all_lanes"]:
     p = d / f"{f}.json"
     if not p.is_file():
         rows.append((f, None)); continue

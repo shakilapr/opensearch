@@ -128,6 +128,61 @@ impl Encoder {
         }
     }
 
+    /// Build an initial encoder whose atoms are real samples, not noise.
+    ///
+    /// This matters more than it looks. In 384 dimensions a Gaussian row is almost orthogonal to
+    /// every document, so all rows score within noise of each other and `TopK` keeps picking the
+    /// same handful — measured on the primary corpus: **31 live features out of 4,096** after an
+    /// epoch. Seeding each atom from a distinct real document makes the initial activations
+    /// meaningful, so documents spread across the vocabulary from the first step.
+    pub fn from_samples(
+        samples: &[Vec<f32>],
+        dim: usize,
+        features: usize,
+        active: usize,
+        seed: u64,
+    ) -> Self {
+        let mut enc = Self::random(dim, features, active, seed);
+        let active_n = active.clamp(1, features.max(1)) as f32;
+        let radius = 1.0 / active_n.sqrt();
+        let mut rng = Lcg::new(seed ^ 0x1234_5678);
+        for f in 0..features {
+            let pick = (rng.next_u64() as usize) % samples.len().max(1);
+            let x = &samples[pick];
+            if x.len() != dim {
+                continue;
+            }
+            let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            for i in 0..dim {
+                let jitter = (rng.next_f32() - 0.5) * 0.02;
+                enc.w[f * dim + i] = x[i] / norm * radius + jitter;
+            }
+            // Just below zero, so an atom starts silent rather than firing on everything.
+            enc.b[f] = -0.05;
+        }
+        enc
+    }
+
+    /// The weight vector of one feature.
+    ///
+    /// The decoder is tied, so this is also the atom the feature reconstructs with — which is
+    /// what makes a learned feature inspectable: its row can be compared with a document.
+    pub fn row(&self, feature: usize) -> &[f32] {
+        let start = feature.min(self.features.saturating_sub(1)) * self.dim;
+        &self.w[start..start + self.dim]
+    }
+
+    /// The `active` strongest features of `x` with their **raw** activations.
+    ///
+    /// Unlike [`Encoder::encode`] these are not normalised, so `Σ z_j w_j` is the reconstruction
+    /// the training objective measures. Callers that score documents use `encode`; callers that
+    /// check the fit use this.
+    pub fn code_topk(&self, x: &[f32], active: usize) -> Result<Vec<FeatureHit>, EncoderError> {
+        let z = self.code(x)?;
+        let active = active.clamp(1, self.features.max(1));
+        Ok(top_k(&z, active))
+    }
+
     /// Raw code `ReLU(Wx+b)` for every feature, before `TopK`.
     ///
     /// Exposed because the training loop and the diagnostics both need the dense activation
@@ -164,9 +219,7 @@ impl Encoder {
         if x.iter().all(|v| *v == 0.0) {
             return Ok(Vec::new());
         }
-        let z = self.code(x)?;
-        let active = active.clamp(1, self.features.max(1));
-        let hits = top_k(&z, active);
+        let hits = self.code_topk(x, active)?;
         let max = hits.first().map(|h| h.activation).unwrap_or(0.0);
         if max <= 0.0 {
             return Ok(Vec::new());
@@ -249,6 +302,22 @@ pub struct TrainOptions {
     pub seed: u64,
     /// Print a progress line every this many samples (0 = quiet).
     pub log_every: u64,
+    /// Whether training may move the per-feature bias.
+    ///
+    /// Off by default, and that default is a measurement, not taste. With a trainable bias the
+    /// selected atoms raise their own threshold-free activation every step (`b -= lr·gz`, and
+    /// `gz` is negative whenever the reconstruction is short of the input), which is a
+    /// winner-take-all loop: measured on the primary corpus, one epoch took a data-seeded
+    /// vocabulary of **4,077 live features down to 40**. A frozen bias keeps the competition
+    /// on `w·x` with equal-radius atoms.
+    pub train_bias: bool,
+    /// How often to re-seed features that never fire (0 disables).
+    ///
+    /// Required, not cosmetic: measured on the 19,255-document primary root, a random
+    /// initialisation leaves **31 of 4,096** features used after an epoch. The `TopK` picks the
+    /// few rows that happen to align with the data, only those rows receive a gradient, and the
+    /// rest are unreachable forever — a 31-feature vocabulary dressed up as a 4,096-feature one.
+    pub resample_every: usize,
 }
 
 impl Default for TrainOptions {
@@ -265,6 +334,10 @@ impl Default for TrainOptions {
             momentum: 0.9,
             seed: 0x5eed_0001,
             log_every: 0,
+            train_bias: false,
+            // Roughly ten re-seed rounds over a 400K-sample epoch: frequent enough that a dead
+            // row is replaced before the vocabulary settles, rare enough not to churn live atoms.
+            resample_every: 20_000,
         }
     }
 }
@@ -294,12 +367,18 @@ pub fn train(
         return Err(EncoderError::Dim { expected: dim, got: bad.len() });
     }
     let active = opts.active.clamp(1, opts.features);
-    let mut enc = Encoder::random(dim, opts.features, active, opts.seed);
+    let mut enc = Encoder::from_samples(samples, dim, opts.features, active, opts.seed);
     let mut velocity = vec![0.0f32; opts.features * dim];
     let mut v_bias = vec![0.0f32; opts.features];
     let mut order: Vec<u32> = (0..samples.len() as u32).collect();
     let mut rng = Lcg::new(opts.seed ^ 0xa5a5_1234);
     let mut seen: u64 = 0;
+    // Selections per feature since the last re-seed round. A `TopK` code only ever updates the
+    // rows it selects, so a row that is never selected receives no gradient at all and cannot
+    // recover on its own.
+    let mut usage = vec![0u32; opts.features];
+    let mut since_resample = 0usize;
+    let target_radius = 1.0 / (active as f32).sqrt();
 
     for _epoch in 0..opts.epochs {
         // Fisher–Yates with the seeded LCG: sample order is reproducible, which is what makes the
@@ -353,6 +432,7 @@ pub fn train(
                     }
                     acc_b[f] += gz;
                     touched.push(h.feature);
+                    usage[f] += 1;
                 }
             }
 
@@ -364,8 +444,10 @@ pub fn train(
                     velocity[i] = opts.momentum * velocity[i] + acc[i];
                     enc.w[i] -= opts.lr * velocity[i];
                 }
-                v_bias[f] = opts.momentum * v_bias[f] + acc_b[f];
-                enc.b[f] -= opts.lr * v_bias[f];
+                if opts.train_bias {
+                    v_bias[f] = opts.momentum * v_bias[f] + acc_b[f];
+                    enc.b[f] -= opts.lr * v_bias[f];
+                }
                 // Constrain every decoder atom to the same radius, `1/sqrt(active)`. Without it
                 // the tied objective is scale-free along each row: rows can grow, the code grows
                 // with them, and the step size silently becomes a function of training time.
@@ -390,10 +472,78 @@ pub fn train(
             if opts.log_every > 0 && seen % opts.log_every < chunk.len() as u64 {
                 eprintln!("  trained on {seen} samples");
             }
+            since_resample += chunk.len();
+            if opts.resample_every > 0 && since_resample >= opts.resample_every {
+                let reseeded = reseed_dead(
+                    &mut enc,
+                    &mut velocity,
+                    &mut v_bias,
+                    &usage,
+                    samples,
+                    since_resample,
+                    target_radius,
+                    &mut rng,
+                );
+                if reseeded > 0 {
+                    tracing::info!(reseeded, "features: re-seeded dead atoms");
+                }
+                usage.fill(0);
+                since_resample = 0;
+            }
         }
     }
     enc.trained_on = seen;
     Ok(enc)
+}
+
+/// Re-seed features that were never selected, by pointing them at a random training sample.
+///
+/// A feature that `TopK` never selects is a feature that never receives a gradient, so it stays
+/// whatever random direction it was born with — for the entire run. The measured effect on the
+/// first real corpus was 31 live features out of 4,096. Standard remedy (resampling, as in sparse
+/// autoencoders): any atom selected fewer than once per 100 expected selections is re-pointed at
+/// a real sample, given a slightly negative bias so it starts just below the activation cut, and
+/// its optimiser state is cleared.
+///
+/// Rounds are capped at 5% of the vocabulary so a run cannot spend all its steps re-seeding, and
+/// the RNG is the training RNG, so reproducibility survives.
+#[allow(clippy::too_many_arguments)]
+fn reseed_dead(
+    enc: &mut Encoder,
+    velocity: &mut [f32],
+    v_bias: &mut [f32],
+    usage: &[u32],
+    samples: &[Vec<f32>],
+    window: usize,
+    target_radius: f32,
+    rng: &mut Lcg,
+) -> usize {
+    let dim = enc.dim;
+    let expected = (window / enc.features).max(1);
+    let floor = (expected / 100).max(1) as u32;
+    let cap = (enc.features / 20).max(1);
+    let mut reseeded = 0usize;
+    for f in 0..enc.features {
+        if reseeded >= cap {
+            break;
+        }
+        if usage[f] > floor {
+            continue;
+        }
+        let pick = (rng.next_u64() as usize) % samples.len();
+        let x = &samples[pick];
+        let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        for i in 0..dim {
+            // A small jitter stops several dead atoms inheriting the identical direction.
+            let jitter = (rng.next_f32() - 0.5) * 0.05;
+            enc.w[f * dim + i] = x[i] / norm * target_radius + jitter;
+            velocity[f * dim + i] = 0.0;
+        }
+        enc.b[f] = -0.05;
+        v_bias[f] = 0.0;
+        reseeded += 1;
+    }
+    reseeded
 }
 
 /// The `k` largest entries of `z`, descending, ties by lower feature id.
@@ -516,6 +666,8 @@ mod tests {
             momentum: 0.9,
             seed: 11,
             log_every: 0,
+            resample_every: 0,
+            train_bias: false,
         };
         let before = Encoder::random(8, 16, 4, opts.seed);
         let enc = train(&samples, 8, &opts).unwrap();
@@ -559,6 +711,45 @@ mod tests {
     }
 
     #[test]
+    fn resampling_keeps_the_vocabulary_alive() {
+        // The failure this guards: with a random start, `TopK` selects a handful of rows, only
+        // those get gradients, and the rest stay random forever. Measured on the real corpus that
+        // was 31 live features out of 4,096.
+        // Many distinct directions, not four: a four-cluster corpus needs only a handful of
+        // atoms, so it would report a collapsed vocabulary that is in fact correct.
+        let mut rng = Lcg::new(21);
+        let samples: Vec<Vec<f32>> = (0..256)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..16).map(|_| rng.next_f32() - 0.5).collect();
+                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                v.iter_mut().for_each(|x| *x /= n);
+                v
+            })
+            .collect();
+        let opts = TrainOptions {
+            features: 128,
+            active: 4,
+            epochs: 3,
+            batch: 32,
+            lr: 0.01,
+            momentum: 0.9,
+            seed: 3,
+            log_every: 0,
+            resample_every: 32,
+            train_bias: false,
+        };
+        let enc = train(&samples, 16, &opts).unwrap();
+        let mut live = vec![false; enc.features()];
+        for x in &samples {
+            for h in enc.encode(x, 4).unwrap() {
+                live[h.feature as usize] = true;
+            }
+        }
+        let used = live.iter().filter(|x| **x).count();
+        assert!(used > 32, "re-seeding must keep the vocabulary alive, got {used} of 128");
+    }
+
+    #[test]
     fn the_same_seed_gives_the_same_weights() {
         let samples = corpus(64);
         let opts = TrainOptions {
@@ -570,6 +761,8 @@ mod tests {
             momentum: 0.9,
             seed: 5,
             log_every: 0,
+            resample_every: 0,
+            train_bias: false,
         };
         let a = train(&samples, 8, &opts).unwrap();
         let b = train(&samples, 8, &opts).unwrap();

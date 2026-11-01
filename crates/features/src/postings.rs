@@ -200,6 +200,28 @@ impl SparseIndex {
             .collect()
     }
 
+    /// Documents with the codes stored for them, reconstructed from the postings.
+    ///
+    /// The postings are the authority: `doc_feature` rows written by `agent0 features build` are
+    /// derived from exactly these values, so the forward index and the inverted one cannot
+    /// disagree.
+    pub fn codes(&self) -> Vec<(String, Vec<FeatureHit>)> {
+        let mut per_doc: Vec<Vec<FeatureHit>> = vec![Vec::new(); self.docs.len()];
+        for (f, list) in self.postings.iter().enumerate() {
+            for (doc, q) in list {
+                per_doc[*doc as usize].push(FeatureHit {
+                    feature: f as u32,
+                    activation: *q as f32 / 255.0,
+                });
+            }
+        }
+        self.docs
+            .iter()
+            .zip(per_doc)
+            .map(|(d, hits)| (d.doc_id.clone(), hits))
+            .collect()
+    }
+
     /// Write the index. Lists are contiguous and doc ids sorted, so the file is reproducible.
     pub fn save(&self, path: &Path) -> Result<(), PostingsError> {
         if let Some(parent) = path.parent() {
@@ -385,7 +407,10 @@ mod tests {
     fn source_scope_is_applied_before_truncation() {
         let enc = trained();
         let index = SparseIndex::build(corpus(), &enc, 4).unwrap();
-        let q = enc.encode(&corpus()[0].2, 4).unwrap();
+        // Query with an odd document's code: features are specific enough that a query for an
+        // even document need not reach any odd one at all, which would make the assertion pass
+        // vacuously.
+        let q = enc.encode(&corpus()[1].2, 4).unwrap();
         let hits = index.search(&q, 50, Some("s-odd"));
         assert!(!hits.is_empty());
         assert!(
