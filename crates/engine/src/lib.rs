@@ -14,6 +14,7 @@ pub mod evidence;
 pub mod fuse;
 pub mod plan;
 pub mod planner;
+pub mod route;
 pub mod timing;
 pub mod units;
 
@@ -32,8 +33,8 @@ pub use evidence::{
 };
 pub use fuse::{fuse, run_cascade, CascadeInput, CascadeOutput, Fused, FusionPolicy, LaneHits};
 pub use plan::{
-    build_plan, variant_preserves_constraints, IndexStats, Mode, Plan, QueryVariant, StageDeadlines,
-    VariantOrigin,
+    build_plan, variant_preserves_constraints, IndexStats, Mode, Plan, QueryVariant,
+    StageDeadlines, VariantOrigin,
 };
 pub use planner::{PlannedQueries, QueryPlanner};
 pub use units::{decompose, joins, JoinKey, QueryUnit, UnitKind};

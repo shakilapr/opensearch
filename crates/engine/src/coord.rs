@@ -18,13 +18,18 @@ use crate::evidence::{evidence_coverage, EvidenceRecord, EvidenceVerifier, Suppo
 use crate::fuse::{fuse, fuse_families, run_cascade, CascadeInput, FusionPolicy, LaneHits};
 use crate::plan::{build_plan, size_first_pass_top_k, IndexStats, Mode, Plan};
 use crate::planner::QueryPlanner;
+use crate::route::{self, Route};
 use crate::timing;
 use crate::units::QueryUnit;
 use crate::LaneId;
+use search_rerank::{rerank, FeatureRanker, Features, RerankInput};
 
 /// Static bound on the round loop. The budget caps rounds at 5 (Deep); this is a hard ceiling so
 /// the loop is statically bounded even if a budget is misconfigured (§17/§18).
 const MAX_ROUNDS: u32 = 8;
+/// Stage-3 rerank window. At most this many fused candidates are scored; the rest keep their
+/// existing relative order behind the reranked window.
+const MAX_RERANK_CANDIDATES: usize = 50;
 /// Static bound on the action frontier offered to the selector (§12.2 "restrict the action space").
 const MAX_ACTIONS: usize = 16;
 /// Cap on sources considered for a `Refresh` action.
@@ -54,8 +59,12 @@ pub enum Action {
 
 /// §16/§22.1 — optional answer generation, after search, consuming the selected evidence.
 pub trait Answerer: Send + Sync {
-    fn answer(&self, query: &str, evidence: &[EvidenceRecord], passages: &[String])
-        -> Result<String, String>;
+    fn answer(
+        &self,
+        query: &str,
+        evidence: &[EvidenceRecord],
+        passages: &[String],
+    ) -> Result<String, String>;
 
     /// What the most recent [`answer`](Answerer::answer) call cost the provider, when the
     /// implementation can report it.
@@ -160,7 +169,10 @@ pub struct EngineState {
 
 impl EngineState {
     fn new() -> Self {
-        Self { global_lexical: LaneId::Bm25, ..Default::default() }
+        Self {
+            global_lexical: LaneId::Bm25,
+            ..Default::default()
+        }
     }
 }
 
@@ -193,13 +205,17 @@ impl Selector for RuleSelector {
             return Some(i);
         }
         // 2. Widen the global lexical lane once.
-        if let Some(i) = actions.iter().position(|a| {
-            matches!(a, Action::Widen { lane } if *lane == state.global_lexical)
-        }) {
+        if let Some(i) = actions
+            .iter()
+            .position(|a| matches!(a, Action::Widen { lane } if *lane == state.global_lexical))
+        {
             return Some(i);
         }
         // Fallback: any other widenable lane.
-        if let Some(i) = actions.iter().position(|a| matches!(a, Action::Widen { .. })) {
+        if let Some(i) = actions
+            .iter()
+            .position(|a| matches!(a, Action::Widen { .. }))
+        {
             return Some(i);
         }
         // 3. Abstain.
@@ -243,18 +259,55 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     // request. The scan cost the eval attributes to retrieval is `index_scan_limit`, and the
     // caller's `limit` bounds what the scan has to feed — see `size_first_pass_top_k`.
     plan.per_lane_top_k =
-        plan.per_lane_top_k.min(size_first_pass_top_k(req.mode, deps.stats.docs, req.limit));
+        plan.per_lane_top_k
+            .min(size_first_pass_top_k(req.mode, deps.stats.docs, req.limit));
     timing::record("planning", t_planning);
     let mut budget = Budget::for_mode(req.mode, req.deadline_ms);
     budget.start(0);
 
     trace.push(format!(
         "plan: mode={:?} lanes={:?} top_k={} variants={} rerank={} refresh={}",
-        req.mode, plan.lanes, plan.per_lane_top_k, plan.query_variants.len(),
-        plan.rerank_count, plan.refresh_count
+        req.mode,
+        plan.lanes,
+        plan.per_lane_top_k,
+        plan.query_variants.len(),
+        plan.rerank_count,
+        plan.refresh_count
     ));
 
     let mut state = EngineState::new();
+
+    // §7 judge: the router is a *filter on experts*, never on the query. `lane_on` is indexed by
+    // searcher position so it can be consulted in every dispatch loop below; a searcher that does
+    // not declare a lane is "unknown, run it", and the lexical expert is never switched off.
+    let routing: Option<Route> = if route::enabled() {
+        let r = route::route(&analysis);
+        trace.push(format!("route: {}", r.summary()));
+        Some(r)
+    } else {
+        None
+    };
+    let lane_on: Vec<bool> = deps
+        .lanes
+        .iter()
+        .map(|s| match (routing.as_ref(), s.lane_hint()) {
+            (Some(r), Some(lane)) => match route::expert_for(lane) {
+                Some(expert) => r.runs(expert) || expert == route::Expert::Lexical,
+                None => true,
+            },
+            _ => true,
+        })
+        .collect();
+    if let Some(r) = &routing {
+        let skipped = lane_on.iter().filter(|on| !**on).count();
+        if skipped > 0 {
+            trace.push(format!(
+                "route: skipping {skipped} of {} searcher(s)",
+                deps.lanes.len()
+            ));
+            let _ = r;
+        }
+    }
 
     // Cross-round accumulators.
     // Family-tagged lane hits: family 0 is the original query, family >= 1 a rewrite family.
@@ -274,7 +327,8 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         state.completed_rounds = 1;
         trace.push(format!(
             "round 1: launch {} searcher(s) over {} probe(s)",
-            deps.lanes.len(), plan.query_variants.len()
+            deps.lanes.len(),
+            plan.query_variants.len()
         ));
         // §8: "Search the original query in its own lane" — the original is the first variant,
         // family 0 — then each capped, constraint-preserving expansion, tagged with its family so
@@ -286,10 +340,20 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                 continue;
             }
             for idx in 0..deps.lanes.len() {
+                if !lane_on[idx] {
+                    continue;
+                }
                 let searcher = deps.lanes[idx];
                 match call_searcher(
-                    idx, searcher, &variant.text, plan.per_lane_top_k, None,
-                    &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources,
+                    idx,
+                    searcher,
+                    &variant.text,
+                    plan.per_lane_top_k,
+                    None,
+                    &mut raw_hits,
+                    &mut titles,
+                    &mut searcher_lanes,
+                    &mut seen_sources,
                     variant.family,
                 ) {
                     Ok(n) => launched += n,
@@ -301,7 +365,12 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         state.candidates = launched;
         let t_evidence = timing::start();
         refresh_evidence(
-            &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
+            &analysis.units,
+            &titles,
+            deps.verifier,
+            &mut records,
+            &mut coverage,
+            &mut state,
         );
         timing::record("evidence", t_evidence);
         trace.push(evidence_line(&records));
@@ -362,7 +431,9 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         // Atomic reservation before dispatch (§17): charge the round, or do not run at all.
         if !budget.charge_round() {
             state.stop_reason = Some(StopReason::BudgetExhausted);
-            trace.push(format!("rejected {action:?}: no rounds remaining (not executed)"));
+            trace.push(format!(
+                "rejected {action:?}: no rounds remaining (not executed)"
+            ));
             break;
         }
 
@@ -374,7 +445,10 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
             Action::Widen { lane } => {
                 state.widened.push(*lane);
                 trace.push(format!("round {round}: action Widen {{{lane:?}}}"));
-                let limit = plan.per_lane_top_k.saturating_mul(2).max(plan.per_lane_top_k + 1);
+                let limit = plan
+                    .per_lane_top_k
+                    .saturating_mul(2)
+                    .max(plan.per_lane_top_k + 1);
                 let mut targets: Vec<usize> = Vec::new();
                 for i in 0..deps.lanes.len() {
                     if searcher_lanes[i].contains(lane) {
@@ -387,10 +461,24 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                     }
                 }
                 for idx in targets {
+                    // A widen targets only lanes that already ran, so `lane_on` is redundant here;
+                    // it is checked anyway so a routed-off lane can never be re-entered by a
+                    // later round (`targets.is_empty()` would otherwise push every lane).
+                    if !lane_on[idx] {
+                        continue;
+                    }
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
-                        idx, searcher, &req.query, limit, None,
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
+                        idx,
+                        searcher,
+                        &req.query,
+                        limit,
+                        None,
+                        &mut raw_hits,
+                        &mut titles,
+                        &mut searcher_lanes,
+                        &mut seen_sources,
+                        0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -405,10 +493,21 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                     .map(|u| u.text.clone())
                     .unwrap_or_else(|| req.query.clone());
                 for idx in 0..deps.lanes.len() {
+                    if !lane_on[idx] {
+                        continue;
+                    }
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
-                        idx, searcher, &text, plan.per_lane_top_k, None,
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
+                        idx,
+                        searcher,
+                        &text,
+                        plan.per_lane_top_k,
+                        None,
+                        &mut raw_hits,
+                        &mut titles,
+                        &mut searcher_lanes,
+                        &mut seen_sources,
+                        0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -419,10 +518,21 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
                 budget.fetches_remaining = budget.fetches_remaining.saturating_sub(1);
                 trace.push(format!("round {round}: action Refresh {{{source_id}}}"));
                 for idx in 0..deps.lanes.len() {
+                    if !lane_on[idx] {
+                        continue;
+                    }
                     let searcher = deps.lanes[idx];
                     if let Err(e) = call_searcher(
-                        idx, searcher, &req.query, plan.per_lane_top_k, Some(source_id.as_str()),
-                        &mut raw_hits, &mut titles, &mut searcher_lanes, &mut seen_sources, 0,
+                        idx,
+                        searcher,
+                        &req.query,
+                        plan.per_lane_top_k,
+                        Some(source_id.as_str()),
+                        &mut raw_hits,
+                        &mut titles,
+                        &mut searcher_lanes,
+                        &mut seen_sources,
+                        0,
                     ) {
                         trace.push(format!("lane failed: {e}"));
                     }
@@ -435,7 +545,12 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         state.candidates = raw_hits.iter().map(|(_, h)| h.ranked.len()).sum();
         let t_evidence = timing::start();
         refresh_evidence(
-            &analysis.units, &titles, deps.verifier, &mut records, &mut coverage, &mut state,
+            &analysis.units,
+            &titles,
+            deps.verifier,
+            &mut records,
+            &mut coverage,
+            &mut state,
         );
         timing::record("evidence", t_evidence);
         trace.push(evidence_line(&records));
@@ -490,7 +605,7 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
     timing::record("fusion", t_fusion);
 
     let t_assembly = timing::start();
-    let results: Vec<ResultRow> = diversified
+    let mut results: Vec<ResultRow> = diversified
         .into_iter()
         .map(|s| {
             let ranks = lane_ranks.get(&s.doc_id).cloned().unwrap_or_default();
@@ -509,6 +624,21 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         .collect();
 
     trace.push(format!("results: {} of limit {}", results.len(), req.limit));
+
+    // ---- Stage 3: optional feature rerank over the display window (§10/§22). ----
+    // Off unless `SEARCH_RERANK` is explicitly `1`/`true`, so the default response is unchanged.
+    // The window is bounded and closed: only candidates already in `results` can be reordered,
+    // and rows after the window keep their relative order behind the reranked prefix.
+    if rerank_enabled() {
+        let fused_ranks: HashMap<String, usize> = cascaded
+            .ranked
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.doc_id.clone(), i + 1))
+            .collect();
+        let (n, m) = rerank_results(&mut results, &analysis, &titles, &fused_ranks);
+        trace.push(format!("rerank: {n} candidates, {m} reordered"));
+    }
 
     // §17 stop-reason refinement, applied once the final result set is known. Priority when
     // several conditions hold at once: deadline > limit-reached > sufficient-coverage > budget.
@@ -535,7 +665,10 @@ pub fn run_search(req: SearchRequest, deps: &Deps<'_>) -> SearchResponse {
         let passages: Vec<String> = results.iter().map(|r| r.doc_id.clone()).collect();
         match a.answer(&req.query, &records, &passages) {
             Ok(text) => {
-                trace.push(format!("answer: {} char(s) from the selected evidence", text.len()));
+                trace.push(format!(
+                    "answer: {} char(s) from the selected evidence",
+                    text.len()
+                ));
                 answer = Some(text);
             }
             Err(e) => trace.push(format!("answer failed: {e}")),
@@ -583,7 +716,11 @@ fn evidence_line(records: &[EvidenceRecord]) -> String {
         .iter()
         .map(|r| format!("{}={} ({:?})", r.unit_id, r.doc_id, r.status))
         .collect();
-    format!("evidence: {} supported unit(s) [{}]", records.len(), pairs.join(", "))
+    format!(
+        "evidence: {} supported unit(s) [{}]",
+        records.len(),
+        pairs.join(", ")
+    )
 }
 
 /// Deadline-only early stop. `Budget::should_stop` is consulted, but its `BudgetExhausted`
@@ -645,7 +782,9 @@ fn admissible_next_actions(
                 break;
             }
             if !state.refreshed.contains(s) {
-                v.push(Action::Refresh { source_id: s.clone() });
+                v.push(Action::Refresh {
+                    source_id: s.clone(),
+                });
             }
         }
     }
@@ -698,7 +837,10 @@ fn collapse_lane_hits(raw: &[(u8, LaneHits)]) -> Vec<(u8, Vec<LaneHits>)> {
         for (lane, map) in lane_order.iter().zip(maps.iter()) {
             let mut v: Vec<(usize, String)> = map.iter().map(|(d, r)| (*r, d.clone())).collect();
             v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            lanes.push(LaneHits { lane: *lane, ranked: v.into_iter().map(|(_, d)| d).collect() });
+            lanes.push(LaneHits {
+                lane: *lane,
+                ranked: v.into_iter().map(|(_, d)| d).collect(),
+            });
         }
         out.push((*family, lanes));
     }
@@ -724,6 +866,167 @@ fn build_lane_ranks(collapsed: &[(u8, Vec<LaneHits>)]) -> HashMap<String, HashMa
     out
 }
 
+/// Whether stage-3 reranking is enabled. Anything other than `1`/`true` — including unset —
+/// leaves the path untouched.
+fn rerank_enabled() -> bool {
+    matches!(
+        std::env::var("SEARCH_RERANK").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Map a 1-based rank to a `[0, 1]` feature. Best rank 1 is 1.0 and the signal decays
+/// monotonically; a missing rank contributes no evidence, which is not the same as a bad rank.
+fn rank_signal(rank: Option<usize>) -> f32 {
+    match rank {
+        Some(rank) if rank > 0 => 1.0 / (1.0 + rank as f32),
+        _ => 0.0,
+    }
+}
+
+/// The best (lowest) rank among `lanes`, if the document appeared in any of them.
+fn best_lane_rank(ranks: &HashMap<LaneId, usize>, lanes: &[LaneId]) -> Option<usize> {
+    lanes
+        .iter()
+        .filter_map(|lane| ranks.get(lane).copied())
+        .min()
+}
+
+/// Whether a known title contains any analysed query phrase or identifier. Case-insensitive,
+/// punctuation-preserving: a phrase only matches where it actually appears.
+fn title_contains_query(title: &str, phrases: &[String], identifiers: &[String]) -> bool {
+    let title = title.to_lowercase();
+    phrases
+        .iter()
+        .chain(identifiers.iter())
+        .map(|needle| needle.trim().to_lowercase())
+        .any(|needle| !needle.is_empty() && title.contains(&needle))
+}
+
+/// Build the stage-3 feature vector from signals that exist at the end of the coordinator loop.
+///
+/// The coordinator keeps a `titles` map filled from every lane candidate, so `title_match` is a
+/// real signal here rather than an invented one. A missing title entry (or a row with no lane
+/// provenance) makes the candidate unscorable: we skip it instead of claiming a zero, because
+/// zero is a statement about quality and absence is not. An *empty* title is a known title that
+/// simply contains no query phrase.
+///
+/// Lane ranks are folded into the matching slots: the fused rank into `bm25`, the best semantic
+/// lane (`Dense`/`Features`/`Concept`) into `dense`, the source-scoped lane into
+/// `source_authority`, and the graph lane into `graph_hop`. `entity_match` carries verified unit
+/// support (supported units / total units). `freshness` stays absent because no document
+/// timestamp reaches this point.
+fn rerank_features(
+    row: &ResultRow,
+    fused_rank: usize,
+    units: usize,
+    titles: &BTreeMap<String, String>,
+    phrases: &[String],
+    identifiers: &[String],
+) -> Option<Features> {
+    let title = titles.get(&row.doc_id)?;
+    if row.lane_ranks.is_empty() {
+        return None;
+    }
+    let supported = if units == 0 {
+        0.0
+    } else {
+        row.unit_support.len().min(units) as f32 / units as f32
+    };
+    Some(Features {
+        bm25: rank_signal(Some(fused_rank)),
+        dense: rank_signal(best_lane_rank(
+            &row.lane_ranks,
+            &[LaneId::Dense, LaneId::Features, LaneId::Concept],
+        )),
+        source_authority: rank_signal(row.lane_ranks.get(&LaneId::SourceFirst).copied()),
+        freshness: 0.0,
+        entity_match: supported,
+        graph_hop: rank_signal(row.lane_ranks.get(&LaneId::Graph).copied()),
+        title_match: if title_contains_query(title, phrases, identifiers) {
+            1.0
+        } else {
+            0.0
+        },
+    })
+}
+
+/// Rerank the bounded prefix of `results` in place, returning `(window, reordered)`.
+///
+/// `window` is `min(results.len(), MAX_RERANK_CANDIDATES)`. Only rows inside it are scored;
+/// candidates for which no complete feature vector exists keep their relative order after the
+/// scored rows. Rows outside the window never move, so the tail is untouched. `reordered` counts
+/// positions whose occupant changed, which is the honest measure of whether the ranking moved.
+fn rerank_results(
+    results: &mut Vec<ResultRow>,
+    analysis: &crate::analyze::QueryAnalysis,
+    titles: &BTreeMap<String, String>,
+    fused_ranks: &HashMap<String, usize>,
+) -> (usize, usize) {
+    let window = results.len().min(MAX_RERANK_CANDIDATES);
+    if window == 0 {
+        return (0, 0);
+    }
+
+    let mut inputs: Vec<RerankInput> = Vec::with_capacity(window);
+    let mut scorable: Vec<usize> = Vec::with_capacity(window);
+    let mut unscorable: Vec<usize> = Vec::new();
+    for (i, row) in results.iter().take(window).enumerate() {
+        let fused_rank = fused_ranks.get(&row.doc_id).copied().unwrap_or(i + 1);
+        match rerank_features(
+            row,
+            fused_rank,
+            analysis.units.len(),
+            titles,
+            &analysis.phrases,
+            &analysis.identifiers,
+        ) {
+            Some(features) => {
+                inputs.push(RerankInput::new(row.doc_id.clone(), features));
+                scorable.push(i);
+            }
+            None => unscorable.push(i),
+        }
+    }
+
+    let ranker = FeatureRanker::default_llm();
+    let scored = rerank(&inputs, &ranker, inputs.len());
+    let scores: HashMap<String, f32> = scored.iter().cloned().collect();
+    let index_by_doc: HashMap<String, usize> = scorable
+        .iter()
+        .map(|&i| (results[i].doc_id.clone(), i))
+        .collect();
+
+    let mut order: Vec<usize> = Vec::with_capacity(window);
+    for (doc_id, _) in &scored {
+        if let Some(&i) = index_by_doc.get(doc_id) {
+            order.push(i);
+        }
+    }
+    order.extend(unscorable);
+
+    let reordered = order
+        .iter()
+        .enumerate()
+        .filter(|(position, index)| **index != *position)
+        .count();
+
+    let old: Vec<ResultRow> = results.drain(..window).collect();
+    let mut new_window: Vec<ResultRow> = order
+        .into_iter()
+        .filter_map(|i| old.get(i).cloned())
+        .collect();
+    // The reranked prefix carries the reranker's score; skipped and out-of-window rows keep the
+    // fused score they arrived with.
+    for row in &mut new_window {
+        if let Some(score) = scores.get(&row.doc_id) {
+            row.score = f64::from(*score);
+        }
+    }
+    results.splice(0..0, new_window);
+    (window, reordered)
+}
+
 /// Drive one searcher and fold its candidates into the accumulators. Groups a single call's
 /// candidates by their lane tag, preserving the searcher's own ranking within each lane. `family`
 /// is the §8/§10 variant family the call belongs to (0 = the original query).
@@ -741,7 +1044,9 @@ fn call_searcher(
     family: u8,
 ) -> Result<usize, String> {
     timing::count("searcher_calls");
-    let cands = searcher.search(query, limit, source).map_err(|e| e.to_string())?;
+    let cands = searcher
+        .search(query, limit, source)
+        .map_err(|e| e.to_string())?;
     let mut lane_order: Vec<LaneId> = Vec::new();
     let mut groups: Vec<Vec<String>> = Vec::new();
     for c in cands {
@@ -750,7 +1055,9 @@ fn call_searcher(
                 seen_sources.push(src.clone());
             }
         }
-        if !searcher_lanes.get(idx).map_or(false, |l| l.contains(&c.lane))
+        if !searcher_lanes
+            .get(idx)
+            .map_or(false, |l| l.contains(&c.lane))
             && idx < searcher_lanes.len()
         {
             searcher_lanes[idx].push(c.lane);
@@ -766,7 +1073,9 @@ fn call_searcher(
         if !groups[pos].contains(&c.doc_id) {
             groups[pos].push(c.doc_id.clone());
         }
-        titles.entry(c.doc_id.clone()).or_insert_with(|| c.title.clone().unwrap_or_default());
+        titles
+            .entry(c.doc_id.clone())
+            .or_insert_with(|| c.title.clone().unwrap_or_default());
     }
     let mut count = 0usize;
     for (lane, docs) in lane_order.into_iter().zip(groups.into_iter()) {
@@ -808,7 +1117,10 @@ fn refresh_evidence(
     for u in units {
         // 1. Injected content verification, when available.
         if let Some(v) = verifier {
-            if let Some(doc_id) = titles.keys().find(|doc_id| v.supports(&u.text, doc_id)).cloned()
+            if let Some(doc_id) = titles
+                .keys()
+                .find(|doc_id| v.supports(&u.text, doc_id))
+                .cloned()
             {
                 records.push(EvidenceRecord {
                     unit_id: u.id.clone(),
