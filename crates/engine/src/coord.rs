@@ -22,7 +22,7 @@ use crate::route::{self, Route};
 use crate::timing;
 use crate::units::QueryUnit;
 use crate::LaneId;
-use search_rerank::{rerank, FeatureRanker, Features, RerankInput};
+use search_rerank::{rerank, FeatureRanker, Features, RerankInput, FEATURE_ORDER};
 
 /// Static bound on the round loop. The budget caps rounds at 5 (Deep); this is a hard ceiling so
 /// the loop is statically bounded even if a budget is misconfigured (§17/§18).
@@ -951,6 +951,28 @@ fn rerank_features(
     })
 }
 
+/// The weights the stage-3 rerank uses, overridable so they can be *measured*.
+///
+/// `DEFAULT_LLM_WEIGHTS` is a documented prior, not a fit: measured on the 600-query graded set it
+/// cost 0.021 nDCG, so shipping it unchanged would be a guess dressed as a decision. The override
+/// takes exactly [`FEATURE_ORDER`]'s seven numbers in order, e.g. `1,0.2,0,0,0.3,0,0.2`; a value
+/// that is not seven numbers is refused with a warning rather than half-applied.
+fn rerank_ranker() -> FeatureRanker {
+    if let Ok(raw) = std::env::var("SEARCH_RERANK_WEIGHTS") {
+        let parsed: Vec<f32> =
+            raw.split(',').filter_map(|p| p.trim().parse::<f32>().ok()).collect();
+        if parsed.len() == FEATURE_ORDER.len() && parsed.iter().all(|w| *w >= 0.0) {
+            return FeatureRanker { weights: parsed };
+        }
+        // The engine crate takes no logging dependency; a malformed experiment flag is reported on
+        // stderr and the documented prior is used, so a typo cannot silently change ranking.
+        eprintln!(
+            "SEARCH_RERANK_WEIGHTS={raw} ignored: expected seven comma-separated non-negative numbers"
+        );
+    }
+    FeatureRanker::default_llm()
+}
+
 /// Rerank the bounded prefix of `results` in place, returning `(window, reordered)`.
 ///
 /// `window` is `min(results.len(), MAX_RERANK_CANDIDATES)`. Only rows inside it are scored;
@@ -989,7 +1011,7 @@ fn rerank_results(
         }
     }
 
-    let ranker = FeatureRanker::default_llm();
+    let ranker = rerank_ranker();
     let scored = rerank(&inputs, &ranker, inputs.len());
     let scores: HashMap<String, f32> = scored.iter().cloned().collect();
     let index_by_doc: HashMap<String, usize> = scorable
