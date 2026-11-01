@@ -48,7 +48,27 @@ mod evalrun;
 /// weight set and no lane is the failure this function exists to make impossible to overlook.
 pub(crate) fn build_features_lane(
     cfg: &search_core::config::Config,
+    force: bool,
 ) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
+    // A lane at weight 0.0 is a lane that cannot change the answer but is still called on every
+    // query — measured at 16 ms p50 (172 ms against 156 ms) over the 600-query set. Serving does
+    // not pay that for nothing, so the lane is built only when the fusion weight makes it
+    // meaningful. `force` exists for the eval harness, whose control run needs the lane present at
+    // weight 0 to prove that the weight-0.4/0.8 differences are the lane's doing.
+    if !force {
+        let w = std::env::var("SEARCH_FUSION_FEATURES")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|w| *w > 0.0)
+            .unwrap_or(0.0);
+        if w == 0.0 {
+            tracing::info!(
+                "feature lane: SEARCH_FUSION_FEATURES is 0, lane not built (set it >0 once a graded \
+                 run has chosen the weight)"
+            );
+            return Vec::new();
+        }
+    }
     let encoder = cfg.data_dir.join("features").join("encoder.bin");
     if !encoder.is_file() {
         tracing::info!(
@@ -61,18 +81,18 @@ pub(crate) fn build_features_lane(
         Some(e) => e,
         None => return Vec::new(),
     };
-    // Only the roots named by SEARCH_FEDERATE_DIRS, plus the primary. Measured 2026-11-01 on the
-    // 600 graded queries with the primary root only (19,255 documents, one shard): setting
-    // `SEARCH_FUSION_FEATURES=0.8` took nDCG@10 from **0.4813 to 0.3903** and MRR from 0.4757 to
-    // 0.3611; at 0.4 it was 0.4221/0.3974; with the lexical lanes switched off entirely the lane
-    // alone scored 0.0677/0.0575. So this lane does not currently earn a weight, and the shipped
-    // weight stays 0.0 — that is the measurement, not a placeholder. Fleet postings are loaded only
-    // when the fleet is federated in, because a lane that proposes documents the searcher does not
-    // hold cannot be resolved by any later stage.
+    // Primary root plus every federated root, which is exactly the corpus this process serves:
+    // `dirs_from_env` is empty unless `SEARCH_FEDERATE_DIRS` is set. Scoping matters because the
+    // lane can only rank documents the rest of the pipeline can resolve — proposed ids that no
+    // searcher holds are dropped after wasting a candidate slot.
+    //
+    // Measured 2026-11-01 on the 600 graded queries against the primary root only (19,255
+    // documents): `SEARCH_FUSION_FEATURES=0.8` took nDCG@10 from **0.4813 to 0.3903** and MRR from
+    // 0.4757 to 0.3611; at 0.4 it was 0.4221/0.3974; with the lexical lanes switched off the lane
+    // alone scored 0.0677/0.0575. The lane therefore earns no weight yet and ships at 0.0 — that is
+    // the measurement, not a placeholder.
     let mut dirs = vec![cfg.data_dir.clone()];
-    if std::env::var("SEARCH_FEATURES_FLEET").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
-        dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
-    }
+    dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
     match search_features::FeatureLane::from_paths(&encoder, &dirs, embedder) {
         Ok(Some(lane)) => {
             tracing::info!(
@@ -590,7 +610,7 @@ async fn run_serve() -> ExitCode {
             }
         };
 
-    let mut extra_lanes = build_features_lane(&cfg);
+    let mut extra_lanes = build_features_lane(&cfg, false);
     extra_lanes.extend(build_dense_lane(&cfg));
     extra_lanes.extend(build_graph_lane(&cfg));
     extra_lanes.extend(build_concept_lane(&cfg));

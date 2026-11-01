@@ -144,7 +144,7 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     // 0.0 for every semantic lane, so without an arm that builds only this lane a "features"
     // experiment would silently run the lexical baseline.
     if matches!(opts.lanes.as_str(), "all" | "features") {
-        extra_lanes.extend(build_features_lane(&cfg));
+        extra_lanes.extend(build_features_lane(&cfg, true));
     }
     if matches!(opts.lanes.as_str(), "all" | "dense") {
         extra_lanes.extend(build_dense_lane(&cfg));
