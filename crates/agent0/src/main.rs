@@ -61,10 +61,18 @@ pub(crate) fn build_features_lane(
         Some(e) => e,
         None => return Vec::new(),
     };
-    // Every served root, because the postings were written per root by `features build` and a
-    // shard without postings is skipped by the lane itself rather than faking an empty index.
+    // Only the roots named by SEARCH_FEDERATE_DIRS, plus the primary. Measured 2026-11-01 on the
+    // 600 graded queries with the primary root only (19,255 documents, one shard): setting
+    // `SEARCH_FUSION_FEATURES=0.8` took nDCG@10 from **0.4813 to 0.3903** and MRR from 0.4757 to
+    // 0.3611; at 0.4 it was 0.4221/0.3974; with the lexical lanes switched off entirely the lane
+    // alone scored 0.0677/0.0575. So this lane does not currently earn a weight, and the shipped
+    // weight stays 0.0 — that is the measurement, not a placeholder. Fleet postings are loaded only
+    // when the fleet is federated in, because a lane that proposes documents the searcher does not
+    // hold cannot be resolved by any later stage.
     let mut dirs = vec![cfg.data_dir.clone()];
-    dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
+    if std::env::var("SEARCH_FEATURES_FLEET").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
+    }
     match search_features::FeatureLane::from_paths(&encoder, &dirs, embedder) {
         Ok(Some(lane)) => {
             tracing::info!(

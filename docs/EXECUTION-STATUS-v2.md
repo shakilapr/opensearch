@@ -1,4 +1,4 @@
-# v2 execution status — 2026-10-29
+# v2 execution status — 2026-11-01
 
 Reporting what is measured, not what is planned. Every number below came from this host.
 
@@ -66,10 +66,72 @@ text, and PLAN-v2 orders "build excerpt → verify → delete" for exactly this 
 
 Current fleet storage: **41 GB** (tantivy 17.3, text 15.6, meta 7.2).
 
-## Phase D — learned sparse features ❌ not started
+## Phase D — learned sparse features ✅ built, measured, weight 0.0
 
-No `crates/features`, `feature`/`doc_feature` empty, no feature postings in the schema. This is the
-v2 core (§5.2/§9/§14) and cannot start until dense vectors exist, because Model B trains on them.
+Built as v2 §5.2 specifies: `z = TopK(ReLU(Wx + b))`, 4096 features, 16 active, tied decoder
+`x̂ = Wᵀz`, so the whole model is `W` (4096×384 = 6.0 MiB) plus `b` and trains on CPU.
+
+| Item | State |
+|---|---|
+| `crates/features` (encoder, postings, lane) | **done** |
+| Trained encoder | **`/var/lib/search/features/encoder.bin`**, 282,983 samples, 4 epochs, 775 s |
+| Live features after training | **1,930 of 4,096 (47.1%)** on the fleet sample; 3,810 of 4,096 on the 19K primary root |
+| Postings, all five roots | **done** — 1.39M documents, 16.0 postings/doc |
+| `doc_feature` rows | **30.9M** (primary 308,080; shards 5.1M / 6.6M / 6.8M / 3.4M) |
+| Resource coverage | **100%** primary, **87.6–94.0%** per shard (the rest have no vector) |
+| Lane reachable from serving and eval | **yes** — `build_features_lane`, `--lanes features` |
+
+Two defects had to be fixed, both found by measurement:
+
+1. **The build died on memory.** The first fleet build was killed at 4.1 GB RSS (cgroup OOM) because
+   `SparseIndex::build` held every vector beside the store it came from. Rewritten to stream: sort by
+   id, then encode and write 8,192-document chunks with one transaction per chunk. Peak 0.7–1.1 GB,
+   29–154 s per shard.
+2. **The forward index keyed on the wrong id.** A fleet vector is `res_<hash>:<chunk>` while
+   `resource.resource_id` is bare, so the `WHERE EXISTS` guard silently dropped most rows — shard-1
+   landed **27,815 of 411,815** documents. The mirror now normalises to the base id and merges chunks
+   by max activation: **411,783 of 411,815**.
+
+### The measurement decides the weight, and it says zero
+
+600 graded queries, Fast mode, one process per configuration, primary root:
+
+| config | nDCG@10 | Δ vs baseline | recall@10 | MRR | p50 |
+|---|---|---|---|---|---|
+| bm25_only (baseline) | 0.4813 | — | 0.4983 | 0.4757 | 156 ms |
+| features, weight 0.0 (lane built) | 0.4813 | +0.0000 | 0.4983 | 0.4757 | 172 ms |
+| features, weight 0.4 | 0.4221 | **−0.0592** | 0.4983 | 0.3974 | 177 ms |
+| features, weight 0.8 | 0.3903 | **−0.0910** | 0.4817 | 0.3611 | 175 ms |
+| features only (no lexical lanes) | 0.0677 | −0.4136 | 0.1000 | 0.0575 | 204 ms |
+
+The lane is wired and returns documents — the weight-0 run reproduces the baseline exactly while
+costing 16 ms, which is what proves the 0.4/0.8 runs are the lane's doing and not noise. It simply
+does not rank well yet on this set, whose labels are title→document: BM25 answers a title query by
+scoring its words, while the lane has never seen the title tokens and cannot. **`SEARCH_FUSION_FEATURES`
+ships at 0.0** — the plan's rule is that the measurement sets the weight, and this measurement says
+this lane has not earned one. What would change it: training Model B on document *titles* as well as
+bodies, or measuring on a set whose queries are not near-copies of the target title.
+
+## Phase E — routing and rerank ✅ behind flags
+
+`SEARCH_ROUTE=1` enables a rule-based sparse-expert router (`crates/engine/src/route.rs`): the lexical
+expert is **never** removed, every other expert is additive and skippable, and the router is off
+unless asked, so the default path is byte-identical. `SEARCH_RERANK=1` enables a stage-3 feature
+rerank over the top 50 fused candidates. Both default off and both are gated by tests
+(`crates/engine/tests/routing.rs`, `crates/engine/tests/rerank.rs`).
+
+### Routing, measured (600 queries, `--lanes all`, dense weight 0.8)
+
+| | nDCG@10 | MRR | recall@10 | p50 | searcher calls p50 / p95 |
+|---|---|---|---|---|---|
+| `SEARCH_ROUTE` off | 0.4830 | 0.4794 | 0.4933 | 222 ms | **5 / 5** |
+| `SEARCH_ROUTE=1` | 0.4824 | 0.4776 | 0.4967 | 155 ms | **2 / 4** |
+
+The router removes **three of five lane calls** on the median query and 30% of p50 latency
+(67 ms) for **0.0007 nDCG** and 0.0018 MRR. p95 calls of 4 show the fallback path working: queries
+the router cannot classify still reach nearly every lane rather than being forced down one branch.
+It ships off because a 0.0007 quality cost has to be chosen deliberately, not inherited — turning it
+on is a one-variable decision (`SEARCH_ROUTE=1`) once a workload's latency budget needs it.
 
 ## Graded-set measurements (600 queries, Fast mode, one process per config)
 
@@ -127,15 +189,18 @@ fusion weight — one case shifts nDCG by ~0.017. Needs ~50 cases.
 | Concept lane served | present in `lane_ranks` | **yes, 1–2 of 40** |
 | Cross-disciplinary acceptance | oxytocin paper for a romance query | **fails on corpus** — 1.34M docs, 2 with "oxytocin" in the title |
 | Storage ≤15 GB | after Phase C rebuild | 41 GB (rebuild pending) |
-| Dense lane covers corpus | all shards have vectors | 0 of 4 (in progress) |
-| nDCG@10 semantic > BM25 | strictly better | **measured: dense +0.0017, graph 0.0000, concept −0.0114** |
+| Dense lane covers corpus | all shards have vectors | **4 of 4** (1.39M documents) |
+| nDCG@10 semantic > BM25 | strictly better | **measured: dense +0.0017, graph 0.0000, concept −0.0114, features −0.0910 at w=0.8** |
 
 ## Honest summary
 
-Phase A is complete and serving. Phase B is running and will take about a day. Phase C's code is
-committed but its effect is gated on a rebuild that must not run before Phase B finishes. Phase D —
-the learned sparse memory that is v2's actual core — has not started and cannot until B lands.
+Phase A is complete and serving. Phase B is complete: 1,387,749 fleet documents have vectors.
+Phase C's code is committed and its rebuild is still pending. Phase D — the learned sparse memory
+that is v2's actual core — is built end to end: encoder trained, postings written for all five roots,
+`doc_feature` mirrored for 1.39M documents, and the lane selectable from serving and eval.
 
-The concept layer works and is now reachable, which it was not this morning. It does not yet change
-rankings measurably, and the acceptance query still fails because the corpus lacks the literature,
-not because the lane is wrong.
+Every semantic lane now exists and none of them yet beats BM25 on the graded set. The features lane
+is the clearest case: at weight 0.8 it costs 0.091 nDCG, and it ships at 0.0. That is not a failure
+of the architecture, it is the first honest measurement of it — and it names the next task precisely:
+the encoder has learned a document-similarity space from body text, while the graded labels reward
+matching a title's words. Training on titles too is the cheapest experiment that could move it.
