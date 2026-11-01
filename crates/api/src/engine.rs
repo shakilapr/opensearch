@@ -76,6 +76,15 @@ pub struct EngineSearchRequest {
     /// Requested mode; defaults to [`EngineMode::Auto`].
     #[serde(default)]
     pub mode: EngineMode,
+    /// Generate an LLM answer. **Opt-in**, because it costs a model call per request.
+    ///
+    /// Measured 2026-10-31 on the live service: retrieval answers in ~400 ms, while an
+    /// `engine:true` request that generated an answer took **11.4 s**, and the benchmark's p95 was
+    /// 13 s with a 25 s max — every spike was a model call, not the index. PLAN-v2 Phase 1.3
+    /// states the rule directly: "engine:true must not pay an LLM call it cannot deliver; answer
+    /// generation becomes opt-in per request."
+    #[serde(default)]
+    pub answer: bool,
 }
 
 /// One engine result: the frozen [`SearchResult`] fields (flattened, so the wire
@@ -812,7 +821,13 @@ pub fn run_engine_search(
     // Passage-text adapter: see [`SnippetAnswerer`]. Built from the same shared
     // maps the lanes populate, so it is read only after they have run.
     let retained_maps = vec![Arc::clone(&retained_bm25), Arc::clone(&retained_source)];
-    let wrapped = answerer.map(|a| SnippetAnswerer::new(a, searcher, retained_maps.clone()));
+    let wrapped = if req.answer {
+        answerer.map(|a| SnippetAnswerer::new(a, searcher, retained_maps.clone()))
+    } else {
+        // No answer requested: do not build the adapter and do not call the model. Retrieval
+        // results are unaffected — the answerer only adds `answer` and its usage counters.
+        None
+    };
     // §16: verify units against real document text, not just titles.
     let verifier = TextVerifier::new(searcher, retained_maps);
 
@@ -1186,6 +1201,7 @@ mod tests {
             },
             engine: true,
             mode: EngineMode::Auto,
+            answer: false,
         };
         let no_lanes: Vec<Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> = Vec::new();
 
@@ -1284,6 +1300,7 @@ mod tests {
             },
             engine: true,
             mode,
+            answer: false,
         };
 
         for (mode, should_run) in [

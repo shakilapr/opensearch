@@ -318,8 +318,29 @@ impl Indexer {
                 Some(Mutex::new(overlay.writer(budget).ix()?)),
             )
         };
-        let base_reader = base.reader().ix()?;
-        let overlay_reader = overlay.reader().ix()?;
+        // A read-only index uses `ReloadPolicy::Manual`; everything else keeps Tantivy's default.
+        //
+        // `index.reader()` defaults to `OnCommitWithDelay`, which spawns a file-watcher thread per
+        // reader that polls the directory and reloads on every commit. Serving five indices while
+        // four crawlers commit to them means five watcher threads spinning: profiled
+        // 2026-10-31, `FileWatcher::spawn` plus the `from_utf8` work it drives were **44% of all
+        // samples** in the serving process, and `do_sys_openat2` another 9.6%.
+        //
+        // The serving path already refreshes explicitly through `refresh_readers`, which is
+        // throttled and measured. Letting Tantivy also reload behind that is duplicate work with no
+        // benefit — and it invalidates caches at moments the code did not choose.
+        let (base_reader, overlay_reader) = if cfg.read_only {
+            (
+                base.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().ix()?,
+                overlay
+                    .reader_builder()
+                    .reload_policy(tantivy::ReloadPolicy::Manual)
+                    .try_into()
+                    .ix()?,
+            )
+        } else {
+            (base.reader().ix()?, overlay.reader().ix()?)
+        };
         let fields = Fields::from_schema(&schema);
         let manifest = load_manifest(&cfg.base_dir)?;
         Ok(Self {

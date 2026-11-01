@@ -192,6 +192,9 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
             // 3 queries took over 280 s and reported nothing. Fast mode's refresh_count is 0, which
             // is what makes a 604-case run tractable and repeatable. `--mode deep` opts back in.
             mode: opts.mode,
+            // A benchmark measures retrieval. Asking for an answer would put a model call inside
+            // every case and measure the provider, not the engine.
+            answer: false,
         };
         let started = std::time::Instant::now();
         let _ = search_engine::timing::take();

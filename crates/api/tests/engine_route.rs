@@ -270,7 +270,7 @@ async fn answerer_text_appears_and_results_unchanged() {
         addr_a,
         "POST",
         "/search",
-        Some(r#"{"query":"rust","engine":true}"#),
+        Some(r#"{"query":"rust","engine":true,"answer":true}"#),
     )
     .await;
     assert_eq!(s, 200, "with answerer: {with}");
@@ -314,7 +314,7 @@ async fn answerer_receives_resolved_passage_text_not_doc_ids() {
         addr,
         "POST",
         "/search",
-        Some(r#"{"query":"rust","engine":true,"mode":"fast","limit":3}"#),
+        Some(r#"{"query":"rust","engine":true,"mode":"fast","limit":3,"answer":true}"#),
     )
     .await;
     assert_eq!(s, 200, "{b}");
@@ -374,7 +374,7 @@ async fn answerer_excerpts_the_stored_body_around_the_query_terms() {
         addr,
         "POST",
         "/search",
-        Some(r#"{"query":"transformers nlp","engine":true,"mode":"fast","limit":2}"#),
+        Some(r#"{"query":"transformers nlp","engine":true,"mode":"fast","limit":2,"answer":true}"#),
     )
     .await;
     assert_eq!(s, 200, "{b}");
