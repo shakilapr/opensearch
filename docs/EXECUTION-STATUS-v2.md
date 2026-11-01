@@ -77,7 +77,7 @@ Built as v2 §5.2 specifies: `z = TopK(ReLU(Wx + b))`, 4096 features, 16 active,
 | Trained encoder | **`/var/lib/search/features/encoder.bin`**, 282,983 samples, 4 epochs, 775 s |
 | Live features after training | **1,930 of 4,096 (47.1%)** on the fleet sample; 3,810 of 4,096 on the 19K primary root |
 | Postings, all five roots | **done** — 1.39M documents, 16.0 postings/doc |
-| `doc_feature` rows | **30.9M** (primary 308,080; shards 5.1M / 6.6M / 6.8M / 3.4M) |
+| `doc_feature` rows | **22.2M** (primary 308,080; shards 5.1M / 6.6M / 6.8M / 3.4M) |
 | Resource coverage | **100%** primary, **87.6–94.0%** per shard (the rest have no vector) |
 | Lane reachable from serving and eval | **yes** — `build_features_lane`, `--lanes features` |
 

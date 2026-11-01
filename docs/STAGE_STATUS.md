@@ -202,4 +202,4 @@ Every semantic lane exists and none of them yet beats BM25 on the 600-query grad
 +0.0017 nDCG, graph 0.0000, concept −0.0114, learned features −0.0910 at weight 0.8. Each lane's
 fusion weight is therefore whatever was measured, and for features that is **0.0** — the lane is
 built, tested, and deliberately absent from scoring. The sparse index itself is complete: 1.39M
-documents, 16.0 postings each, 30.9M `doc_feature` rows, 87.6–100% resource coverage.
+documents, 16.0 postings each, 22.2M `doc_feature` rows, 87.6–100% resource coverage.
