@@ -53,6 +53,15 @@ impl Default for FusionPolicy {
             LaneId::Concept,
             weight_from_env("SEARCH_FUSION_CONCEPT", 0.0),
         );
+        // The learned sparse-feature lane (v2 §5.2/§9) is the one lane whose score is a *learned*
+        // number rather than a lexical or geometric one, and it is the only lane whose vocabulary
+        // is a trained artefact: turn it on only once a graded run has chosen the weight.
+        // SEARCH_FUSION_FEATURES=0.8 plus `--lanes features` is the experiment; 0.0 is the default
+        // because "the measurement, not the expectation, sets the weight".
+        weights.insert(
+            LaneId::Features,
+            weight_from_env("SEARCH_FUSION_FEATURES", 0.0),
+        );
         Self {
             c: weight_from_env("SEARCH_FUSION_C", 60.0),
             weights,

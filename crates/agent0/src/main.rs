@@ -36,6 +36,86 @@ use search_core::config::Config;
 mod evalrun;
 
 
+/// Build the learned sparse-feature lane (v2 §5.2/§9), when a trained encoder exists.
+///
+/// Unlike the dense lane this is not a brute-force scan: the query's teacher embedding is projected
+/// through `W`, and the resulting `active` features are answered from the inverted postings, so its
+/// cost is set by the posting lists a query touches (≈86K postings fleet-wide) rather than by the
+/// corpus size. It is therefore enabled on every root, fleet included.
+///
+/// The lane is built even at weight 0.0: `SEARCH_FUSION_FEATURES` decides how much it contributes
+/// to the ranking, while building it decides whether it can contribute at all. Serving with a
+/// weight set and no lane is the failure this function exists to make impossible to overlook.
+pub(crate) fn build_features_lane(
+    cfg: &search_core::config::Config,
+) -> Vec<std::sync::Arc<dyn search_retrieval::LaneSearcher + Send + Sync>> {
+    let encoder = cfg.data_dir.join("features").join("encoder.bin");
+    if !encoder.is_file() {
+        tracing::info!(
+            path = %encoder.display(),
+            "feature lane: no trained encoder, lane absent (run `agent0 features train`)"
+        );
+        return Vec::new();
+    }
+    let embedder = match model_embedder(cfg) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    // Every served root, because the postings were written per root by `features build` and a
+    // shard without postings is skipped by the lane itself rather than faking an empty index.
+    let mut dirs = vec![cfg.data_dir.clone()];
+    dirs.extend(search_agent0::fedserve::dirs_from_env(&cfg.data_dir));
+    match search_features::FeatureLane::from_paths(&encoder, &dirs, embedder) {
+        Ok(Some(lane)) => {
+            tracing::info!(
+                shards = lane.shard_summary().len(),
+                documents = lane.len(),
+                features = lane.features(),
+                active = lane.active(),
+                "feature lane ready"
+            );
+            vec![std::sync::Arc::new(lane)]
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "feature lane unavailable");
+            Vec::new()
+        }
+    }
+}
+
+/// The teacher embedder, loaded once and shared by every lane that needs one.
+///
+/// Returns `None` when the BGE weights are missing instead of falling back to a different
+/// embedder: the postings and the query codes must come from the *same* model, and a stand-in
+/// would produce features that mean something else while looking perfectly well-formed.
+fn model_embedder(
+    cfg: &search_core::config::Config,
+) -> Option<std::sync::Arc<dyn search_embed::Embedder>> {
+    #[cfg(feature = "bge")]
+    {
+        let cache = std::env::var("SEARCH_MODEL_CACHE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| cfg.data_dir.join("fastembed"));
+        match search_embed::bge::BgeEmbedder::with_cache_dir(cache) {
+            Ok(e) => Some(std::sync::Arc::new(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, "BGE weights unavailable: feature lane absent");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "bge"))]
+    {
+        // Without the `bge` feature the dense lane uses a hash embedder, which is a different
+        // vector space from the one the encoder was trained on; using it would silently answer
+        // with features that were never trained. Absent is the honest answer.
+        let _ = cfg;
+        tracing::info!("feature lane: built without the `bge` feature, lane absent");
+        None
+    }
+}
+
 /// Build the dense lane over the vector sidecar, when one exists.
 ///
 /// The binary owns this choice: it knows the data root, the `SEARCH_MODEL_CACHE` location and
@@ -262,6 +342,16 @@ async fn main() -> ExitCode {
             Some("recover") => search_agent0::frontier_recover::run(&args),
             _ => {
                 eprintln!("usage: agent0 frontier recover [--dir PATH]... [--now EPOCH]");
+                ExitCode::from(2)
+            }
+        },
+        Some("features") => match args.get(2).map(String::as_str) {
+            Some("train") => search_agent0::featuresbuild::run_train(&args),
+            Some("build") => search_agent0::featuresbuild::run_build(&args),
+            _ => {
+                eprintln!(
+                    "usage: agent0 features train --vectors PATH[,PATH...] [--out DIR] [--features N] [--active N] [--epochs N] [--sample N] [--lr F] [--resample-every N] [--train-bias]\n       agent0 features build [--dir PATH]... [--encoder PATH] [--active N] [--limit N] [--forward-index]"
+                );
                 ExitCode::from(2)
             }
         },
@@ -492,7 +582,8 @@ async fn run_serve() -> ExitCode {
             }
         };
 
-    let mut extra_lanes = build_dense_lane(&cfg);
+    let mut extra_lanes = build_features_lane(&cfg);
+    extra_lanes.extend(build_dense_lane(&cfg));
     extra_lanes.extend(build_graph_lane(&cfg));
     extra_lanes.extend(build_concept_lane(&cfg));
     if let Err(e) = search_api::serve_with(&cfg, searcher, Some(deep), answerer, planner, extra_lanes).await {

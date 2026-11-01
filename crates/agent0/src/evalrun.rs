@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use search_core::contract::SearchRequest;
 use search_eval::{aggregate, load_cases, RunResult};
 
-use crate::{build_concept_lane, build_dense_lane, build_graph_lane};
+use crate::{build_concept_lane, build_dense_lane, build_features_lane, build_graph_lane};
 
 pub struct Options {
     set: PathBuf,
@@ -140,6 +140,12 @@ pub async fn run(args: &[String]) -> std::process::ExitCode {
     };
     let searcher = pipeline.searcher();
     let mut extra_lanes = Vec::new();
+    // `--lanes features` exists so the lane can be measured on its own: fusion weights default to
+    // 0.0 for every semantic lane, so without an arm that builds only this lane a "features"
+    // experiment would silently run the lexical baseline.
+    if matches!(opts.lanes.as_str(), "all" | "features") {
+        extra_lanes.extend(build_features_lane(&cfg));
+    }
     if matches!(opts.lanes.as_str(), "all" | "dense") {
         extra_lanes.extend(build_dense_lane(&cfg));
     }

@@ -387,6 +387,19 @@ pub fn run_build(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The resource a vector belongs to: `res_<hash>:3` (chunk 3) is a chunk of `res_<hash>`.
+///
+/// Only a trailing `:<digits>` is stripped. An id with no suffix is already a resource id, and a
+/// colon anywhere else is left alone rather than guessed at.
+fn base_resource_id(doc_id: &str) -> &str {
+    match doc_id.rsplit_once(':') {
+        Some((base, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            base
+        }
+        _ => doc_id,
+    }
+}
+
 /// How many documents a streaming build encodes and writes at a time.
 ///
 /// 8,192 documents is ~13 MB of vectors plus ~1 MB of codes: small enough that the build's memory
@@ -449,28 +462,54 @@ impl ForwardWriter {
     }
 
     /// Write one chunk's rows; returns how many rows actually landed.
+    ///
+    /// Document ids are normalised to the owning resource: a fleet vector is keyed
+    /// `res_<hash>:<chunk>` (one vector per text chunk, which is also what Tantivy's delete term
+    /// holds), while `resource.resource_id` is the bare `res_<hash>`. Writing the suffixed id made
+    /// the `WHERE EXISTS` guard skip almost every row — on shard-1 only 27,815 of 411,815 documents
+    /// landed, which is why the mirror is keyed on the base id and the per-chunk codes are merged.
+    ///
+    /// Merge rule: per feature, the highest activation across the document's chunks. A feature
+    /// present in one chunk and absent from another is still a property of the *document*, and
+    /// `max` keeps the strongest evidence rather than averaging it away. The upsert repeats the
+    /// merge across batches, because a long document's chunks can straddle a chunk boundary.
     fn put_batch(&mut self, batch: &[(String, Vec<search_features::FeatureHit>)]) -> Result<usize, String> {
+        let mut merged: std::collections::BTreeMap<&str, std::collections::BTreeMap<u32, f32>> =
+            std::collections::BTreeMap::new();
+        for (doc_id, hits) in batch {
+            let base = base_resource_id(doc_id);
+            let slot = merged.entry(base).or_default();
+            for h in hits {
+                let e = slot.entry(h.feature).or_insert(f32::MIN);
+                if h.activation > *e {
+                    *e = h.activation;
+                }
+            }
+        }
+
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let mut rows = 0usize;
         {
             let mut stmt = tx
                 .prepare(
-                    "INSERT OR REPLACE INTO doc_feature
+                    "INSERT INTO doc_feature
                        (resource_id, feature_id, model_id, version, space_id, activation, created_at)
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-                      WHERE EXISTS (SELECT 1 FROM resource r WHERE r.resource_id = ?1)",
+                      WHERE EXISTS (SELECT 1 FROM resource r WHERE r.resource_id = ?1)
+                     ON CONFLICT (resource_id, model_id, version, space_id, feature_id)
+                     DO UPDATE SET activation = max(doc_feature.activation, excluded.activation)",
                 )
                 .map_err(|e| e.to_string())?;
-            for (doc_id, hits) in batch {
-                for h in hits {
+            for (doc_id, hits) in &merged {
+                for (feature, activation) in hits {
                     rows += stmt
                         .execute(rusqlite::params![
                             doc_id,
-                            h.feature as i64,
+                            *feature as i64,
                             self.model_id,
                             self.version,
                             self.space_id,
-                            h.activation as f64,
+                            *activation as f64,
                             self.now
                         ])
                         .map_err(|e| e.to_string())?;

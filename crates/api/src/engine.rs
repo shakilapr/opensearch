@@ -151,6 +151,7 @@ pub fn lane_name(lane: Lane) -> &'static str {
         Lane::Dense => "dense",
         Lane::Graph => "graph",
         Lane::Concept => "concept",
+        Lane::Features => "features",
     }
 }
 
