@@ -107,10 +107,29 @@ Two defects had to be fixed, both found by measurement:
 The lane is wired and returns documents — the weight-0 run reproduces the baseline exactly while
 costing 16 ms, which is what proves the 0.4/0.8 runs are the lane's doing and not noise. It simply
 does not rank well yet on this set, whose labels are title→document: BM25 answers a title query by
-scoring its words, while the lane has never seen the title tokens and cannot. **`SEARCH_FUSION_FEATURES`
-ships at 0.0** — the plan's rule is that the measurement sets the weight, and this measurement says
-this lane has not earned one. What would change it: training Model B on document *titles* as well as
-bodies, or measuring on a set whose queries are not near-copies of the target title.
+scoring its words, while the lane has never seen the title tokens and cannot.
+
+### The same measurement at fleet scale changes the size of the answer, not its sign
+
+`eval run` used to open only the primary root even with `SEARCH_FEDERATE_DIRS` set, so every number
+above described 1.4% of the served corpus. Fixed (`evalrun` now federates exactly as `serve` does)
+and re-measured on **1,512,850 documents**:
+
+| config | nDCG@10 | Δ | recall@10 | MRR | p50 |
+|---|---|---|---|---|---|
+| federated lexical baseline | 0.2481 | — | 0.4450 | 0.1870 | 329 ms |
+| federated + features w=0.8 | 0.2460 | **−0.0021** | 0.4467 | 0.1843 | 386 ms |
+
+Two things this measurement says. First, at fleet scale the lane costs 0.002 nDCG instead of 0.091 —
+it is close to neutral rather than destructive, so the primary-root number was overstating the harm.
+Second, the *baseline itself* falls from 0.4813 to 0.2481 nDCG@10 when the corpus grows 78×: the
+graded set's labels are a document's own title, which a 19K-document corpus answers almost by
+construction, and 1.5M documents do not. The 600-query set therefore cannot rank semantic lanes
+fairly until it is rebuilt against the delivered corpus.
+
+**`SEARCH_FUSION_FEATURES` ships at 0.0** — the plan's rule is that the measurement sets the weight,
+and neither scale shows a gain. What would change it: training Model B on titles as well as bodies,
+IDF-weighting the postings, and a graded set whose queries are not near-copies of the target title.
 
 ## Phase E — routing and rerank ✅ behind flags
 
@@ -132,6 +151,19 @@ The router removes **three of five lane calls** on the median query and 30% of p
 the router cannot classify still reach nearly every lane rather than being forced down one branch.
 It ships off because a 0.0007 quality cost has to be chosen deliberately, not inherited — turning it
 on is a one-variable decision (`SEARCH_ROUTE=1`) once a workload's latency budget needs it.
+
+### Rerank, measured (600 queries, primary root, `--lanes none`)
+
+| | nDCG@10 | MRR | recall@10 | p50 |
+|---|---|---|---|---|
+| `SEARCH_RERANK` off | 0.4813 | 0.4757 | 0.4983 | 156 ms |
+| `SEARCH_RERANK=1` | 0.4600 | 0.4468 | 0.4983 | 158 ms |
+
+Recall is identical, which is the expected shape for a reranker: it moved no documents in or out of
+the top 10, only their order — and moved them the wrong way. The weights it used are
+`DEFAULT_LLM_WEIGHTS`, a documented untuned prior, so this is a measurement of the prior and not of
+reranking as an idea. It stays off; the next step is fitting those weights on a held-out half of the
+graded set and measuring the other half.
 
 ## Graded-set measurements (600 queries, Fast mode, one process per config)
 
