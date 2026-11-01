@@ -50,6 +50,11 @@ pub enum Lane {
     /// query resolves to concepts, the matrix resolves concepts to document ids, and the weights
     /// become the score.
     Concept,
+    /// Learned sparse-feature lane (v2 §5.2/§9, `crates/features`): the query's teacher embedding
+    /// is projected through the trained `W`, and the resulting ≤32 features are answered from an
+    /// inverted index of `doc_feature` postings. Unlike [`Lane::Dense`] it does not scan the
+    /// corpus, and unlike [`Lane::Bm25`] it does not require the query's words to appear.
+    Features,
 }
 
 /// A scored retrieval candidate carrying enough provenance for the UI's

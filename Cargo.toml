@@ -15,6 +15,7 @@ members = [
     "crates/sources",
     "crates/graph",
     "crates/retrieval",
+    "crates/features",
     "crates/eval",
     "crates/embed",
     "crates/rerank",

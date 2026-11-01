@@ -1,0 +1,19 @@
+[package]
+name = "search-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "v2 §5.2/§9: learned sparse features — encoder, forward index, postings, lane."
+
+[dependencies]
+search-core = { path = "../core" }
+search-embed = { path = "../embed" }
+search-retrieval = { path = "../retrieval" }
+thiserror.workspace = true
+tracing.workspace = true
+# Gradient accumulation shards a mini-batch across cores. `rayon` is already in the dependency
+# graph through Tantivy, so this adds no new third-party code to the build.
+rayon = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
