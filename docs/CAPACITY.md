@@ -21,6 +21,30 @@ Two things had to be fixed before these numbers existed at all: **195,648 expire
 (55,158 + 52,108 + 56,786 + 31,596) were reclaimed with `agent0 frontier recover`, and the crawlers
 were dying silently (see `docs/OPERATIONS.md`). Before both, the fleet sat at ~110 docs/min.
 
+## 1.1 What changed on 2026-11-02, and what it bought
+
+| Change | Why | Effect (measured) |
+| --- | --- | --- |
+| refill **leases** rows (`READY`→`FETCHING`) instead of reading them | every refill returned the same head of the frontier; the drain had already logged those URLs and idled | the frontier advances; `DONE` grows instead of `READY` |
+| completion buffered, 256 per transaction | one SQLite commit per page pinned the crawl to the writer's fsync rate | removed the per-document commit |
+| completion matches `READY`/`NEW` too | 69% of each refill was URLs already attempted through discovery, never marked | refills stopped wasting slots |
+| refill breadth 512→1,024 URLs, 4→8 per origin | one 256-row refill carried 27 distinct origins; sockets sat at 17 of 256 | 17→58 sockets |
+| `Restart=always` on the crawler units | the crawler exits when its seed slice quiesces (every few minutes); it used to idle until a watchdog noticed | no idle gap between runs |
+| `CPUQuota=250%`, `MemoryMax=6G` per crawler | leave ~6 of 16 cores and most RAM for serving and batch work | load 5–12 of 16 while crawling |
+| watchdog checks **ingest**, not process presence | a shard wrote 429 warnings for an hour with zero documents | shard restarted within 30 min of starving |
+
+| Metric | Before | After |
+| --- | --- | --- |
+| attempts | 540/min (9/s) | **834/min (13.9/s)** |
+| documents | 372/min (6.2/s, 22.3k/h) | **666/min (11.1/s, 40k/h)** |
+| best shard burst | — | **548 docs/s** (one shard, productive slice) |
+| sockets per crawler | 17 | 17–58 |
+| frontier `DONE` | stalled | +~2,000/5 min per shard |
+
+The gap between the sustained average and the 548/s burst is **yield, not engine speed**: shard-0
+ran 40–90% ingest while another slice ran 2–10% (robots-denied spam), and the fleet average is their
+sum. That is the frontier's composition, and it is the next lever.
+
 ## 2. What 1,000 sites/s means
 
 1,000 sites/s = **60,000 attempts/min**, 111× the current attempt rate, and — at the measured 68.8%

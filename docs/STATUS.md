@@ -22,6 +22,7 @@ Updated 2026-11-02. Every number is from this host; the commands that produced t
 | Entity graph | 130,359 rows, primary root only |
 | Migration ledger | 9 on every root |
 | Legacy `/search` | p50 34 ms, p95 97 ms |
+| Crawl throughput | **11.1 docs/s sustained (40k/h)**, bursts to 548/s; 13.9 attempts/s |
 | `engine:true` | p50 620 ms, p95 2,541 ms |
 
 The corpus is crawled and searchable. The semantic layer is built and, measured, not yet worth a
