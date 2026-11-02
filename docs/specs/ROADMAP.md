@@ -116,7 +116,7 @@ These are real, current limitations — none is a hidden TODO:
     `127.0.0.1:8080` default). With no API reachable, every tool returns an honest
     `isError`; there is no embedded in-process backend.
 13. **Verification is token-based, not entity-aware.** §16 coverage can be satisfied by a page
-    that contains a unit's tokens without the fact (recorded in `engine/engine-architecture.md`
+    that contains a unit's tokens without the fact (recorded in `docs/legacy/engine-architecture.md`
     §26). The trace names the supporting document so the verdict can be audited; the answerer
     remains the honesty gate.
 14. **`RUST_LOG` filtering is coarse.** The subscriber is installed

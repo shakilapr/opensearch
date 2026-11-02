@@ -1,7 +1,7 @@
 # Engine Spec — the algorithmic core (`search-engine`)
 
 Frozen interfaces for `crates/engine`. This implements the query-time half of
-`engine/engine-architecture.md` (§6–§18), which was specified but never built. The
+`docs/legacy/engine-architecture.md` (§6–§18), which was specified but never built. The
 crawl/index spine (Stages 0–10) stays as-is; this crate sits **above** it and **below**
 `search-api`.
 

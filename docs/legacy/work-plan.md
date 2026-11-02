@@ -14,7 +14,7 @@ Source documents this plan must satisfy (deduped by content):
 | :--- | :--- |
 | `docs/specs/CRAWLER.md` (= `crawler/*`, `docs/ARCHITECTURE.md`) | Crawler: 5 IDs, source registry, frontier, per-origin scheduling, robots, fetchers, routing, parsers, adapters, freshness, storage tiers, events, security |
 | `engine/ARCHITECTURE.md` (= `docs/specs/AGENT_NATIVE_SEARCH_ENGINE.md`) | Engine: 3 planes, data model, retrieval lanes, query pipeline, ranking, agent policy, API, evaluation, 13 build stages |
-| `engine/engine-architecture.md` | Algorithm spec v2: contracts, persistent records, retrieval lanes, RRF, cascade, budgets, coordinator, service boundaries, acceptance tests |
+| `docs/legacy/engine-architecture.md` | Algorithm spec v2: contracts, persistent records, retrieval lanes, RRF, cascade, budgets, coordinator, service boundaries, acceptance tests |
 | `README.md` + `ui/README.md` | Repo topology, 5 IDs summary, modes, deployment, UI contract |
 
 Governing principle (both crawler + engine docs): **a compact semantic map of where useful
