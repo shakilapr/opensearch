@@ -19,12 +19,39 @@ use search_core::AppResult;
 use search_metadata::MetadataReader;
 
 /// URLs to hand the drain per refill, spread across origins.
-pub const REFILL_BATCH: usize = 512;
+///
+/// This is the breadth knob. Measured 2026-11-02: at 512 with a per-origin share of 4, one refill
+/// carried only ~27-128 distinct origins, the drain held 17 sockets against a 256-slot bound, and
+/// the fleet managed 9 attempts/s while 47,000 origins had READY work. The frontier query's first
+/// rows are dominated by a few deep hosts, so the refill must ask for far more than it will
+/// dispatch and let the per-origin filter spread it. Overridable with
+/// `SEARCH_CRAWL_REFILL_BATCH`.
+pub const REFILL_BATCH: usize = 4_096;
 
 /// Per-origin share of one refill. A host contributes at most this many URLs per call, so a
 /// sitemap that advertised 20,000 URLs cannot crowd out the other hosts — the same fairness the
 /// dispatch loop enforces with `origin_cap`, applied at the point rows are read.
-pub const PER_ORIGIN_SHARE: usize = 4;
+/// Overridable with `SEARCH_CRAWL_PER_ORIGIN_SHARE`.
+pub const PER_ORIGIN_SHARE: usize = 8;
+
+/// Read a `usize` env knob, falling back to the compiled default.
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// Effective refill batch (env-overridable).
+pub fn refill_batch() -> usize {
+    knob("SEARCH_CRAWL_REFILL_BATCH", REFILL_BATCH)
+}
+
+/// Effective per-origin share (env-overridable).
+pub fn per_origin_share() -> usize {
+    knob("SEARCH_CRAWL_PER_ORIGIN_SHARE", PER_ORIGIN_SHARE)
+}
 
 /// Dispatchable URLs: `READY` first (already reclaimed and immediately fetchable), then `NEW`
 /// whose `earliest_fetch_at` has arrived. Ordered by priority so the crawl keeps doing the work
@@ -36,6 +63,25 @@ const REFILL_SQL: &str = "
      ORDER BY CASE status WHEN 'READY' THEN 0 ELSE 1 END,
               priority ASC, earliest_fetch_at ASC, resource_id ASC
      LIMIT ?2";
+
+/// Lease the rows a refill hands out: `READY`/`NEW` -> `FETCHING` with an expiry.
+///
+/// Without this the refill returns the same head of the table on every call — the rows are still
+/// `READY`, the drain has already seen them, and the queue empties while millions stay pending.
+/// Measured 2026-11-02: throughput oscillated between ~2,300 and ~20 attempts/min with 47,000
+/// origins holding READY work, and 195,648 leases had to be reclaimed by hand. A row this pass
+/// fails to complete is recovered by `agent0 frontier recover` after `lease_until`, which is the
+/// same contract the frontier's own `lease` uses.
+const LEASE_SQL: &str = "
+    UPDATE frontier_entry
+       SET status = 'FETCHING', lease_until = ?2, epoch = epoch + 1
+     WHERE resource_id IN (
+        SELECT resource_id FROM frontier_entry
+         WHERE status = 'READY'
+            OR (status = 'NEW' AND earliest_fetch_at <= ?1)
+         ORDER BY CASE status WHEN 'READY' THEN 0 ELSE 1 END,
+                  priority ASC, earliest_fetch_at ASC, resource_id ASC
+         LIMIT ?3)";
 
 /// Read up to [`REFILL_BATCH`] dispatchable URLs, at most [`PER_ORIGIN_SHARE`] per origin.
 ///
@@ -54,14 +100,21 @@ pub fn dispatchable_urls(
         .prepare(REFILL_SQL)
         .map_err(search_metadata::db_err)?;
     // Read generously: the per-origin filter below drops most of a deep host's rows.
+    // Read generously: the per-origin filter below drops most of a deep host's rows, and the
+    // frontier's head is not diverse (measured: 27 distinct origins in the first 256 rows).
     let rows = stmt
-        .query_map(rusqlite::params![now, (limit * 32) as i64], |r| {
+        .query_map(rusqlite::params![now, (limit.saturating_mul(16)).max(4_096) as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .map_err(search_metadata::db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(search_metadata::db_err)?;
+    // `dispatchable_urls` is called on the metadata *reader*, which cannot write, so the lease is
+    // taken by the caller (see `crawl::refill_frontier`). Returning rows here keeps this function
+    // read-only and testable.
+    let _ = &rows;
 
+    let share = per_origin_share();
     let mut per_origin: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<String> = Vec::with_capacity(limit);
     for (url, origin) in rows {
@@ -69,7 +122,7 @@ pub fn dispatchable_urls(
             break;
         }
         let taken = per_origin.entry(origin).or_insert(0);
-        if *taken >= PER_ORIGIN_SHARE {
+        if *taken >= share {
             continue;
         }
         *taken += 1;
@@ -77,6 +130,78 @@ pub fn dispatchable_urls(
     }
     Ok(out)
 }
+
+/// Lease up to `limit` dispatchable URLs and mark exactly those rows `FETCHING`.
+///
+/// The read and the write must be one decision. `dispatchable_urls` alone returns the same head of
+/// the table on every call: the rows stay `READY`, the drain has already logged them, and the queue
+/// empties while millions remain pending. Measured 2026-11-02: throughput oscillated between ~2,300
+/// and ~20 attempts/min with 47,000 origins holding READY work, and 195,648 stale leases had to be
+/// reclaimed by hand.
+///
+/// A row that is leased and never completed is recovered by `agent0 frontier recover` once
+/// `lease_until` passes — the same contract `Frontier::lease` uses.
+pub fn lease_dispatchable(
+    conn: &rusqlite::Connection,
+    now: i64,
+    limit: usize,
+) -> AppResult<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let yield_after = now + LEASE_SECONDS;
+
+    // Select generously, then apply the per-origin share in Rust: the SQL's head is dominated by a
+    // few deep hosts (measured: 27 distinct origins in the first 256 rows).
+    let mut stmt = conn.prepare(REFILL_SQL).map_err(search_metadata::db_err)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![now, (limit.saturating_mul(16)).max(4_096) as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .map_err(search_metadata::db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(search_metadata::db_err)?;
+
+    let share = per_origin_share();
+    let mut per_origin: HashMap<String, usize> = HashMap::new();
+    let mut urls: Vec<String> = Vec::with_capacity(limit);
+    for (url, origin) in rows {
+        if urls.len() >= limit {
+            break;
+        }
+        let taken = per_origin.entry(origin).or_insert(0);
+        if *taken >= share {
+            continue;
+        }
+        *taken += 1;
+        urls.push(url);
+    }
+    if urls.is_empty() {
+        return Ok(urls);
+    }
+
+    // Chunked so the statement stays far below SQLite's variable limit.
+    for chunk in urls.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "UPDATE frontier_entry SET status = 'FETCHING', lease_until = ?1
+              WHERE url IN ({placeholders}) AND status IN ('READY','NEW')"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        params.push(&yield_after);
+        for u in chunk {
+            params.push(u);
+        }
+        conn.execute(&sql, params.as_slice())
+            .map_err(search_metadata::db_err)?;
+    }
+    Ok(urls)
+}
+
+/// How long a refilled row stays leased before `frontier recover` may reclaim it. Long enough that
+/// a slow fetch still completes, short enough that a crashed crawler does not strand work.
+const LEASE_SECONDS: i64 = 600;
 
 #[cfg(test)]
 mod tests {

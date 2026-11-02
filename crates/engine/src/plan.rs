@@ -1,7 +1,7 @@
 //! §8 Query planning and resource allocation. OWNER: engine-plan agent.
 //!
 //! Implements the conservative planning rules from
-//! `engine/engine-architecture.md` §8 ("Query planning and resource allocation") and the
+//! `docs/legacy/engine-architecture.md` §8 ("Query planning and resource allocation") and the
 //! per-mode ceilings from §17 ("Budgets, deadlines, and stopping"). Frozen contract:
 //! `docs/specs/ENGINE_SPEC.md` §8.
 //!

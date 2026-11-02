@@ -93,6 +93,7 @@ fn page_of_docs(
     reader: &search_metadata::MetadataReader,
     after: &str,
     limit: usize,
+    since: Option<i64>,
 ) -> AppResult<Vec<Doc>> {
     let conn = reader.conn();
     let mut stmt = conn
@@ -104,6 +105,7 @@ fn page_of_docs(
                JOIN content c ON c.content_id = dv.content_id
               WHERE c.text_path IS NOT NULL
                 AND dv.docver_id > ?1
+                AND (?3 IS NULL OR dv.fetched_at > ?3)
                 AND dv.version_no = (
                       SELECT MAX(d2.version_no) FROM document_version d2
                        WHERE d2.resource_id = dv.resource_id)
@@ -112,7 +114,7 @@ fn page_of_docs(
         )
         .map_err(search_metadata::db_err)?;
     let rows = stmt
-        .query_map(rusqlite::params![after, limit as i64], |r| {
+        .query_map(rusqlite::params![after, limit as i64, since], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -134,7 +136,7 @@ fn page_of_docs(
         .collect())
 }
 
-/// `agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--rebuild] [--dry-run]`
+/// `agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--rebuild] [--dry-run] [--since EPOCH]`
 ///
 /// `--rebuild` purges this pass's own `model_version` before tagging. Tagging is otherwise an
 /// upsert, so a corrected lexicon cannot remove an association the previous lexicon created — a
@@ -162,6 +164,12 @@ pub async fn run(args: &[String]) -> ExitCode {
     let limit = flag_usize(args, "--limit").unwrap_or(usize::MAX);
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let rebuild = args.iter().any(|a| a == "--rebuild");
+    // `--since EPOCH` restricts tagging to documents fetched after that second. A scheduled pass
+    // uses a checkpoint file; a full rebuild omits it. Without it every run re-reads the whole
+    // corpus (~35 min at 750 docs/s) and coverage still decays between rebuilds — measured
+    // 2026-11-02: 15% of the corpus had been ingested after the last full pass and was invisible
+    // to the concept lane.
+    let since: Option<i64> = flag_str(args, "--since").and_then(|v| v.parse().ok());
     let _ = flag_str(args, "--unknown");
 
     let mut failed = false;
@@ -169,7 +177,7 @@ pub async fn run(args: &[String]) -> ExitCode {
         let mut cfg = Config::from_env();
         cfg.data_dir = dir.clone();
         println!("{}:", dir.display());
-        match build_root(&cfg, batch, limit, dry_run, rebuild) {
+        match build_root(&cfg, batch, limit, dry_run, rebuild, since) {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
@@ -190,6 +198,7 @@ fn build_root(
     limit: usize,
     dry_run: bool,
     rebuild: bool,
+    since: Option<i64>,
 ) -> AppResult<()> {
     let started = Instant::now();
     let now = search_core::time::now_unix_s();
@@ -221,7 +230,7 @@ fn build_root(
     {
         let mut probe_after = String::new();
         loop {
-            let batch = page_of_docs(&reader, &probe_after, batch)?;
+            let batch = page_of_docs(&reader, &probe_after, batch, since)?;
             if batch.is_empty() {
                 break;
             }
@@ -258,7 +267,7 @@ fn build_root(
     }
 
     'pages: loop {
-        let docs = page_of_docs(&reader, &after, batch.min(limit.saturating_sub(seen)).max(1))?;
+        let docs = page_of_docs(&reader, &after, batch.min(limit.saturating_sub(seen)).max(1), since)?;
         if docs.is_empty() {
             break;
         }

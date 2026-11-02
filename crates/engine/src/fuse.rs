@@ -1,6 +1,6 @@
 //! §10 Candidate fusion and the ranking cascade. OWNER: engine-rank agent.
 //!
-//! Frozen contract: `docs/specs/ENGINE_SPEC.md` §10 and `engine/engine-architecture.md` §10.
+//! Frozen contract: `docs/specs/ENGINE_SPEC.md` §10 and `docs/legacy/engine-architecture.md` §10.
 //!
 //! Two entry points:
 //! * [`fuse`] — weighted reciprocal rank fusion over one family of lanes (the primitive).

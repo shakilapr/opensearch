@@ -1,7 +1,7 @@
 //! §17 Budgets, deadlines, and stopping. OWNER: engine-plan agent.
 //!
 //! Implements the per-mode budget ledger, the deadline accounting, and the first-applicable
-//! stopping rule from `engine/engine-architecture.md` §17. Frozen contract:
+//! stopping rule from `docs/legacy/engine-architecture.md` §17. Frozen contract:
 //! `docs/specs/ENGINE_SPEC.md` §17.
 //!
 //! §17: "Stop on deadline or budget exhaustion, sufficient supported coverage, no admissible

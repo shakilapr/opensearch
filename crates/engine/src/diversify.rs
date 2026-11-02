@@ -1,6 +1,6 @@
 //! §16 Greedy maximal-marginal-relevance diversification. OWNER: engine-rank agent.
 //!
-//! Frozen contract: `docs/specs/ENGINE_SPEC.md` §16 and `engine/engine-architecture.md` §16.
+//! Frozen contract: `docs/specs/ENGINE_SPEC.md` §16 and `docs/legacy/engine-architecture.md` §16.
 
 use std::collections::BTreeSet;
 

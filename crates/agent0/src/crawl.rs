@@ -186,7 +186,7 @@ const PERSIST_FULL_EVERY: u64 = 150;
 
 /// The denial reason `Pipeline::crawl_one` reports when the site root itself is disallowed. The
 /// drain matches on it to retire the host's queue instead of retrying each of its URLs.
-use crate::backfill::REFILL_BATCH;
+use crate::backfill::refill_batch;
 
 const DENY_ALL_REASON: &str = "robots.txt disallows / (site denies all)";
 
@@ -671,10 +671,10 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
         // the drain runs dry, pull dispatchable URLs from the frontier so the fetch slots stay
         // busy instead of idling at 1% utilisation waiting for seed discovery.
         if drain.needs_work() {
-            if let Ok(urls) = pipeline.with_meta_conn(|_c| {
-                // A reader keeps the frontier query off the single-writer lock.
-                let reader = search_metadata::MetadataReader::from_path(&cfg.meta_db())?;
-                crate::backfill::dispatchable_urls(&reader, now_unix, REFILL_BATCH)
+            // Lease, do not merely read: the rows must leave READY/NEW or the next refill returns
+            // the same head of the table and the drain idles on URLs it has already seen.
+            if let Ok(urls) = pipeline.with_meta_conn(|conn| {
+                crate::backfill::lease_dispatchable(conn, now_unix, refill_batch())
             }) {
                 if !urls.is_empty() {
                     refilled += urls.len();
@@ -1282,6 +1282,24 @@ impl Drainer {
         self.remaining.remove(&per.url);
         // Mark as done so a later frontier re-read never re-queues it.
         self.seen.insert(per.url.clone());
+
+        // Complete the frontier row this URL came from. `lease_dispatchable` set it to FETCHING;
+        // without this step the row is reclaimed after ten minutes and re-attempted forever, and
+        // the frontier never drains no matter how fast the fleet fetches.
+        let frontier_status = match per.outcome {
+            "ingested" | "unchanged" => "DONE",
+            _ => "FAILED",
+        };
+        let done_url = per.url.clone();
+        let _ = self.pipeline.with_meta_conn(|conn| {
+            conn.execute(
+                "UPDATE frontier_entry SET status = ?1, lease_until = NULL
+                  WHERE url = ?2 AND status = 'FETCHING'",
+                rusqlite::params![frontier_status, done_url],
+            )
+            .map_err(search_metadata::db_err)?;
+            Ok(())
+        });
 
         match per.outcome {
             "ingested" => {
