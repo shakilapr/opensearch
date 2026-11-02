@@ -74,6 +74,22 @@ not a regression: a title query is answered almost by construction on 19K docume
 
 At n=6 one case moves nDCG by ~0.017: this establishes capability, not a weight.
 
+### 3.2.1 Body-span set — the query is a sentence from the document (600 cases)
+
+| Configuration | nDCG@10 | recall@10 | MRR | p50 | p95 |
+| --- | --- | --- | --- | --- | --- |
+| shipped weights (`--lanes all`, every semantic weight 0.0) | 0.0912 | 0.1633 | 0.0690 | 593 ms | 5,584 ms |
+
+This is the second instrument the repository needed: the query shares no words with the *title* but
+does appear in the *body*, so it can judge whether a lane maps prose to its source. It is markedly
+harder than the title set (0.0912 vs 0.2112) — which is the point, and it is the set a semantic lane
+has to move. All weights are 0.0 here, so this row is BM25 plus the duplicate source-first lane: the
+baseline the semantic lanes must beat, not a result they achieved.
+
+Runtime: ~25 minutes for 600 cases at these weights, because every query is a bounded multi-word
+match over 1.59M documents. A shorter smoke run must be a truncated *set*, never `--limit` (`--limit`
+bounds results per query, not cases).
+
 ### 3.3 Concept-first ranking (2026-11-02)
 
 Corpus-derived relatedness graph built with `agent0 concepts relate` on all five roots, then:
