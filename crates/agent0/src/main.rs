@@ -345,6 +345,7 @@ async fn main() -> ExitCode {
         Some("index") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::indexbuild::run(&args).await,
             Some("publish") => search_agent0::indexbuild::run_publish(&args),
+            Some("audit") => search_agent0::indexbuild::run_audit(&args),
             _ => {
                 eprintln!("usage: agent0 index build [--dir PATH]... [--batch N] [--limit N]");
                 ExitCode::from(2)

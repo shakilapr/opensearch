@@ -341,6 +341,113 @@ pub fn run_publish(args: &[String]) -> ExitCode {
     }
 }
 
+/// `agent0 index audit [--dir PATH]...` — is the index what the metadata says it should be?
+///
+/// Two numbers decide that: the live document count in Tantivy, and the number of documents a
+/// rebuild would index (newest version per resource, with a readable text path). Every "the index is
+/// behind" question in this repository was previously answered by hand, and `_manifest.json` cannot
+/// answer it because it is only written on publish.
+///
+/// Exits non-zero when the index holds less than 95% of the expected documents, so it can gate a
+/// deploy or a rebuild without a human reading the table.
+pub fn run_audit(args: &[String]) -> ExitCode {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => match args.get(i + 1) {
+                Some(v) => {
+                    dirs.push(PathBuf::from(v));
+                    i += 2;
+                }
+                None => return usage("--dir needs a path"),
+            },
+            _ => i += 1,
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(Config::from_env().data_dir);
+    }
+
+    println!("{:<34} {:>9} {:>9} {:>7} {:>10}", "root", "index", "expected", "ratio", "MB");
+    let mut short = 0usize;
+    for dir in &dirs {
+        let index = match search_indexer::Indexer::open(search_indexer::IndexerConfig::read_only(
+            dir.join("tantivy"),
+        )) {
+            Ok(ix) => ix,
+            Err(e) => {
+                println!("{:<34} {:>9}", dir.display(), "ERROR");
+                eprintln!("  {e}");
+                short += 1;
+                continue;
+            }
+        };
+        let actual = index.doc_count().unwrap_or(0);
+        let expected = expected_documents(dir).unwrap_or(0);
+        let ratio = if expected > 0 {
+            actual as f64 / expected as f64
+        } else {
+            1.0
+        };
+        let mb = dir_size_mb(&dir.join("tantivy"));
+        println!(
+            "{:<34} {:>9} {:>9} {:>7.3} {:>10}",
+            dir.display(),
+            actual,
+            expected,
+            ratio,
+            mb
+        );
+        if ratio < 0.95 {
+            short += 1;
+        }
+    }
+    if short > 0 {
+        eprintln!("{short} root(s) hold fewer documents than metadata implies (ratio < 0.95)");
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Documents a rebuild would index: newest version per resource with a readable text path.
+fn expected_documents(dir: &std::path::Path) -> AppResult<i64> {
+    let db = dir.join("meta").join("meta.sqlite");
+    let reader = search_metadata::MetadataReader::from_path(&db)?;
+    reader
+        .conn()
+        .query_row(
+            "SELECT COUNT(*)
+               FROM document_version dv
+               JOIN content c ON c.content_id = dv.content_id
+              WHERE c.text_path IS NOT NULL
+                AND dv.version_no = (
+                      SELECT MAX(d2.version_no) FROM document_version d2
+                       WHERE d2.resource_id = dv.resource_id)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(search_metadata::db_err)
+}
+
+fn dir_size_mb(path: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path, total: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), total);
+            } else {
+                *total += meta.len();
+            }
+        }
+    }
+    let mut bytes = 0u64;
+    walk(path, &mut bytes);
+    bytes / (1024 * 1024)
+}
+
 fn usage(why: &str) -> ExitCode {
     eprintln!("error: {why}");
     eprintln!("usage: agent0 index build [--dir PATH]... [--batch N] [--limit N]");

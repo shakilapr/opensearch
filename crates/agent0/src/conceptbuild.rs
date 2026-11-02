@@ -349,7 +349,9 @@ fn build_root(
 /// taxonomy and no model: two concepts are related when the corpus uses them on the same page more
 /// often than chance, measured by pointwise mutual information.
 ///
-///     PMI(a,b) = ln( (n_ab · N) / (n_a · n_b) )
+/// ```text
+/// PMI(a,b) = ln( (n_ab · N) / (n_a · n_b) )
+/// ```
 ///
 /// Why co-occurrence rather than an imported hierarchy: the corpus is software docs, news and
 /// science pages, and the concept vocabulary is grown from it. An external taxonomy describes
