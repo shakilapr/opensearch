@@ -68,6 +68,13 @@ const RELOAD_THROTTLE_MS: u64 = 500;
 pub struct IndexerConfig {
     pub base_dir: PathBuf,
     pub overlay_dir: PathBuf,
+    /// Where the extracted text lives, when the caller has it (`<data>/text`).
+    ///
+    /// The index no longer stores the article, so `Indexer::doc_text` reads the source file and
+    /// degrades to the stored excerpt when it is absent. `None` (or a missing file) means
+    /// "excerpt only", which is a supported state — the architecture intends the text to be
+    /// deleted once the derived artifacts are verified.
+    pub text_dir: Option<PathBuf>,
     /// Open without an `IndexWriter`, so the process takes **no lock** on the directory.
     ///
     /// Tantivy's writer lock is exclusive per index directory, which is why a crawl and a
@@ -83,6 +90,8 @@ impl IndexerConfig {
         Self {
             base_dir: root.join("base"),
             overlay_dir: root.join("overlay"),
+            // `<data>/tantivy` ⇒ `<data>/text`; the ingest layout already puts them side by side.
+            text_dir: root.parent().map(|p| p.join("text")),
             read_only: false,
         }
     }
@@ -90,6 +99,12 @@ impl IndexerConfig {
     /// The same layout, opened read-only (no writer, no lock).
     pub fn read_only(root: impl AsRef<Path>) -> Self {
         Self { read_only: true, ..Self::new(root) }
+    }
+
+    /// Point the reader at a different text root, or at none.
+    pub fn with_text_dir(mut self, dir: impl Into<Option<PathBuf>>) -> Self {
+        self.text_dir = dir.into();
+        self
     }
 }
 
@@ -109,8 +124,7 @@ struct Fields {
     title: Field,
     title_boost: Field,
     headings: Field,
-    body: Field,
-    body_boost: Field,
+    excerpt: Field,
     entities: Field,
     source_id: Field,
     doc_type: Field,
@@ -135,8 +149,7 @@ impl Fields {
             title: g("title"),
             title_boost: g("title_boost"),
             headings: g("headings"),
-            body: g("body"),
-            body_boost: g("body_boost"),
+            excerpt: g("excerpt"),
             entities: g("entities"),
             source_id: g("source_id"),
             doc_type: g("doc_type"),
@@ -165,12 +178,13 @@ struct Candidate {
     content_id: Option<String>,
     url: String,
     title: String,
-    body: String,
+    /// The indexed excerpt — the only article text this index holds.
+    excerpt: String,
     /// Key entities, as the organizing model produced them (space-joined in the index). The schema
     /// STOREs this field, so it is recoverable — the export path used to drop it anyway.
     entities: String,
-    /// Query-relevant excerpt of `body`, set by `collect`; empty means "not
-    /// generated" and falls back to the leading characters of the body.
+    /// Query-relevant fragment of the stored `excerpt`, set by `collect`; empty means "not
+    /// generated" and falls back to the leading characters of the excerpt.
     snippet: String,
     source_id: Option<String>,
     published_at: Option<i64>,
@@ -220,7 +234,7 @@ impl Candidate {
             content_id: opt(f.content_id),
             url: text(f.url),
             title: text(f.title),
-            body: text(f.body),
+            excerpt: text(f.excerpt),
             entities: text(f.entities),
             snippet: String::new(),
             source_id: opt(f.source_id),
@@ -254,7 +268,7 @@ impl Candidate {
             Provenance::Snapshot => "lexical_base",
         };
         let snippet = if self.snippet.trim().is_empty() {
-            make_snippet(&self.body)
+            make_snippet(&self.excerpt)
         } else {
             self.snippet
         };
@@ -277,7 +291,7 @@ impl Candidate {
             signals: vec![Signal {
                 name: "bm25".to_string(),
                 value: self.score,
-                note: "lexical relevance (title_boost/body_boost)".to_string(),
+                note: "lexical relevance (title_boost/headings/entities/excerpt)".to_string(),
             }],
         }
     }
@@ -289,6 +303,8 @@ pub struct Indexer {
     fields: Fields,
     base_dir: PathBuf,
     overlay_dir: PathBuf,
+    /// `<data>/text`, when it exists; `doc_text` reads full documents from here.
+    text_dir: Option<PathBuf>,
     base: Index,
     overlay: Index,
     /// `None` when the index was opened read-only (see `IndexerConfig::read_only`): no writer
@@ -348,6 +364,7 @@ impl Indexer {
             fields,
             base_dir: cfg.base_dir,
             overlay_dir: cfg.overlay_dir,
+            text_dir: cfg.text_dir,
             base,
             overlay,
             base_writer,
@@ -614,14 +631,14 @@ impl Indexer {
                 self.fields.title_boost,
                 self.fields.headings,
                 self.fields.entities,
-                self.fields.body_boost,
+                self.fields.excerpt,
                 self.fields.url,
             ],
         );
         parser.set_field_boost(self.fields.title_boost, 3.0);
         parser.set_field_boost(self.fields.entities, 3.0);
         parser.set_field_boost(self.fields.headings, 2.0);
-        parser.set_field_boost(self.fields.body_boost, 1.0);
+        parser.set_field_boost(self.fields.excerpt, 1.0);
         // Parse the pruned query: the index tokenizer keeps stop-words and
         // single letters, over which an OR query degenerates into noise.
         let pruned = search_core::text::prune_query(query);
@@ -635,16 +652,16 @@ impl Indexer {
         // Query-relevant fragments: the first characters of a page are usually
         // navigation/boilerplate, which reads as "just headers" to a downstream
         // answerer. When Tantivy can build a snippet generator for the query, the
-        // stored body is excerpted around the matched terms instead.
-        // The fragment must be built from a field that is BOTH indexed with
-        // positions and STORED, because `snippet_from_doc` re-reads the value
-        // from the retrieved document: `body_boost` (the field the parser
-        // searches) is not STORED, so the generator is built from a `body`-only
-        // parse of the same query. No body parse -> no fragment -> head fallback.
-        let body_parser = QueryParser::for_index(index, vec![self.fields.body]);
-        let body_query = body_parser.parse_query(&pruned).ok();
-        let mut generator = match body_query {
-            Some(q) => SnippetGenerator::create(&searcher, &q, self.fields.body)
+        // stored excerpt is windowed around the matched terms instead.
+        // The fragment is built from the stored `excerpt`, which is the only body-derived
+        // field the index holds and is both indexed-with-positions and STORED — the requirement
+        // `snippet_from_doc` has, because it re-reads the value from the retrieved document.
+        // A term that occurs only beyond the excerpt yields no fragment, and `into_result` falls
+        // back to the head of the excerpt; that is the accepted cost of not storing the article.
+        let excerpt_parser = QueryParser::for_index(index, vec![self.fields.excerpt]);
+        let excerpt_query = excerpt_parser.parse_query(&pruned).ok();
+        let mut generator = match excerpt_query {
+            Some(q) => SnippetGenerator::create(&searcher, &q, self.fields.excerpt)
                 .ok()
                 .map(|mut g| {
                     g.set_max_num_chars(SNIPPET_CHARS);
@@ -736,8 +753,7 @@ impl Indexer {
             reader.reload().ix()?;
             let searcher = reader.searcher();
             let term = Term::from_field_text(self.fields.doc_id, doc_id);
-            let query =
-                TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+            let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
             let top = searcher.search(&query, &TopDocs::with_limit(1)).ix()?;
             let Some((_, addr)) = top.first() else {
                 continue;
@@ -746,11 +762,31 @@ impl Indexer {
                 return Ok(None);
             }
             let doc: TantivyDocument = searcher.doc(*addr).ix()?;
-            let body = doc
-                .get_first(self.fields.body)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            return Ok(Some(body.to_string()));
+            let text = |field| {
+                doc.get_first(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            // The index holds no article. The source text file is the full document; the stored
+            // excerpt is the honest fallback when the file is absent (the architecture intends
+            // `text/` to be deleted once the derived artifacts are verified). `content_id` is
+            // `cnt_<hex>` and the ingest layout is `text/<hex[0..2]>/<hex>.txt`.
+            if let Some(dir) = &self.text_dir {
+                let hex = text(self.fields.content_id);
+                let hex = hex.trim_start_matches("cnt_");
+                if let Some(prefix) = hex.get(..2) {
+                    let path = dir.join(prefix).join(format!("{hex}.txt"));
+                    match std::fs::read_to_string(&path) {
+                        Ok(body) => return Ok(Some(body)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "doc_text: text file unreadable")
+                        }
+                    }
+                }
+            }
+            return Ok(Some(text(self.fields.excerpt)));
         }
         Ok(None)
     }
@@ -797,7 +833,7 @@ impl Indexer {
             // a result row) does not want the article, and `doc_text` exists for callers that do.
             // Measured 2026-10-31: fetching it here made the dense lane cost ~1.7 s per query,
             // because every candidate the lane returned pulled its whole body through `doc()`.
-            let body = String::new();
+            let excerpt = text(self.fields.excerpt);
             let resource_id = text(self.fields.resource_id);
             let content_id = text(self.fields.content_id);
             let work_id = text(self.fields.work_id);
@@ -805,6 +841,7 @@ impl Indexer {
                 doc_id: doc_id.to_string(),
                 url,
                 title,
+                excerpt,
 
                 source_id: if source_id.is_empty() {
                     None
@@ -824,11 +861,12 @@ impl Indexer {
         Ok(None)
     }
 
-    /// Every live (non-tombstoned, visible) document in base ∪ overlay as full
-    /// `IndexDoc`s — everything the schema STOREs (`url`, `title`, `body`,
-    /// `source_id`, `published_at`, ids), i.e. enough to rebuild a document
-    /// without touching the blob store. Deduped by `doc_id`: a newer overlay copy
-    /// wins over the base copy, exactly as `search` does it.
+    /// Every live (non-tombstoned, visible) document in base ∪ overlay as an
+    /// `IndexDoc` — everything the schema STOREs (`url`, `title`, `headings`, `excerpt`,
+    /// `entities`, `source_id`, `doc_type`, `language`, `published_at`, ids). **Not the article:**
+    /// `body` is empty here and `Pipeline::all_docs` fills it from `text/<hash>.txt` when a batch
+    /// job actually needs full text. Deduped by `doc_id`: a newer overlay copy wins over the base
+    /// copy, exactly as `search` does it.
     ///
     /// Order is `doc_id`-sorted so two runs over the same index are byte-identical.
     ///
@@ -990,7 +1028,10 @@ impl Candidate {
             url: self.url.clone(),
             title: self.title.clone(),
             headings: String::new(),
-            body: self.body.clone(),
+            excerpt: self.excerpt.clone(),
+            // The full text is not in the index; a caller that needs it reads `text/<hash>.txt`
+            // (see `Pipeline::all_docs`, which hydrates it).
+            body: String::new(),
             // `entities` IS stored (schema.rs), so an export can carry it; dropping it here made
             // every export -> import round trip lose the organizing model's key entities.
             // Split on the comma join used by `IndexDoc::to_tantivy`, which keeps a multi-word
@@ -1208,10 +1249,11 @@ mod tests {
     }
 
     #[test]
-    fn snippet_is_excerpted_around_the_match_not_the_page_head() {
+    fn snippet_is_windowed_around_the_match_not_the_excerpt_head() {
         let (_t, idx) = tmp();
-        // Leading boilerplate, the matched term far into the body.
-        let filler = "nav home about contact ".repeat(120);
+        // Leading boilerplate inside the 500-char excerpt, so the matched term is reachable but
+        // is not in the first 200 characters (which is what the fallback snippet returns).
+        let filler = "nav home about contact ".repeat(6);
         let body = format!("{filler} the transformer architecture dominates modern language modelling");
         idx.index_batch(vec![doc("d1", "Transformers", &body)])
             .unwrap();
@@ -1238,21 +1280,25 @@ mod tests {
     }
 
     #[test]
-    fn doc_text_returns_stored_body_and_none_for_unknown() {
-        let (_t, idx) = tmp();
+    fn doc_text_reads_the_source_file_and_degrades_to_the_excerpt() {
+        let (t, idx) = tmp();
         let body = "concrete detail about retrieval augmented generation pipelines";
-        idx.index_batch(vec![doc("d1", "RAG", body)]).unwrap();
+        let mut d = doc("d1", "RAG", body);
+        let hex = "ab".to_string() + &"0".repeat(62);
+        d.content_id = Some(format!("cnt_{hex}"));
+        idx.index_batch(vec![d]).unwrap();
 
+        // No text file yet: the answer path gets the stored excerpt rather than nothing. The
+        // index holds no article, so this is the documented degradation, not a bug.
         assert_eq!(idx.doc_text("d1").unwrap().as_deref(), Some(body));
         assert_eq!(idx.doc_text("nope").unwrap(), None);
 
-        // A newer overlay version wins, and a tombstone reads as absent.
-        idx.index_overlay(
-            IndexDoc::new("d1", "res_d1", "https://example.com/d1", "RAG", "newer body text")
-                .with_version(2),
-        )
-        .unwrap();
-        assert_eq!(idx.doc_text("d1").unwrap().as_deref(), Some("newer body text"));
+        // With the source text on disk, the full document is returned.
+        let full = "a much longer document that is not stored in the index at all";
+        let path = t.path().join("text").join("ab").join(format!("{hex}.txt"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, full).unwrap();
+        assert_eq!(idx.doc_text("d1").unwrap().as_deref(), Some(full));
 
         idx.delete("d1").unwrap();
         assert_eq!(idx.doc_text("d1").unwrap(), None);
@@ -1517,10 +1563,12 @@ mod tests {
         // Deterministic (doc_id-sorted) order: two runs must agree byte-for-byte.
         let ids: Vec<&str> = docs.iter().map(|d| d.doc_id.as_str()).collect();
         assert_eq!(ids, vec!["d1", "d2", "d3"]);
-        // The export source is the STOREd fields, not the blob store.
+        // The export source is the STOREd fields. The article is not among them: `body` is empty
+        // and the stored excerpt is what the index kept.
         let d1 = docs.iter().find(|d| d.doc_id == "d1").unwrap();
         assert_eq!(d1.title, "Rust async");
-        assert_eq!(d1.body, "tokio runtime body");
+        assert_eq!(d1.excerpt, "tokio runtime body");
+        assert_eq!(d1.body, "", "the index does not store the article");
         assert_eq!(d1.url, "https://example.com/d1");
         // `index_batch` stores the doc's own generation (0 by default); it must
         // never be reportable above the published watermark.
@@ -1558,7 +1606,7 @@ mod tests {
         let docs = idx.all_docs().unwrap();
         assert_eq!(docs.len(), 1, "d2 is tombstoned; d1 collapses to one doc");
         assert_eq!(docs[0].doc_id, "d1");
-        assert_eq!(docs[0].body, "overlay body newterm", "overlay copy wins");
+        assert_eq!(docs[0].excerpt, "overlay body newterm", "overlay copy wins");
         assert_eq!(docs[0].title, "Overlay title");
     }
 

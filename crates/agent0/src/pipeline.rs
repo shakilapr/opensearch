@@ -561,13 +561,46 @@ impl Pipeline {
         ))
     }
 
-    /// Every live document in the index, for export into a portable pack.
+    /// Every live document in the index, with its full text hydrated from `text/<hash>.txt`.
     ///
-    /// Thin accessor over [`Indexer::all_docs`]: the Tantivy schema STOREs
-    /// `url`/`title`/`body`/`source_id`/`published_at`, so no blob-store read is
-    /// needed. `doc_id`-sorted and tombstone-free, so an export is reproducible.
+    /// The index stores identity, headings, entities and a ~500-char excerpt — **not the article**
+    /// (`crates/indexer/src/schema.rs`). The three batch consumers (export, embed, graph) need full
+    /// text, so this fills `body` from the ingest source, resolved through the document's stored
+    /// `content_id` (`cnt_<hex>` ⇒ `text/<hex[0..2]>/<hex>.txt`).
+    ///
+    /// A missing file leaves `body` empty and is counted, because the only honest alternative is to
+    /// pretend the excerpt is the document. Once `text/` is deleted (PLAN-v2 Phase 2) every caller
+    /// sees that count instead of a corpus of 500-char "bodies" — the same signal that makes the
+    /// deletion verifiable. `doc_id`-sorted and tombstone-free, so an export is reproducible.
     pub fn all_docs(&self) -> AppResult<Vec<IndexDoc>> {
-        self.indexer.all_docs()
+        let mut docs = self.indexer.all_docs()?;
+        let mut hydrated = 0usize;
+        let mut missing = 0usize;
+        for d in &mut docs {
+            if !d.body.is_empty() {
+                continue;
+            }
+            let Some(content_id) = d.content_id.as_deref() else {
+                missing += 1;
+                continue;
+            };
+            let hex = content_id.trim_start_matches("cnt_");
+            match std::fs::read_to_string(self.cfg.text_path(hex)) {
+                Ok(text) => {
+                    d.body = text;
+                    hydrated += 1;
+                }
+                Err(_) => missing += 1,
+            }
+        }
+        if missing > 0 {
+            tracing::warn!(
+                hydrated,
+                missing,
+                "all_docs: documents whose source text is absent; body left empty"
+            );
+        }
+        Ok(docs)
     }
 
     /// `doc_id → version` for live documents, built once per process on first use.
@@ -2432,6 +2465,8 @@ fn build_index_doc(
         url: canonical.to_string(),
         title: doc.title.clone().unwrap_or_default(),
         headings: doc.headings.join(" \n "),
+        // The index derives its ~500-char excerpt from this; `body` itself is never stored.
+        excerpt: String::new(),
         body: doc.text.clone(),
         entities: doc.entities.clone(),
         source_id: Some(source_id.to_string()),

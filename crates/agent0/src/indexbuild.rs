@@ -166,6 +166,8 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
                 url: p.url,
                 title: p.title,
                 headings: String::new(),
+                // Derived from `body` by `to_tantivy`; the index keeps the excerpt, not the text.
+                excerpt: String::new(),
                 body,
                 entities: Vec::new(),
                 source_id: None,
