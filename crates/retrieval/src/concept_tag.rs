@@ -19,22 +19,39 @@
 //! titled terms in the corpus, so the vocabulary reflects the documents we actually hold rather
 //! than a generic list.
 //!
+//! **The vocabulary is open.** [`DEFAULT_SEEDS`] is a starting point, not a ceiling: a
+//! [`ConceptLexicon`] can be loaded from JSON (`agent0 concepts build --lexicon <PATH>`) and holds
+//! thousands or millions of concepts, because tagging walks one flattened list of pre-lowered
+//! surface forms rather than re-deriving them per document.
+//!
 //! **Weights are evidence, not confidence.** A concept's weight is a saturating function of how
 //! much of the document supports it, with the title counting several times a body mention. Two
 //! documents both about chemistry can therefore carry different weights (0.4 vs 0.9), which is what
 //! makes the matrix a *weighted* relation rather than a tag list.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
 
-use search_core::AppResult;
+use search_core::{AppError, AppResult};
+use serde::{Deserialize, Serialize};
 
 /// A concept and the surface forms that reach it.
-#[derive(Debug, Clone)]
+///
+/// The string fields are [`Cow`]s, so one type serves both worlds: the bundled lexicon is a
+/// `const` of borrowed literals, and a vocabulary loaded at runtime from JSON, a database or an
+/// API response is the same type holding owned strings. Callers never need a second "dynamic
+/// concept" type, and `&[ConceptSeed]` remains the input to [`tag`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConceptSeed {
-    pub concept_id: &'static str,
-    pub name: &'static str,
-    pub kind: &'static str,
-    pub aliases: &'static [&'static str],
+    pub concept_id: Cow<'static, str>,
+    pub name: Cow<'static, str>,
+    /// Coarse category — `topic`, `field`, `person`, … Free-form: the matrix only stores it.
+    #[serde(default = "default_kind")]
+    pub kind: Cow<'static, str>,
+    #[serde(default)]
+    pub aliases: Cow<'static, [Cow<'static, str>]>,
     /// Whether the concept's own `name` may be matched as a surface form.
     ///
     /// `true` for most concepts: a page saying "chemistry" is about chemistry. `false` when the
@@ -42,7 +59,59 @@ pub struct ConceptSeed {
     /// "attachment" tagged 290 documents of which three quarters were Elasticsearch reference
     /// pages, and the name alone was the only remaining source of those false positives after the
     /// aliases were narrowed. Such a concept is reachable only through its multi-word aliases.
+    #[serde(default = "default_match_name")]
     pub match_name: bool,
+}
+
+fn default_kind() -> Cow<'static, str> {
+    Cow::Borrowed("topic")
+}
+
+fn default_match_name() -> bool {
+    true
+}
+
+impl ConceptSeed {
+    /// A seed built from owned strings — the shape a runtime-loaded concept takes.
+    pub fn new(
+        concept_id: impl Into<Cow<'static, str>>,
+        name: impl Into<Cow<'static, str>>,
+        kind: impl Into<Cow<'static, str>>,
+        aliases: impl IntoIterator<Item = impl Into<Cow<'static, str>>>,
+        match_name: bool,
+    ) -> Self {
+        Self {
+            concept_id: concept_id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            aliases: Cow::Owned(aliases.into_iter().map(Into::into).collect()),
+            match_name,
+        }
+    }
+
+    /// The forms this seed may be matched through, subject to `match_name`.
+    pub fn surface_forms(&self) -> impl Iterator<Item = &str> {
+        let named = if self.match_name {
+            Some(&*self.name)
+        } else {
+            None
+        };
+        named.into_iter().chain(self.aliases.iter().map(|a| &**a))
+    }
+}
+
+/// Const constructor for a borrowed seed, so the bundled lexicon stays a `const` even though
+/// [`ConceptSeed`] can hold owned strings.
+macro_rules! seed {
+    ($id:expr, $name:expr, $kind:expr, $match_name:expr, [$($alias:expr),* $(,)?]) => {
+        ConceptSeed {
+            concept_id: Cow::Borrowed($id),
+            name: Cow::Borrowed($name),
+            kind: Cow::Borrowed($kind),
+            match_name: $match_name,
+            aliases: Cow::Borrowed(&[$(Cow::Borrowed($alias)),*]),
+        }
+    };
 }
 
 /// The bundled starting lexicon.
@@ -51,144 +120,93 @@ pub struct ConceptSeed {
 /// (chemistry ↔ hormones ↔ attachment ↔ romance) plus the large technical vocabulary this corpus
 /// actually contains. A generic 10,000-topic taxonomy would dilute the signal — a concept every
 /// document matches carries no information.
-pub const LEXICON: &[ConceptSeed] = &[
+///
+/// This is only the *default*. The vocabulary is open: pass a JSON file to
+/// `agent0 concepts build --lexicon <PATH>` (see [`ConceptLexicon`]) and the same machinery tags
+/// against thousands or millions of concepts.
+// `rustfmt::skip`: formatting each `seed!(…)` invocation across a dozen lines would bury the
+// alias list it exists to document.
+#[rustfmt::skip]
+pub const DEFAULT_SEEDS: &[ConceptSeed] = &[
     // --- the motivating example: chemistry, hormones, bonding ---
-    ConceptSeed {
-        concept_id: "c-chemistry",
-        name: "chemistry",
-        kind: "topic",
-        // "chemical" is a band name and a laundry-product word; keep the name but rely on the
-        // sense guard for the band case (measured: 0.49 on a tour-news page).
-        match_name: true,
-        // Biochemistry vocabulary is included because a paper on neurochemistry rarely says
-        // "chemistry": it says neuropeptide, receptor, neurotransmitter. Found by the oxytocin
-        // test failing to tag a paper that is unambiguously about the chemistry of bonding.
-        aliases: &["chemical", "chemicals", "chemically", "molecular", "molecule", "reaction",
-                   "biochemistry", "biochemical", "neurochemistry", "neuropeptide",
-                   "neurotransmitter", "enzyme", "receptor"],
-    },
-    ConceptSeed {
-        concept_id: "c-hormones",
-        name: "hormones",
-        kind: "topic",
-        match_name: true,
-        aliases: &["hormone", "hormonal", "endocrine", "oxytocin", "dopamine", "serotonin",
-                   "vasopressin", "cortisol", "testosterone", "estrogen"],
-    },
-    ConceptSeed {
-        concept_id: "c-attachment",
-        name: "attachment",
-        kind: "topic",
-        match_name: false,
-        // NOT the bare word "attachment" and not "bond": measured 2026-10-29 on the serving root,
-        // 15 of 20 documents tagged `c-attachment` were software documentation — Elasticsearch
-        // "attachment field type", Docker "attach", email attachments, "bond" in finance and
-        // networking. Only multi-word forms that name the psychological construct are kept.
-        aliases: &["pair bonding", "pair-bonding", "emotional bond", "emotional bonding",
-                   "human bonding", "social bonding", "attachment theory", "attachment style",
-                   "affiliation", "closeness"],
-    },
-    ConceptSeed {
-        concept_id: "c-romance",
-        name: "romance",
-        kind: "topic",
-        // "romance" alone is a fiction genre and a band name; the aliases carry the construct.
-        match_name: false,
-        // "love" alone is excluded for the same reason as "attachment": it appears in product
-        // copy, tennis scores and software docs. The phrases below are unambiguous.
-        aliases: &["romantic", "romantic love", "limerence", "romantic attraction",
-                   "falling in love", "romantic relationship", "romantic partner"],
-    },
-    ConceptSeed {
-        concept_id: "c-neuroscience",
-        name: "neuroscience",
-        kind: "field",
-        match_name: true,
-        aliases: &["neural", "neuron", "neurons", "brain", "cortical", "cognitive"],
-    },
-    ConceptSeed {
-        concept_id: "c-psychology",
-        name: "psychology",
-        kind: "field",
-        match_name: true,
-        // Single generic adjectives are excluded. Measured 2026-10-29: "behavioral" alone tagged
-        // the Elasticsearch "Geoshape field type" reference page as psychology, because
-        // "behavioral" is also a product feature name. Only multi-word psychological phrases remain,
-        // plus the field's own name, which is specific enough to be safe.
-        aliases: &["psychological", "emotion regulation", "emotional response",
-                   "emotional state", "cognitive psychology", "clinical psychology",
-                   "developmental psychology"],
-    },
+    // "chemical" is a band name and a laundry-product word; keep the name but rely on the sense
+    // guard for the band case (measured: 0.49 on a tour-news page). Biochemistry vocabulary is
+    // included because a paper on neurochemistry rarely says "chemistry": it says neuropeptide,
+    // receptor, neurotransmitter. Found by the oxytocin test failing to tag a paper that is
+    // unambiguously about the chemistry of bonding.
+    seed!("c-chemistry", "chemistry", "topic", true, [
+        "chemical", "chemicals", "chemically", "molecular", "molecule", "reaction",
+        "biochemistry", "biochemical", "neurochemistry", "neuropeptide",
+        "neurotransmitter", "enzyme", "receptor",
+    ]),
+    seed!("c-hormones", "hormones", "topic", true, [
+        "hormone", "hormonal", "endocrine", "oxytocin", "dopamine", "serotonin",
+        "vasopressin", "cortisol", "testosterone", "estrogen",
+    ]),
+    // NOT the bare word "attachment" and not "bond": measured 2026-10-29 on the serving root,
+    // 15 of 20 documents tagged `c-attachment` were software documentation — Elasticsearch
+    // "attachment field type", Docker "attach", email attachments, "bond" in finance and
+    // networking. Only multi-word forms that name the psychological construct are kept.
+    seed!("c-attachment", "attachment", "topic", false, [
+        "pair bonding", "pair-bonding", "emotional bond", "emotional bonding",
+        "human bonding", "social bonding", "attachment theory", "attachment style",
+        "affiliation", "closeness",
+    ]),
+    // "romance" alone is a fiction genre and a band name; the aliases carry the construct.
+    // "love" alone is excluded for the same reason as "attachment": it appears in product
+    // copy, tennis scores and software docs. The phrases below are unambiguous.
+    seed!("c-romance", "romance", "topic", false, [
+        "romantic", "romantic love", "limerence", "romantic attraction",
+        "falling in love", "romantic relationship", "romantic partner",
+    ]),
+    seed!("c-neuroscience", "neuroscience", "field", true, [
+        "neural", "neuron", "neurons", "brain", "cortical", "cognitive",
+    ]),
+    // Single generic adjectives are excluded. Measured 2026-10-29: "behavioral" alone tagged
+    // the Elasticsearch "Geoshape field type" reference page as psychology, because
+    // "behavioral" is also a product feature name. Only multi-word psychological phrases remain,
+    // plus the field's own name, which is specific enough to be safe.
+    seed!("c-psychology", "psychology", "field", true, [
+        "psychological", "emotion regulation", "emotional response",
+        "emotional state", "cognitive psychology", "clinical psychology",
+        "developmental psychology",
+    ]),
     // --- technical vocabulary the corpus actually holds ---
-    ConceptSeed {
-        concept_id: "c-retrieval",
-        name: "information retrieval",
-        kind: "field",
-        match_name: true,
-        aliases: &["retrieval", "search engine", "bm25", "ranking", "relevance"],
-    },
-    ConceptSeed {
-        concept_id: "c-embeddings",
-        name: "embeddings",
-        kind: "topic",
-        match_name: true,
-        aliases: &["embedding", "vector", "vectors", "dense retrieval", "semantic search"],
-    },
-    ConceptSeed {
-        concept_id: "c-rust",
-        name: "rust",
-        kind: "topic",
-        match_name: true,
-        aliases: &["rustlang", "cargo", "borrow checker", "ownership"],
-    },
-    ConceptSeed {
-        concept_id: "c-databases",
-        name: "databases",
-        kind: "topic",
-        match_name: true,
-        aliases: &["database", "sql", "sqlite", "postgres", "query engine", "indexing"],
-    },
-    ConceptSeed {
-        concept_id: "c-ml",
-        name: "machine learning",
-        kind: "field",
-        match_name: true,
-        aliases: &["neural network", "model training", "inference", "training", "classifier"],
-    },
-    ConceptSeed {
-        concept_id: "c-web-crawling",
-        name: "web crawling",
-        kind: "topic",
-        match_name: true,
-        aliases: &["crawler", "crawl", "spider", "sitemap", "robots.txt", "scraping"],
-    },
-    ConceptSeed {
-        concept_id: "c-distributed-systems",
-        name: "distributed systems",
-        kind: "field",
-        match_name: true,
-        aliases: &["consensus", "replication", "distributed", "fault tolerance", "raft", "paxos"],
-    },
-    ConceptSeed {
-        concept_id: "c-security",
-        name: "security",
-        kind: "topic",
-        match_name: true,
-        aliases: &["vulnerability", "exploit", "authentication", "encryption", "cryptography"],
-    },
-    ConceptSeed {
-        concept_id: "c-climate",
-        name: "climate",
-        kind: "topic",
-        match_name: true,
-        aliases: &["climate change", "global warming", "emissions", "carbon", "greenhouse"],
-    },
+    seed!("c-retrieval", "information retrieval", "field", true, [
+        "retrieval", "search engine", "bm25", "ranking", "relevance",
+    ]),
+    seed!("c-embeddings", "embeddings", "topic", true, [
+        "embedding", "vector", "vectors", "dense retrieval", "semantic search",
+    ]),
+    seed!("c-rust", "rust", "topic", true, [
+        "rustlang", "cargo", "borrow checker", "ownership",
+    ]),
+    seed!("c-databases", "databases", "topic", true, [
+        "database", "sql", "sqlite", "postgres", "query engine", "indexing",
+    ]),
+    seed!("c-ml", "machine learning", "field", true, [
+        "neural network", "model training", "inference", "training", "classifier",
+    ]),
+    seed!("c-web-crawling", "web crawling", "topic", true, [
+        "crawler", "crawl", "spider", "sitemap", "robots.txt", "scraping",
+    ]),
+    seed!("c-distributed-systems", "distributed systems", "field", true, [
+        "consensus", "replication", "distributed", "fault tolerance", "raft", "paxos",
+    ]),
+    seed!("c-security", "security", "topic", true, [
+        "vulnerability", "exploit", "authentication", "encryption", "cryptography",
+    ]),
+    seed!("c-climate", "climate", "topic", true, [
+        "climate change", "global warming", "emissions", "carbon", "greenhouse",
+    ]),
 ];
 
-/// Weight of the *first* body occurrence of a concept's surface form. Later occurrences add
-/// geometrically less (see [`body_weight`]): a page that says "chemistry" eight times is not eight
-/// times as chemical as one that says it once.
-const BODY_HIT: f64 = 0.12;
+/// Backwards-compatible alias for [`DEFAULT_SEEDS`].
+///
+/// Kept because the name is part of the published surface of this module; new code should use
+/// `DEFAULT_SEEDS` and prefer [`ConceptLexicon::from_defaults`].
+pub const LEXICON: &[ConceptSeed] = DEFAULT_SEEDS;
+
 /// Weight of one heading occurrence: headings are the page's own claim about its topic.
 const HEADING_HIT: f64 = 0.20;
 /// Weight of a title occurrence: the strongest single signal a page offers.
@@ -255,9 +273,29 @@ const MIN_WEIGHT: f64 = 0.18;
 /// the other sense. The discount is applied to `direct`, since a genre listing is not claiming this
 /// concept topically, and the association is dropped entirely if nothing else supports it.
 const FICTION_MARKERS: &[&str] = &[
-    "novel", "chapter", "fiction", "romance novel", "audiobook", "ebook", "kindle", "read online",
-    "webnovel", "light novel", "manga", "anime", "episode", "season 2", "watch online", "subtitle",
-    "lyrics", "album", "tracklist", "tour dates", "concert", "tickets", "band",
+    "novel",
+    "chapter",
+    "fiction",
+    "romance novel",
+    "audiobook",
+    "ebook",
+    "kindle",
+    "read online",
+    "webnovel",
+    "light novel",
+    "manga",
+    "anime",
+    "episode",
+    "season 2",
+    "watch online",
+    "subtitle",
+    "lyrics",
+    "album",
+    "tracklist",
+    "tour dates",
+    "concert",
+    "tickets",
+    "band",
 ];
 
 /// Markers of a music/entertainment page, the other sense of "chemical".
@@ -337,47 +375,294 @@ impl Association {
     }
 }
 
+/// A concept vocabulary that can be tagged against.
+///
+/// This is the loadable form of the seed list: it owns its concepts, pre-lowercases every surface
+/// form once at build time, and tags a document against all of them. It is the entry point for
+/// vocabularies that do not fit in a `const` — a JSON file with thousands of concepts, a table, an
+/// API response — while [`ConceptLexicon::from_defaults`] reproduces the bundled lexicon exactly.
+///
+/// Ordering and weights are identical to the standalone [`tag`] helper: a document tagged through
+/// the lexicon scores the same as through `tag(.., DEFAULT_SEEDS)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConceptLexicon {
+    seeds: Vec<ConceptSeed>,
+    /// `(seed index, lowered surface form)`, flattened across the vocabulary.
+    ///
+    /// Built once. The old code re-lowered and re-collected every form of every concept for every
+    /// document; that was invisible at 15 concepts and becomes the dominant cost at 10^4–10^6,
+    /// where a document is compared against more forms than it has bytes.
+    forms: Vec<(usize, String)>,
+    by_id: HashMap<String, usize>,
+}
+
+/// Accepted JSON shapes: a bare array of concepts, or an object carrying a `concepts` array (so a
+/// file can also hold provenance such as a version or a source). Unknown fields are ignored.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LexiconFile {
+    Bare(Vec<ConceptSeed>),
+    Wrapped { concepts: Vec<ConceptSeed> },
+}
+
+impl ConceptLexicon {
+    /// An empty vocabulary. Tags nothing until seeds are added.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build from seeds held in memory, merging repeated `concept_id`s.
+    ///
+    /// Duplicates are normal in vocabularies assembled from several files: the first definition's
+    /// `name` and `kind` win, aliases accumulate (case-insensitively deduplicated) and
+    /// `match_name` is the OR of the definitions. Entries with a blank `concept_id` or `name` are
+    /// dropped here; [`ConceptLexicon::try_from_seeds`] is the strict variant.
+    pub fn from_seeds<I: IntoIterator<Item = ConceptSeed>>(seeds: I) -> Self {
+        let (lexicon, _problems) = Self::build(seeds);
+        lexicon
+    }
+
+    /// Build from seeds held in memory, rejecting any entry a loader should not accept silently.
+    pub fn try_from_seeds<I: IntoIterator<Item = ConceptSeed>>(seeds: I) -> AppResult<Self> {
+        let (lexicon, problems) = Self::build(seeds);
+        if let Some(first) = problems.first() {
+            return Err(AppError::Invalid(format!(
+                "concept lexicon: {first} ({} problem(s) in total)",
+                problems.len()
+            )));
+        }
+        Ok(lexicon)
+    }
+
+    /// The bundled 15-concept lexicon.
+    pub fn from_defaults() -> Self {
+        Self::from_seeds(DEFAULT_SEEDS.iter().cloned())
+    }
+
+    /// Load a vocabulary from a JSON string.
+    ///
+    /// Each object is `{"concept_id", "name", "kind", "aliases", "match_name"}`; `kind` defaults
+    /// to `"topic"`, `aliases` to `[]` and `match_name` to `true`. An empty file is an error
+    /// rather than an empty vocabulary: a run that silently tags nothing is indistinguishable
+    /// from a lexicon that matched nothing, and the difference matters.
+    pub fn from_json_str(json: &str) -> AppResult<Self> {
+        let file: LexiconFile = serde_json::from_str(json)?;
+        let seeds = match file {
+            LexiconFile::Bare(v) => v,
+            LexiconFile::Wrapped { concepts } => concepts,
+        };
+        let lexicon = Self::try_from_seeds(seeds)?;
+        if lexicon.is_empty() {
+            return Err(AppError::Invalid(
+                "concept lexicon: no concepts found".to_string(),
+            ));
+        }
+        Ok(lexicon)
+    }
+
+    /// Load a vocabulary from any reader holding JSON.
+    pub fn from_reader<R: Read>(mut reader: R) -> AppResult<Self> {
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        Self::from_json_str(&buf)
+    }
+
+    /// Load a vocabulary from a JSON file.
+    pub fn from_path(path: impl AsRef<Path>) -> AppResult<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|e| {
+            AppError::Invalid(format!(
+                "cannot open concept lexicon {}: {e}",
+                path.display()
+            ))
+        })?;
+        let lexicon = Self::from_reader(file)
+            .map_err(|e| AppError::Invalid(format!("concept lexicon {}: {e}", path.display())))?;
+        Ok(lexicon)
+    }
+
+    /// Trim, merge duplicates, drop blank entries, and pre-lowercase every surface form.
+    fn build<I: IntoIterator<Item = ConceptSeed>>(seeds: I) -> (Self, Vec<String>) {
+        let mut lexicon = Self::default();
+        let mut problems = Vec::new();
+        for (pos, seed) in seeds.into_iter().enumerate() {
+            let id = seed.concept_id.trim().to_string();
+            let name = seed.name.trim().to_string();
+            if id.is_empty() {
+                problems.push(format!("entry {pos}: empty concept_id"));
+                continue;
+            }
+            if name.is_empty() {
+                problems.push(format!("entry {pos} ({id}): empty name"));
+                continue;
+            }
+            let kind = match seed.kind.trim() {
+                "" => "topic".to_string(),
+                k => k.to_string(),
+            };
+            match lexicon.by_id.get(&id).copied() {
+                Some(idx) => {
+                    let existing = &mut lexicon.seeds[idx];
+                    existing.match_name |= seed.match_name;
+                    for alias in seed.aliases.iter() {
+                        let dup = existing
+                            .aliases
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(alias));
+                        if !dup {
+                            existing
+                                .aliases
+                                .to_mut()
+                                .push(Cow::Owned(alias.to_string()));
+                        }
+                    }
+                }
+                None => {
+                    let idx = lexicon.seeds.len();
+                    lexicon.by_id.insert(id.clone(), idx);
+                    lexicon.seeds.push(ConceptSeed::new(
+                        id,
+                        name,
+                        kind,
+                        seed.aliases.iter().map(|a| a.to_string()),
+                        seed.match_name,
+                    ));
+                }
+            }
+        }
+        lexicon.reindex();
+        (lexicon, problems)
+    }
+
+    /// Rebuild the flattened form list from the seeds.
+    fn reindex(&mut self) {
+        self.forms.clear();
+        for (idx, seed) in self.seeds.iter().enumerate() {
+            let mut seen: Vec<String> = Vec::new();
+            for form in seed.surface_forms() {
+                let lowered = form.trim().to_ascii_lowercase();
+                // Two bytes can be a substring of almost anything; the old `tag` skipped these and
+                // so must the lexicon, or a dynamic vocabulary tags the whole corpus.
+                if lowered.len() < 3 || seen.contains(&lowered) {
+                    continue;
+                }
+                seen.push(lowered.clone());
+                self.forms.push((idx, lowered));
+            }
+        }
+    }
+
+    /// The concepts this lexicon holds, in registration order.
+    pub fn seeds(&self) -> &[ConceptSeed] {
+        &self.seeds
+    }
+
+    /// One concept by id.
+    pub fn get(&self, concept_id: &str) -> Option<&ConceptSeed> {
+        self.by_id.get(concept_id).map(|&i| &self.seeds[i])
+    }
+
+    /// Whether the lexicon defines `concept_id`.
+    pub fn contains(&self, concept_id: &str) -> bool {
+        self.by_id.contains_key(concept_id)
+    }
+
+    /// How many concepts the lexicon holds.
+    pub fn len(&self) -> usize {
+        self.seeds.len()
+    }
+
+    /// Whether the lexicon holds no concepts.
+    pub fn is_empty(&self) -> bool {
+        self.seeds.is_empty()
+    }
+
+    /// How many distinct surface forms are matched against each document.
+    pub fn surface_form_count(&self) -> usize {
+        self.forms.len()
+    }
+
+    /// Tag one document against every concept in the vocabulary.
+    pub fn tag(&self, title: &str, headings: &str, body: &str) -> Vec<Association> {
+        tag_prepared(&self.seeds, &self.forms, title, headings, body)
+    }
+
+    /// `(concept_id, name, kind, alias)` rows this lexicon implies, for registration.
+    pub fn registry_rows(&self) -> Vec<(String, String, String, Option<String>)> {
+        registry_rows_for(&self.seeds)
+    }
+
+    /// Count how many concepts tag each document in `docs`.
+    pub fn coverage(
+        &self,
+        docs: impl Iterator<Item = (String, String, String)>,
+    ) -> AppResult<HashMap<String, usize>> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (title, headings, body) in docs {
+            for a in self.tag(&title, &headings, &body) {
+                *counts.entry(a.concept_id).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+}
+
+/// Per-concept match counts for one document, accumulated over its surface forms.
+#[derive(Debug, Default, Clone, Copy)]
+struct Hits {
+    title: usize,
+    headings: usize,
+    body: usize,
+    mechanism: usize,
+}
+
 /// One document's associations, strongest first.
-pub fn tag(
+pub fn tag(title: &str, headings: &str, body: &str, lexicon: &[ConceptSeed]) -> Vec<Association> {
+    // Lower the forms once for this call. `ConceptLexicon` exists to hoist this out of a
+    // per-document loop; the standalone helper keeps its old signature for callers that hold a
+    // plain seed slice.
+    ConceptLexicon::from_seeds(lexicon.iter().cloned()).tag(title, headings, body)
+}
+
+/// The tagging core: matches pre-lowered `forms` (each tagged with its seed index) against the
+/// document, then turns the counts into dimensions.
+fn tag_prepared(
+    seeds: &[ConceptSeed],
+    forms: &[(usize, String)],
     title: &str,
     headings: &str,
     body: &str,
-    lexicon: &[ConceptSeed],
 ) -> Vec<Association> {
+    if seeds.is_empty() || forms.is_empty() {
+        return Vec::new();
+    }
     let title_l = title.to_ascii_lowercase();
     let headings_l = headings.to_ascii_lowercase();
     let body_l = body.to_ascii_lowercase();
 
-    let mut out: Vec<Association> = Vec::new();
-    for seed in lexicon {
-        let mut title_hits = 0usize;
-        let mut heading_hits = 0usize;
-        let mut body_hits = 0usize;
-        let mut mechanism_hits = 0usize;
-
-        let forms: Vec<&str> = if seed.match_name {
-            std::iter::once(seed.name).chain(seed.aliases.iter().copied()).collect()
-        } else {
-            seed.aliases.to_vec()
-        };
-        for form in forms {
-            let f = form.to_ascii_lowercase();
-            if f.len() < 3 {
-                continue;
-            }
-            if title_l.contains(&f) {
-                title_hits += 1;
-            }
-            heading_hits += headings_l.matches(&f).count();
-            body_hits += body_l.matches(&f).count();
-            // A concept is discussed as a *mechanism* when a causal or process word sits within
-            // `PROXIMITY` characters of it. Measured on 20,000 real documents, the earlier test —
-            // "does the document contain a marker anywhere" — produced a mechanism dimension that
-            // never exceeded 0.2 and never once beat `direct`, because almost every explanatory
-            // page contains "because" somewhere. Proximity is what makes the dimension mean "this
-            // concept is explained" rather than "this page explains something".
-            mechanism_hits += marker_near(&body_l, &f);
+    let mut hits = vec![Hits::default(); seeds.len()];
+    for (idx, form) in forms {
+        let h = &mut hits[*idx];
+        if title_l.contains(form.as_str()) {
+            h.title += 1;
         }
+        h.headings += headings_l.matches(form.as_str()).count();
+        h.body += body_l.matches(form.as_str()).count();
+        // A concept is discussed as a *mechanism* when a causal or process word sits within
+        // `PROXIMITY` characters of it. Measured on 20,000 real documents, the earlier test —
+        // "does the document contain a marker anywhere" — produced a mechanism dimension that
+        // never exceeded 0.2 and never once beat `direct`, because almost every explanatory
+        // page contains "because" somewhere. Proximity is what makes the dimension mean "this
+        // concept is explained" rather than "this page explains something".
+        h.mechanism += marker_near(&body_l, form);
+    }
+
+    let mut out: Vec<Association> = Vec::new();
+    for (seed, h) in seeds.iter().zip(hits.iter()) {
+        let title_hits = h.title;
+        let heading_hits = h.headings;
+        let body_hits = h.body;
+        let mechanism_hits = h.mechanism;
 
         if title_hits == 0 && heading_hits == 0 && body_hits == 0 {
             continue;
@@ -422,7 +707,7 @@ pub fn tag(
 
         // Wrong-sense discount. Applied to `direct` only, and only when the page actually carries
         // the markers — a page with no genre vocabulary is untouched.
-        let (direct, contextual, mechanism) = match wrong_sense_markers(seed.concept_id) {
+        let (direct, contextual, mechanism) = match wrong_sense_markers(&seed.concept_id) {
             Some(markers) => {
                 let hits = markers.iter().filter(|m| body_l.contains(**m)).count();
                 if hits >= 2 {
@@ -494,9 +779,25 @@ fn marker_near(body: &str, form: &str) -> usize {
 /// Chosen for causal/process language, not for topic: these words appear in any explanatory text,
 /// so they only shift a dimension when the concept is already present.
 const MECHANISM_MARKERS: &[&str] = &[
-    "because", "causes", "caused by", "leads to", "results in", "mechanism", "pathway",
-    "receptor", "signalling", "signaling", "regulates", "modulates", "mediates", "triggers",
-    "in response to", "process by which", "how it works", "drives", "produces",
+    "because",
+    "causes",
+    "caused by",
+    "leads to",
+    "results in",
+    "mechanism",
+    "pathway",
+    "receptor",
+    "signalling",
+    "signaling",
+    "regulates",
+    "modulates",
+    "mediates",
+    "triggers",
+    "in response to",
+    "process by which",
+    "how it works",
+    "drives",
+    "produces",
 ];
 
 /// Scale a body-derived weight into the contextual dimension, so contextual evidence never
@@ -520,23 +821,30 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
-/// The `(concept, alias)` rows `LEXICON` implies, for registration.
+/// The `(concept, alias)` rows `DEFAULT_SEEDS` implies, for registration.
+///
+/// Kept for callers that register the bundled vocabulary; a loaded vocabulary uses
+/// [`ConceptLexicon::registry_rows`].
 pub fn registry_rows() -> Vec<(String, String, String, Option<String>)> {
-    // (concept_id, name, kind, alias)
+    registry_rows_for(DEFAULT_SEEDS)
+}
+
+/// `(concept_id, name, kind, alias)` rows for any seed slice.
+fn registry_rows_for(seeds: &[ConceptSeed]) -> Vec<(String, String, String, Option<String>)> {
     let mut out = Vec::new();
-    for seed in LEXICON {
+    for seed in seeds {
         out.push((
             seed.concept_id.to_string(),
             seed.name.to_string(),
             seed.kind.to_string(),
             None,
         ));
-        for a in seed.aliases {
+        for a in seed.aliases.iter() {
             out.push((
                 seed.concept_id.to_string(),
                 seed.name.to_string(),
                 seed.kind.to_string(),
-                Some((*a).to_string()),
+                Some(a.to_string()),
             ));
         }
     }
@@ -544,17 +852,13 @@ pub fn registry_rows() -> Vec<(String, String, String, Option<String>)> {
 }
 
 /// Count how many lexicon concepts a corpus would tag, so a dry run can be reported.
+///
+/// Kept as a free function for a seed slice; [`ConceptLexicon::coverage`] is the prepared form.
 pub fn coverage(
     docs: impl Iterator<Item = (String, String, String)>,
     lexicon: &[ConceptSeed],
 ) -> AppResult<HashMap<String, usize>> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (title, headings, body) in docs {
-        for a in tag(&title, &headings, &body, lexicon) {
-            *counts.entry(a.concept_id).or_insert(0) += 1;
-        }
-    }
-    Ok(counts)
+    ConceptLexicon::from_seeds(lexicon.iter().cloned()).coverage(docs)
 }
 
 #[cfg(test)]
@@ -562,7 +866,7 @@ mod tests {
     use super::*;
 
     fn lex() -> &'static [ConceptSeed] {
-        LEXICON
+        DEFAULT_SEEDS
     }
 
     fn weight_of(tags: &[Association], id: &str) -> Option<f64> {
@@ -594,7 +898,10 @@ mod tests {
         // The title says "oxytocin", not "chemistry", so chemistry's evidence is the body's
         // biochemistry vocabulary — it is a real association and it carries the mechanism
         // dimension, but it is not the page's stated subject.
-        assert!(chem.mechanism > 0.0, "mechanism dimension missing: {chem:?}");
+        assert!(
+            chem.mechanism > 0.0,
+            "mechanism dimension missing: {chem:?}"
+        );
         assert!(
             chem.direct > 0.0,
             "chemistry should still be a direct association: {chem:?}"
@@ -788,9 +1095,297 @@ mod tests {
     fn the_registry_rows_match_the_lexicon() {
         let rows = registry_rows();
         let concepts: usize = rows.iter().filter(|r| r.3.is_none()).count();
-        assert_eq!(concepts, LEXICON.len());
+        assert_eq!(concepts, DEFAULT_SEEDS.len());
         let aliases = rows.len() - concepts;
-        let expected: usize = LEXICON.iter().map(|s| s.aliases.len()).sum();
+        let expected: usize = DEFAULT_SEEDS.iter().map(|s| s.aliases.len()).sum();
         assert_eq!(aliases, expected);
+    }
+
+    // --- dynamic, open vocabularies -------------------------------------------------------
+
+    /// The JSON a user would hand `agent0 concepts build --lexicon`.
+    const JSON_LEXICON: &str = r#"[
+        {
+            "concept_id": "c-sourdough",
+            "name": "sourdough",
+            "kind": "topic",
+            "match_name": true,
+            "aliases": ["starter culture", "wild yeast", "levain"]
+        },
+        {
+            "concept_id": "c-fermentation",
+            "name": "fermentation",
+            "kind": "topic",
+            "match_name": false,
+            "aliases": ["lactic acid bacteria", "fermented food"]
+        }
+    ]"#;
+
+    /// The bundled vocabulary is unchanged, so `--lexicon` is additive rather than a migration.
+    #[test]
+    fn the_bundled_lexicon_is_still_the_fifteen_seeds() {
+        assert_eq!(
+            DEFAULT_SEEDS.len(),
+            15,
+            "the bundled vocabulary changed size"
+        );
+        assert_eq!(
+            LEXICON.len(),
+            15,
+            "the backwards-compatible alias must match"
+        );
+        let lexicon = ConceptLexicon::from_defaults();
+        assert_eq!(lexicon.len(), 15);
+        assert!(
+            lexicon.surface_form_count() > 50,
+            "surface forms were not indexed: {}",
+            lexicon.surface_form_count()
+        );
+        assert_eq!(lexicon.seeds(), DEFAULT_SEEDS);
+        assert_eq!(lexicon.registry_rows().len(), registry_rows().len());
+    }
+
+    /// The point of the task: a vocabulary that exists only in a file tags documents.
+    #[test]
+    fn a_json_lexicon_tags_the_document_it_describes() {
+        let lexicon = ConceptLexicon::from_json_str(JSON_LEXICON).expect("valid lexicon");
+        assert_eq!(lexicon.len(), 2);
+        assert!(lexicon.get("c-sourdough").is_some());
+        assert!(lexicon.contains("c-fermentation"));
+
+        let tags = lexicon.tag(
+            "Sourdough starter troubleshooting",
+            "Feeding schedule",
+            "Wild yeast and levain raise the dough; the starter culture doubles overnight.",
+        );
+        let sd = tags
+            .iter()
+            .find(|a| a.concept_id == "c-sourdough")
+            .expect("sourdough association");
+        assert!(sd.weight() >= MIN_WEIGHT, "{sd:?}");
+        assert!(sd.direct > 0.0, "the title names the concept: {sd:?}");
+        assert_eq!(tags.len(), 1, "false positives: {tags:?}");
+    }
+
+    /// `match_name: false` must be honoured from JSON, not only from the bundled `const`.
+    #[test]
+    fn a_loaded_concept_can_exclude_its_own_name() {
+        let lexicon = ConceptLexicon::from_json_str(JSON_LEXICON).expect("valid lexicon");
+        let bare = lexicon.tag("Fermentation", "", "");
+        assert!(bare.is_empty(), "the bare name must not match: {bare:?}");
+        let by_alias = lexicon.tag(
+            "Lactic acid bacteria in food",
+            "",
+            "Lactic acid bacteria ferment sugars.",
+        );
+        assert_eq!(by_alias.len(), 1, "{by_alias:?}");
+        assert_eq!(by_alias[0].concept_id, "c-fermentation");
+    }
+
+    #[test]
+    fn json_accepts_a_wrapped_concepts_object() {
+        let lexicon = ConceptLexicon::from_json_str(
+            r#"{"version": 1, "source": "hand-curated", "concepts": [
+                 {"concept_id": "c-widgets", "name": "widgets", "aliases": ["widgetry"]}
+               ]}"#,
+        )
+        .expect("wrapped lexicon");
+        assert_eq!(lexicon.len(), 1);
+        assert!(lexicon.contains("c-widgets"));
+        assert!(!lexicon.tag("Widgetry at scale", "", "").is_empty());
+    }
+
+    /// Defaults fill in: `kind` is optional, and a seed without `match_name` matches its name.
+    #[test]
+    fn json_defaults_fill_in_missing_fields() {
+        let lexicon =
+            ConceptLexicon::from_json_str(r#"[{"concept_id":"c-tidal","name":"tidal power"}]"#)
+                .expect("minimal lexicon");
+        let seed = lexicon.get("c-tidal").expect("concept");
+        assert_eq!(seed.kind, "topic");
+        assert!(seed.match_name);
+        assert!(seed.aliases.is_empty());
+        assert_eq!(lexicon.tag("Tidal power in the bay", "", "").len(), 1);
+    }
+
+    #[test]
+    fn a_lexicon_loads_from_a_file_and_from_a_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("concepts.json");
+        std::fs::write(&path, JSON_LEXICON).expect("write lexicon");
+
+        let from_file = ConceptLexicon::from_path(&path).expect("load from path");
+        let from_reader = ConceptLexicon::from_reader(std::fs::File::open(&path).expect("open"))
+            .expect("load from reader");
+        assert_eq!(from_file, from_reader);
+        assert_eq!(from_file.len(), 2);
+
+        let err = ConceptLexicon::from_path(dir.path().join("missing.json")).unwrap_err();
+        assert!(err.to_string().contains("missing.json"), "{err}");
+    }
+
+    /// An empty or malformed vocabulary is an error: a pass that silently tags nothing would
+    /// look like a corpus with no concepts in it.
+    #[test]
+    fn a_broken_or_empty_lexicon_is_an_error_not_a_silent_success() {
+        assert!(ConceptLexicon::from_json_str("{not json").is_err());
+        assert!(ConceptLexicon::from_json_str("[]").is_err(), "empty array");
+        assert!(
+            ConceptLexicon::from_json_str(r#"{"concepts": []}"#).is_err(),
+            "empty wrapped"
+        );
+        assert!(ConceptLexicon::from_json_str(r#"[{"concept_id":"","name":"x"}]"#).is_err());
+        assert!(ConceptLexicon::from_json_str(r#"[{"concept_id":"c","name":""}]"#).is_err());
+        // A wrong type is a parse error, not a silently dropped alias list.
+        assert!(ConceptLexicon::from_json_str(
+            r#"[{"concept_id":"c","name":"n","aliases":"oops"}]"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn duplicate_concept_ids_merge_their_aliases() {
+        let lexicon = ConceptLexicon::from_json_str(
+            r#"[
+                 {"concept_id":"c-dup","name":"dup","aliases":["first alias"],"match_name":false},
+                 {"concept_id":"c-dup","name":"ignored","kind":"field",
+                  "aliases":["second alias","First Alias"],"match_name":true}
+               ]"#,
+        )
+        .expect("duplicate ids are legal");
+        assert_eq!(lexicon.len(), 1, "one id is one concept");
+        let seed = lexicon.get("c-dup").expect("concept");
+        assert_eq!(seed.name, "dup", "the first definition keeps its name");
+        assert_eq!(seed.kind, "topic", "the first definition keeps its kind");
+        assert!(seed.match_name, "match_name is the OR of the definitions");
+        let aliases: Vec<&str> = seed.aliases.iter().map(|a| &**a).collect();
+        assert_eq!(aliases, vec!["first alias", "second alias"]);
+        assert!(!lexicon.tag("Second alias here", "", "").is_empty());
+    }
+
+    #[test]
+    fn the_lenient_constructor_drops_unusable_entries_and_the_strict_one_refuses_them() {
+        let seeds = vec![
+            ConceptSeed::new("", "blank id", "topic", Vec::<String>::new(), true),
+            ConceptSeed::new("c-ok", "fine", "topic", ["fine alias"], true),
+        ];
+        assert_eq!(ConceptLexicon::from_seeds(seeds.clone()).len(), 1);
+        assert!(ConceptLexicon::try_from_seeds(seeds).is_err());
+    }
+
+    /// The refactor must not move a single weight: the standalone helper and the prepared
+    /// lexicon are the same computation.
+    #[test]
+    fn the_standalone_tag_and_the_lexicon_agree() {
+        let title = "Oxytocin modulation of pair-bond formation in voles";
+        let headings = "Introduction\nHormonal mechanisms\nAttachment behaviour";
+        let body = "Oxytocin is a neuropeptide released in the hypothalamus. Central dopamine \
+                    signalling mediates attachment formation because oxytocin receptors in the \
+                    nucleus accumbens regulate social reward. Romantic attachment in humans is \
+                    thought to share this pathway.";
+        assert_eq!(
+            tag(title, headings, body, DEFAULT_SEEDS),
+            ConceptLexicon::from_defaults().tag(title, headings, body),
+        );
+    }
+
+    /// The constraint this task removes: a file with thousands of concepts loads and tags
+    /// against all of them, matching only the one whose form actually occurs.
+    #[test]
+    fn a_lexicon_of_thousands_of_concepts_tags_only_the_matching_one() {
+        const N: usize = 5_000;
+        let mut json = String::from("[");
+        for i in 0..N {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                r#"{{"concept_id":"c-{i:05}","name":"topic-{i:05}-end","aliases":["zz{i:05}qq"]}}"#
+            ));
+        }
+        json.push(']');
+
+        let lexicon = ConceptLexicon::from_json_str(&json).expect("5000-concept lexicon");
+        assert_eq!(lexicon.len(), N);
+        assert_eq!(
+            lexicon.surface_form_count(),
+            N * 2,
+            "every name and alias is indexed"
+        );
+
+        let tags = lexicon.tag(
+            "All about topic-04321-end",
+            "Sections",
+            "This page mentions zz04321qq exactly once.",
+        );
+        assert_eq!(tags.len(), 1, "expected one concept, got: {tags:?}");
+        assert_eq!(tags[0].concept_id, "c-04321");
+    }
+
+    /// A loaded vocabulary gets the same polysemy guard as the bundled one, keyed on concept id.
+    #[test]
+    fn the_wrong_sense_guard_applies_to_loaded_concepts() {
+        let lexicon = ConceptLexicon::from_json_str(
+            r#"[{"concept_id":"c-romance","name":"romance","match_name":false,
+                 "aliases":["romantic love","romantic attachment"]}]"#,
+        )
+        .expect("valid lexicon");
+        let genre = lexicon.tag(
+            "Drama Novels - Read Online",
+            "",
+            "Romantic love stories. Read online, chapter updates, webnovel, ebook, manga, anime.",
+        );
+        let real = lexicon.tag(
+            "Romantic attachment in adult couples",
+            "",
+            "A study of romantic love and romantic attachment over time.",
+        );
+        let genre_w = weight_of(&genre, "c-romance").unwrap_or(0.0);
+        let real_w = weight_of(&real, "c-romance").unwrap_or(0.0);
+        assert!(real_w > 0.5, "a real article must be tagged: {real:?}");
+        assert!(
+            genre_w * 2.0 < real_w,
+            "a genre listing ({genre_w:.3}) must score far below a real article ({real_w:.3})"
+        );
+    }
+
+    #[test]
+    fn loaded_forms_are_case_insensitive_and_two_byte_forms_are_ignored() {
+        let lexicon = ConceptLexicon::from_json_str(
+            r#"[{"concept_id":"c-rust","name":"Rust","aliases":["ai","Ownership"]}]"#,
+        )
+        .expect("valid lexicon");
+        let tags = lexicon.tag("OWNERSHIP and the borrow checker", "", "");
+        assert_eq!(tags.len(), 1, "{tags:?}");
+        assert_eq!(tags[0].concept_id, "c-rust");
+        assert!(
+            lexicon.tag("AI safety", "", "").is_empty(),
+            "a two-byte alias matches half the corpus and must be dropped"
+        );
+    }
+
+    #[test]
+    fn coverage_counts_documents_per_concept() {
+        let lexicon = ConceptLexicon::from_defaults();
+        let docs = vec![
+            (
+                "Chemistry of bonding".to_string(),
+                String::new(),
+                "molecular reaction".to_string(),
+            ),
+            (
+                "Rust ownership".to_string(),
+                String::new(),
+                "borrow checker".to_string(),
+            ),
+            (
+                "Rust again".to_string(),
+                String::new(),
+                "ownership rules".to_string(),
+            ),
+        ];
+        let counts = lexicon.coverage(docs.into_iter()).expect("coverage");
+        assert_eq!(counts.get("c-rust"), Some(&2));
+        assert_eq!(counts.get("c-chemistry"), Some(&1));
     }
 }

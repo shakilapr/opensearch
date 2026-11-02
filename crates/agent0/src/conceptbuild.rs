@@ -64,9 +64,13 @@ struct Doc {
 }
 
 /// Register the lexicon. Idempotent: a concept or alias already present is left alone.
-fn register_lexicon(w: &mut MetadataWriter, now: i64) -> AppResult<usize> {
+fn register_lexicon(
+    w: &mut MetadataWriter,
+    now: i64,
+    lexicon: &concept_tag::ConceptLexicon,
+) -> AppResult<usize> {
     let mut batch = Vec::new();
-    for (concept_id, name, kind, alias) in concept_tag::registry_rows() {
+    for (concept_id, name, kind, alias) in lexicon.registry_rows() {
         match alias {
             None => batch.push(Mutation::UpsertConcept {
                 concept_id,
@@ -136,7 +140,13 @@ fn page_of_docs(
         .collect())
 }
 
-/// `agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--rebuild] [--dry-run] [--since EPOCH]`
+/// `agent0 concepts build [--dir PATH]... [--lexicon PATH] [--batch N] [--limit N] [--rebuild]
+/// [--dry-run] [--since EPOCH]`
+///
+/// `--lexicon <PATH>` loads the concept universe from a JSON file instead of the bundled 15
+/// seeds, so the vocabulary can scale to thousands or millions of concepts (see
+/// [`search_retrieval::concept_tag::ConceptLexicon`]). The file is either an array of concepts or
+/// an object with a `concepts` array.
 ///
 /// `--rebuild` purges this pass's own `model_version` before tagging. Tagging is otherwise an
 /// upsert, so a corrected lexicon cannot remove an association the previous lexicon created — a
@@ -145,21 +155,38 @@ pub async fn run(args: &[String]) -> ExitCode {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut i = 3;
     while i < args.len() {
-        if args[i] == "--dir" {
-            match args.get(i + 1) {
+        match args[i].as_str() {
+            "--dir" => match args.get(i + 1) {
                 Some(v) => {
                     dirs.push(PathBuf::from(v));
                     i += 2;
                 }
                 None => return usage("--dir needs a path"),
-            }
-        } else {
-            break;
+            },
+            // Every other flag is read by `flag_str`/`flag_usize` below. Breaking on the first one
+            // would make `--lexicon` before `--dir` silently skip every directory.
+            _ => i += 1,
         }
     }
     if dirs.is_empty() {
         dirs.push(Config::from_env().data_dir);
     }
+
+    // The vocabulary is resolved once, before any root is touched: a missing or malformed lexicon
+    // must fail the whole command rather than half-tag one root with the built-in seeds.
+    let (lexicon, lexicon_label) = match flag_str(args, "--lexicon") {
+        Some(path) => match concept_tag::ConceptLexicon::from_path(&path) {
+            Ok(lexicon) => (lexicon, path),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => (
+            concept_tag::ConceptLexicon::from_defaults(),
+            "built-in seeds".to_string(),
+        ),
+    };
     let batch = flag_usize(args, "--batch").unwrap_or(BATCH_DOCS).max(1);
     let limit = flag_usize(args, "--limit").unwrap_or(usize::MAX);
     let dry_run = args.iter().any(|a| a == "--dry-run");
@@ -177,7 +204,16 @@ pub async fn run(args: &[String]) -> ExitCode {
         let mut cfg = Config::from_env();
         cfg.data_dir = dir.clone();
         println!("{}:", dir.display());
-        match build_root(&cfg, batch, limit, dry_run, rebuild, since) {
+        match build_root(
+            &cfg,
+            &lexicon,
+            &lexicon_label,
+            batch,
+            limit,
+            dry_run,
+            rebuild,
+            since,
+        ) {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
@@ -192,8 +228,11 @@ pub async fn run(args: &[String]) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_root(
     cfg: &Config,
+    lexicon: &concept_tag::ConceptLexicon,
+    lexicon_label: &str,
     batch: usize,
     limit: usize,
     dry_run: bool,
@@ -209,8 +248,11 @@ fn build_root(
         }])?;
         println!("  purged associations from {MODEL_VERSION}");
     }
-    let registered = register_lexicon(&mut writer, now)?;
-    println!("  lexicon: {registered} concept/alias rows registered");
+    let registered = register_lexicon(&mut writer, now, lexicon)?;
+    println!(
+        "  lexicon: {} concept(s) from {lexicon_label}, {registered} concept/alias rows registered",
+        lexicon.len()
+    );
     if dry_run {
         println!("  dry run: associations not written");
     }
@@ -225,7 +267,8 @@ fn build_root(
     // Pass 1: how many documents each concept would claim. Needed because ubiquity can only be
     // measured against the corpus, not guessed: `c-ml` claimed 32% of the serving root and drowned
     // every real association. Cheap — tagging is 400 docs/s and nothing is written.
-    let mut concept_docs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut concept_docs: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut total_docs = 0usize;
     {
         let mut probe_after = String::new();
@@ -241,7 +284,7 @@ fn build_root(
                 if body.trim().is_empty() {
                     continue;
                 }
-                for a in concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON) {
+                for a in lexicon.tag(&d.title, "", &body) {
                     *concept_docs.entry(a.concept_id).or_insert(0) += 1;
                 }
             }
@@ -267,7 +310,12 @@ fn build_root(
     }
 
     'pages: loop {
-        let docs = page_of_docs(&reader, &after, batch.min(limit.saturating_sub(seen)).max(1), since)?;
+        let docs = page_of_docs(
+            &reader,
+            &after,
+            batch.min(limit.saturating_sub(seen)).max(1),
+            since,
+        )?;
         if docs.is_empty() {
             break;
         }
@@ -284,7 +332,7 @@ fn build_root(
             }
             // Headings live in the body text for extracted pages, so they are searched through the
             // body; a page's title comes from the metadata row.
-            let assocs_for_doc = concept_tag::tag(&d.title, "", &body, concept_tag::LEXICON);
+            let assocs_for_doc = lexicon.tag(&d.title, "", &body);
             after = d.docver_id.clone();
             if assocs_for_doc.is_empty() {
                 continue;
@@ -300,7 +348,8 @@ fn build_root(
                 // "teaching machines to learn from their own errors" resolve to no concept at all,
                 // which turned a bad ranking into no ranking. A ubiquitous concept is weak
                 // evidence, not absent evidence, and that distinction belongs in the score.
-                if ubiquitous.contains(&assoc.concept_id) && assoc.direct < UBIQUITY_STRONG_EVIDENCE {
+                if ubiquitous.contains(&assoc.concept_id) && assoc.direct < UBIQUITY_STRONG_EVIDENCE
+                {
                     continue;
                 }
                 assocs += 1;
@@ -426,20 +475,28 @@ fn relate_one(dir: &std::path::Path, topk: usize, min_support: usize) -> AppResu
     {
         let conn = reader.conn();
         let mut stmt = conn
-            .prepare("SELECT resource_id, concept_id FROM doc_concept WHERE relation_kind = 'direct'")
+            .prepare(
+                "SELECT resource_id, concept_id FROM doc_concept WHERE relation_kind = 'direct'",
+            )
             .map_err(search_metadata::db_err)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(search_metadata::db_err)?;
         for row in rows {
             let (doc, concept) = row.map_err(search_metadata::db_err)?;
-            by_concept.entry(concept.clone()).or_default().insert(doc.clone());
+            by_concept
+                .entry(concept.clone())
+                .or_default()
+                .insert(doc.clone());
             by_doc.entry(doc).or_default().push(concept);
         }
     }
     let n_docs = by_doc.len() as f64;
     if n_docs == 0.0 {
-        println!("{}: no direct associations; nothing to relate", dir.display());
+        println!(
+            "{}: no direct associations; nothing to relate",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -462,7 +519,8 @@ fn relate_one(dir: &std::path::Path, topk: usize, min_support: usize) -> AppResu
 
     // Keep the strongest `topk` neighbours per concept, symmetrically: an edge kept for `a` must
     // also be walkable from `b`, or expansion depends on which concept the query happened to name.
-    let mut best: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
+    let mut best: std::collections::HashMap<(String, String), f64> =
+        std::collections::HashMap::new();
     for ((a, b), n_ab) in pair.iter() {
         if (*n_ab as usize) < min_support {
             continue;
@@ -481,8 +539,14 @@ fn relate_one(dir: &std::path::Path, topk: usize, min_support: usize) -> AppResu
     let mut per_concept: std::collections::HashMap<String, Vec<(String, f64)>> =
         std::collections::HashMap::new();
     for ((a, b), s) in best.iter() {
-        per_concept.entry(a.clone()).or_default().push((b.clone(), *s));
-        per_concept.entry(b.clone()).or_default().push((a.clone(), *s));
+        per_concept
+            .entry(a.clone())
+            .or_default()
+            .push((b.clone(), *s));
+        per_concept
+            .entry(b.clone())
+            .or_default()
+            .push((a.clone(), *s));
     }
     let mut edges: Vec<(String, String, f64)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
@@ -542,7 +606,7 @@ fn relate_one(dir: &std::path::Path, topk: usize, min_support: usize) -> AppResu
 fn usage(why: &str) -> ExitCode {
     eprintln!("error: {why}");
     eprintln!(
-        "usage: agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]\n       agent0 concepts relate [--dir PATH]... [--topk N] [--min-support N]"
+        "usage: agent0 concepts build [--dir PATH]... [--lexicon PATH] [--batch N] [--limit N] [--dry-run]\n       agent0 concepts relate [--dir PATH]... [--topk N] [--min-support N]"
     );
     ExitCode::from(2)
 }

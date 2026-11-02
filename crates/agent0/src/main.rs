@@ -338,7 +338,7 @@ async fn main() -> ExitCode {
             Some("build") => search_agent0::conceptbuild::run(&args).await,
             Some("relate") => search_agent0::conceptbuild::run_relate(&args).await,
             _ => {
-                eprintln!("usage: agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]");
+                eprintln!("usage: agent0 concepts build [--dir PATH]... [--lexicon PATH] [--batch N] [--limit N] [--dry-run]");
                 ExitCode::from(2)
             }
         },

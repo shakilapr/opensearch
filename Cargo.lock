@@ -3603,6 +3603,7 @@ dependencies = [
  "search-graph",
  "search-indexer",
  "search-metadata",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",

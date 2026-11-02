@@ -19,9 +19,12 @@ search-core = { path = "../core" }
 search-embed = { path = "../embed" }
 search-indexer = { path = "../indexer", optional = true }
 search-graph = { path = "../graph" }
+# `ConceptLexicon` loads vocabularies from JSON at runtime: a concept file is the whole point of
+# the open-vocabulary path, so the parser is a normal dependency, not a test one.
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
