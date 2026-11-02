@@ -431,7 +431,7 @@ Each is enforced somewhere a future change can be caught.
 | `engine` | query units, routing, budgets, fusion (RRF), evidence, rerank hooks |
 | `rerank` | stage-3 feature reranker (off by default) |
 | `api` | HTTP surface, federation, `/read`, `/search` |
-| `agent0` | the binary: `crawl`, `serve`, `index build|publish`, `concepts build|relate`, `features train|build|probe`, `embed build`, `eval run`, `export|import`, `migrate` |
+| `agent0` | the binary: `crawl`, `serve`, `index build|publish|audit`, `concepts build|relate`, `features train|build|probe`, `embed build`, `eval run`, `export|import`, `migrate` |
 | `eval`, `bench`, `acceptance` | graded sets, harnesses, acceptance tests |
 | `nav`, `planner`, `answer`, `mcp`, `router`, `distill`, `cache`, `trace`, `graph`, `ann`, `dataset` | optional stages, surfaces and derived layers (several are schema-only — see §12) |
 
@@ -447,9 +447,11 @@ Honest, by layer. "Partial" means it exists for some roots or some paths only.
 | `/read` resolution incl. federation | **done** | live 15,375-char read of a shard doc |
 | Dense vectors | **done**, 1.39M docs | 2.14 GB across 5 roots |
 | Feature encoder + postings + forward index | **done**, weight 0.0 | 22.2M rows, 180 MB postings |
-| Concept matrix M3/M4 | **done**, weight 0.0 | 885,364 / 1,892,440 rows, 15 concepts |
+| Concept matrix M3/M4 | **done** | 885,364 / 1,892,440 rows, 15 concepts |
+| Concept relatedness graph (M5) | **built from the corpus** (`cooccur`, PMI) | 222 edges; hand-written taxonomy edges still absent |
+| Concept-first ranking | **measured** | 2.6× BM25 on cross-disciplinary, −0.078 on title queries (`docs/CONCEPT-RANKING.md`) |
 | Concept vocabulary breadth | **weak** | 15 concepts over 1.56M docs; a lexicon, not a taxonomy |
-| Concept graph M5 | **absent** | 0 rows |
+
 | Source profiles M6 | **absent** | 0 rows |
 | Link graph (`web_link`) | **absent** | 0 rows; raw HTML no longer retained, so it is only recoverable from a re-crawl |
 | Passage layer | **absent** | 0 rows |
