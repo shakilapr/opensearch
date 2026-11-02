@@ -32,16 +32,22 @@ systemctl reset-failed "$UNIT" 2>/dev/null || true
 # CPUQuota leaves headroom: four crawlers at 250% each is at most 10 of 16 cores, so the box keeps
 # ~6 cores for serving, batch passes and anything else. MemoryMax keeps a crawl from OOM-killing a
 # neighbour (a 4 GB cgroup kill took a rebuild down twice).
-systemd-run --unit="$UNIT" --collect \
+# `Restart=always` is load-bearing: the crawler exits normally when its seed list is exhausted and
+# discovery has quiesced, which happens every few minutes on a thin seed file. Without a restart
+# policy the fleet sits idle until an external watchdog notices (up to 5 min), halving throughput.
+# Waiting 5 s and starting again costs far less than the gap.
+systemd-run --unit="$UNIT" \
+  --property=Restart=always \
+  --property=RestartSec=5 \
   --property=WorkingDirectory=/root/projects/search \
   --property=CPUQuota="${CRAWLER_CPU_QUOTA:-250%}" \
   --property=MemoryMax="${CRAWLER_MEMORY_MAX:-6G}" \
   --property=Environment=SEARCH_DATA_DIR="$ROOT" \
   --property=Environment=SEARCH_CRAWL_ORIGIN_INTERVAL_MS=250 \
   --property=Environment=SEARCH_CRAWL_ORIGIN_CAP=250 \
-  --property=Environment=SEARCH_CRAWL_REFILL_BATCH="${CRAWLER_REFILL_BATCH:-4096}" \
+  --property=Environment=SEARCH_CRAWL_REFILL_BATCH="${CRAWLER_REFILL_BATCH:-1024}" \
   --property=Environment=SEARCH_CRAWL_PER_ORIGIN_SHARE="${CRAWLER_PER_ORIGIN_SHARE:-8}" \
   --property=Environment=SEARCH_MIN_FREE_GB=20 \
-  /bin/bash -c "exec timeout 86400 ./target/release/agent0 crawl /var/lib/search-fleet/work/shard-$SHARD.txt --out raw-dataset/shard-$SHARD --max-docs 250000 --max-urls 1000000 --concurrency 256 --compress >> $LOG 2>&1" \
+  /bin/bash -c "exec timeout 86400 ./target/release/agent0 crawl /var/lib/search-fleet/work/shard-$SHARD.txt --out raw-dataset/shard-$SHARD --max-docs 1000000 --max-urls 4000000 --concurrency "${CRAWLER_CONCURRENCY:-512}" --compress >> $LOG 2>&1" \
   >/dev/null
 echo "shard-$SHARD: unit $UNIT started"

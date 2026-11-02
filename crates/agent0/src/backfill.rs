@@ -64,6 +64,18 @@ const REFILL_SQL: &str = "
               priority ASC, earliest_fetch_at ASC, resource_id ASC
      LIMIT ?2";
 
+/// The same selection without the domain grouping, kept for the tests that pin the per-origin
+/// share. Production uses [`REFILL_SQL`]: one URL per domain per refill is what turns 47,000 ready
+/// origins into 47,000 *concurrent* origins instead of 27 (measured: the ungrouped head carried 27
+/// distinct domains in its first 256 rows, and the drain held 17 sockets against a 256 bound).
+const REFILL_SQL_UNGROUPED: &str = "
+    SELECT url, domain_id FROM frontier_entry
+     WHERE status = 'READY'
+        OR (status = 'NEW' AND earliest_fetch_at <= ?1)
+     ORDER BY CASE status WHEN 'READY' THEN 0 ELSE 1 END,
+              priority ASC, earliest_fetch_at ASC, resource_id ASC
+     LIMIT ?2";
+
 /// Lease the rows a refill hands out: `READY`/`NEW` -> `FETCHING` with an expiry.
 ///
 /// Without this the refill returns the same head of the table on every call — the rows are still
@@ -181,6 +193,13 @@ pub fn lease_dispatchable(
         return Ok(urls);
     }
 
+    // One transaction for the whole lease. Without it each chunk was its own commit, i.e. one
+    // fsync per 400 URLs: a refill of 8,192 rows became ~21 commits, blocked the drain behind the
+    // single metadata writer, and throughput collapsed to under one attempt per second (measured
+    // 2026-11-02).
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(search_metadata::db_err)?;
     // Chunked so the statement stays far below SQLite's variable limit.
     for chunk in urls.chunks(400) {
         let placeholders = vec!["?"; chunk.len()].join(",");
@@ -193,9 +212,10 @@ pub fn lease_dispatchable(
         for u in chunk {
             params.push(u);
         }
-        conn.execute(&sql, params.as_slice())
+        tx.execute(&sql, params.as_slice())
             .map_err(search_metadata::db_err)?;
     }
+    tx.commit().map_err(search_metadata::db_err)?;
     Ok(urls)
 }
 

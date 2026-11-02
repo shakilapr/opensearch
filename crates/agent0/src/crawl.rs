@@ -173,6 +173,9 @@ const MAX_RATE_LIMIT_BACKOFF_MS: u64 = 300_000;
 /// a bounded loss of that host's URLs.
 const RATE_LIMIT_RETIRE_AFTER: u32 = 8;
 
+/// Completed URLs buffered before one transaction marks them DONE/FAILED in the frontier.
+const COMPLETION_FLUSH: usize = 256;
+
 /// Discovery fan-out bounds (mirror the pipeline's own limits).
 const MAX_SITEMAPS: usize = 8;
 const MAX_CHILD_SITEMAPS: usize = 16;
@@ -785,6 +788,7 @@ pub async fn crawl(opts: CrawlOptions, cfg: &Config) -> AppResult<CrawlSummary> 
     // thousands of URLs still pending, and clearing the file would make the next run
     // rediscover them from scratch. A run that genuinely emptied its queue writes []
     // because `remaining` is empty.
+    drain.flush_completions();
     drain.final_persist();
 
     Ok(drain.summary(resumed_from, started.elapsed(), stopped_for_disk, refilled))
@@ -863,6 +867,8 @@ struct Drainer {
     backoff_until: HashMap<String, Instant>,
     /// Origins that answered 429 too many times in a row and are no longer asked this run.
     rate_limit_retired: std::collections::HashSet<String>,
+    /// `(url, terminal status)` waiting to be written to `frontier_entry` in one transaction.
+    completed: Vec<(String, &'static str)>,
     /// Consecutive 429s per origin, driving the exponential backoff. Cleared by
     /// any healthy (`ingested`/`unchanged`) response from that origin.
     backoff_level: HashMap<String, u32>,
@@ -920,6 +926,7 @@ impl Drainer {
             origin_attempts: HashMap::new(),
             backoff_until: HashMap::new(),
             rate_limit_retired: std::collections::HashSet::new(),
+            completed: Vec::new(),
             backoff_level: HashMap::new(),
             attempts: 0,
             ingested: 0,
@@ -1117,6 +1124,43 @@ impl Drainer {
     /// dispatch as many new ones as the concurrency + per-origin politeness
     /// allow. Returns how many completions were handled. Never awaits, so a
     /// caller driving discovery and draining together can interleave the two.
+    /// Mark buffered URLs terminal in one transaction.
+    ///
+    /// A per-document UPDATE commits and fsyncs once per page; at a few hundred pages per second
+    /// that alone is the ceiling. One commit per 256 completions keeps the frontier truthful
+    /// without paying that.
+    fn flush_completions(&mut self) {
+        if self.completed.is_empty() {
+            return;
+        }
+        let done: Vec<(String, &'static str)> = std::mem::take(&mut self.completed);
+        let _ = self.pipeline.with_meta_conn(|conn| {
+            let tx = conn.unchecked_transaction().map_err(search_metadata::db_err)?;
+            let mut by_status: std::collections::HashMap<&'static str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (url, status) in &done {
+                by_status.entry(*status).or_default().push(url.as_str());
+            }
+            for (status, urls) in by_status {
+                for chunk in urls.chunks(400) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!(
+                        "UPDATE frontier_entry SET status = ?1, lease_until = NULL
+                          WHERE url IN ({placeholders}) AND status IN ('FETCHING','READY','NEW')"
+                    );
+                    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+                    params.push(&status);
+                    for u in chunk {
+                        params.push(u);
+                    }
+                    tx.execute(&sql, params.as_slice()).map_err(search_metadata::db_err)?;
+                }
+            }
+            tx.commit().map_err(search_metadata::db_err)?;
+            Ok(())
+        });
+    }
+
     fn pump(&mut self, joinset: &mut JoinSet<PerUrl>) -> usize {
         let mut handled = 0;
         while let Some(res) = joinset.try_join_next() {
@@ -1290,16 +1334,13 @@ impl Drainer {
             "ingested" | "unchanged" => "DONE",
             _ => "FAILED",
         };
-        let done_url = per.url.clone();
-        let _ = self.pipeline.with_meta_conn(|conn| {
-            conn.execute(
-                "UPDATE frontier_entry SET status = ?1, lease_until = NULL
-                  WHERE url = ?2 AND status = 'FETCHING'",
-                rusqlite::params![frontier_status, done_url],
-            )
-            .map_err(search_metadata::db_err)?;
-            Ok(())
-        });
+        // Buffer, do not write per document: one SQLite commit for every completed URL pins the
+        // drain to the metadata writer's fsync rate. Flushed every COMPLETION_FLUSH docs and at
+        // the end of the run (see `flush_completions`).
+        self.completed.push((per.url.clone(), frontier_status));
+        if self.completed.len() >= COMPLETION_FLUSH {
+            self.flush_completions();
+        }
 
         match per.outcome {
             "ingested" => {
@@ -1349,6 +1390,21 @@ impl Drainer {
                     level = *level,
                     "HTTP 429 repeatedly: retiring this origin for the rest of the run"
                 );
+                // Retire the host's *rows*, not just its in-memory queue. Leaving them READY means
+                // every later refill hands them straight back, the drain refuses them, and the
+                // slots are spent on a host that will never answer. Measured 2026-11-02: refills
+                // were 69% already-attempted URLs, and one shard burned 760 attempts for 57
+                // documents while the others starved.
+                let retired_origin = per.origin.clone();
+                let _ = self.pipeline.with_meta_conn(|conn| {
+                    conn.execute(
+                        "UPDATE frontier_entry SET status = 'FAILED', lease_until = NULL
+                          WHERE domain_id = ?1 AND status IN ('READY','NEW','FETCHING')",
+                        rusqlite::params![retired_origin],
+                    )
+                    .map_err(search_metadata::db_err)?;
+                    Ok(())
+                });
             }
             tracing::warn!(
                 target: "agent0::crawl",
