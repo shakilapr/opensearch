@@ -122,6 +122,7 @@ struct Report {
     missing_text: usize,
     empty_text: usize,
     elapsed_ms: u64,
+    generation: Option<u64>,
 }
 
 /// Build the index for one data root.
@@ -139,6 +140,7 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
         missing_text: 0,
         empty_text: 0,
         elapsed_ms: 0,
+        generation: None,
     };
     let mut batch_docs: Vec<IndexDoc> = Vec::with_capacity(batch);
     // Page size is independent of the index batch: the page bounds peak memory (one text at a
@@ -172,7 +174,13 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
                 continue;
             }
             batch_docs.push(IndexDoc {
-                doc_id: p.doc_id,
+                // The index's delete term is the RESOURCE id, matching `build_index_doc` in the
+                // crawl path: one live document per resource, versioned. Using `docver_id` here
+                // (the rebuild's natural cursor) put `res_x:1` in the index while the crawler used
+                // `res_x`, so a rebuilt corpus answered with ids no graded label matched and
+                // `/read` had never seen. `document_derived` stays keyed by docver_id; only the
+                // index identity is the resource.
+                doc_id: p.resource_id.clone(),
                 version: 1,
                 resource_id: p.resource_id,
                 work_id: None,
@@ -216,8 +224,19 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
             break;
         }
     }
-    // Publish: every buffered document becomes visible under one manifest.
+    // Publish explicitly: this pass writes every document through `index_batch`, not through the
+    // overlay buffer, so `flush_overlay_batch` would see nothing to do and leave the index with no
+    // visible manifest (generation 0, which the API reports as unpublished).
     pipeline.flush_overlay_batch()?;
+    if report.indexed > 0 {
+        let manifest = pipeline.publish_index()?;
+        tracing::info!(
+            generation = manifest.generation,
+            doc_count = manifest.doc_count,
+            "index build: published"
+        );
+        report.generation = Some(manifest.generation);
+    }
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
 }
@@ -252,16 +271,66 @@ pub async fn run(args: &[String]) -> ExitCode {
         match build_root(&cfg, batch, limit).await {
             Ok(r) => {
                 println!(
-                    "  indexed {} document(s) in {:.1}s ({} missing text, {} empty)",
+                    "  indexed {} document(s) in {:.1}s ({} missing text, {} empty), generation {}",
                     r.indexed,
                     r.elapsed_ms as f64 / 1000.0,
                     r.missing_text,
-                    r.empty_text
+                    r.empty_text,
+                    r.generation
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "unchanged".to_string())
                 );
             }
             Err(e) => {
                 failed = true;
                 eprintln!("  error: {e}");
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `agent0 index publish [--dir PATH]...` — make a written index visible.
+///
+/// For an index that has documents but no manifest: a rebuild from an empty directory, or a restore
+/// from a copy whose manifest was not carried over. The documents are already committed; this only
+/// allocates a generation and writes `_manifest.json`.
+pub fn run_publish(args: &[String]) -> ExitCode {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => match args.get(i + 1) {
+                Some(v) => {
+                    dirs.push(PathBuf::from(v));
+                    i += 2;
+                }
+                None => return usage("--dir needs a path"),
+            },
+            _ => i += 1,
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(Config::from_env().data_dir);
+    }
+    let mut failed = false;
+    for dir in &dirs {
+        let mut cfg = Config::from_env();
+        cfg.data_dir = dir.clone();
+        match Pipeline::open(&cfg).and_then(|p| p.publish_index()) {
+            Ok(m) => println!(
+                "{}: published generation {} with {} document(s)",
+                dir.display(),
+                m.generation,
+                m.doc_count
+            ),
+            Err(e) => {
+                failed = true;
+                eprintln!("{}: {e}", dir.display());
             }
         }
     }

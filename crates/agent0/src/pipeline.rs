@@ -734,6 +734,20 @@ impl Pipeline {
     /// next allocation is `MAX(generation) + 1` over **all** rows, published or not, so documents
     /// written for an abandoned attempt stay above the watermark and invisible forever instead of
     /// being swept in by the next publish.
+    /// Publish the current index state as a new visible generation.
+    ///
+    /// Needed by writers that add documents without going through the overlay batch buffer:
+    /// `agent0 index build` indexes every document directly, so its final `flush_overlay_batch()`
+    /// found an empty buffer and published nothing. The rebuilt index then reported generation 0 —
+    /// the API marks that `index_unpublished` and clients see a corpus that exists but claims not
+    /// to. A publish is meta-only (the documents are already committed), so it is cheap.
+    pub fn publish_index(&self) -> AppResult<search_core::IndexManifest> {
+        let generation = self.reserve_generation()?;
+        let manifest = self.indexer.publish_manifest_at(generation)?;
+        self.finalize_generation(&manifest)?;
+        Ok(manifest)
+    }
+
     fn reserve_generation(&self) -> AppResult<u64> {
         let mut w = self.meta.lock().unwrap();
         let generation: u64 = w
