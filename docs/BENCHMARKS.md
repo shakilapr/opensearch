@@ -164,3 +164,10 @@ Vectors: 2.14 GB (1,387,584 documents). Feature postings: 180 MB.
   like with like.
 * Rounded numbers in prose are not re-rounded here: if a table says 1,710 MB it is the sum of the
   per-root measurements in §5.
+* **A result of exactly 0.0 on a corpus that answers queries by hand is a wiring bug, not a model
+  result.** One run recorded nDCG 0.0 on all 600 cases because the index had been rebuilt with
+  `docver_id` as `doc_id` while the labels are `resource_id`. It is kept in `ops/rejected/` with a
+  note; rejected measurements stay visible so nobody re-derives them, and they are never cited.
+* Two runs from the same batch failed to start (`env: unrecognized option '--lanes'` — options for
+  the target command were passed before `env`'s own assignments). A benchmark job that printed no
+  metrics file did not run; check for the file before believing the log's last line.
