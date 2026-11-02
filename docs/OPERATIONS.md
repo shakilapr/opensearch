@@ -379,3 +379,24 @@ outlives whatever started it.
 Supervision must be liveness-based, not presence-based: check ingest per 10 minutes and the index
 `generation`, not the process count. A crawler can be alive, busy, and publishing nothing (see the
 lock-zombie and rate-limit-starvation cases in the crawl notes).
+
+## A watchdog, because presence is not liveness
+
+`fleet-watch.service` (installed with `systemd-run --unit=fleet-watch --collect
+--property=Restart=always /bin/bash scripts/watch-fleet.sh`) checks every five minutes that each
+shard's crawler is both present **and** writing: a process with no log line for 15 minutes is
+restarted, a missing process is started. It never restarts a shard whose log is moving.
+
+Both failure modes it covers happened on 2026-11-02: four crawlers started as `nohup` children died
+with the cgroup of the rebuild that started them, and later two more were killed while their logs had
+already been silent for over an hour — a process count of 4, and zero documents. Log it as
+`/var/lib/search-fleet/fleet-watch.log`.
+
+Check what actually happened, not what you started:
+
+```bash
+systemctl is-active crawler-shard-{0..3} fleet-watch
+for i in 0 1 2 3; do stat -c 'shard-'$i' %y' /var/lib/search-fleet/shard-$i.log; done
+```
+
+A log whose mtime is older than a few minutes is a dead or hung crawler regardless of its PID.
