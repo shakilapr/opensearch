@@ -51,8 +51,22 @@ refresh_root() {
       log "$name: no checkpoint; skipping incremental (run with --full once)"
       return 0
     fi
-    SEARCH_DATA_DIR="$root" "$BIN" concepts build --dir "$root" --since "$((ckpt - OVERLAP))" >>"$LOG" 2>&1 \
-      || { log "$name: incremental build FAILED"; return 1; }
+    # Retry on lock contention: the crawler holds the SQLite writer, and a batch pass that gives up
+    # on the first "database is locked" leaves the matrix permanently behind (measured 2026-11-02:
+    # shard-1 accumulated 16,141 untagged documents from one failed pass). Small batches plus
+    # backoff get through without pausing the crawl.
+    local attempt=1 ok=0
+    while [ "$attempt" -le 4 ]; do
+      if SEARCH_DATA_DIR="$root" "$BIN" concepts build --dir "$root" --since "$((ckpt - OVERLAP))" --batch 500 >>"$LOG" 2>&1; then
+        ok=1; break
+      fi
+      log "$name: build attempt $attempt hit contention; retrying in 60s"
+      attempt=$((attempt + 1)); sleep 60
+    done
+    if [ "$ok" -ne 1 ]; then
+      log "$name: incremental build FAILED after 4 attempts (crawler holds the writer)"
+      return 1
+    fi
     date +%s > "$ckpt_file"
   fi
   SEARCH_DATA_DIR="$root" "$BIN" concepts relate --dir "$root" >>"$LOG" 2>&1 \
