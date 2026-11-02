@@ -1,5 +1,5 @@
 //! PolicyTrace (plan Stage 8): structured per-query phase events for evaluation + distillation.
-//! Interfaces frozen in `docs/STAGE8_SPEC.md`.
+//! Interfaces frozen in `docs/specs/STAGE8_SPEC.md`.
 //!
 //! A [`PolicyTrace`] wraps a [`TraceSink`] and emits one [`TraceEvent`] per pipeline phase. The
 //! [`JsonlTraceSink`] appends events as newline-delimited JSON; [`read_trace`] reads them back

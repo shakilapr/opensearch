@@ -3,7 +3,7 @@
 //! Turns sitemaps, sitemap indexes, and feeds into discovered-resource records so the
 //! crawler learns about URLs without fetching every page. Pure parsing: no I/O.
 //!
-//! Interfaces are frozen in `docs/STAGE1_SPEC.md`. Module layout is up to the owner.
+//! Interfaces are frozen in `docs/specs/STAGE1_SPEC.md`. Module layout is up to the owner.
 
 #![forbid(unsafe_code)]
 

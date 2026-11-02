@@ -1,6 +1,6 @@
 //! §16 Evidence scoring. OWNER: engine-rank agent.
 //!
-//! Frozen contract: `docs/ENGINE_SPEC.md` §16 and `engine/engine-architecture.md` §16.
+//! Frozen contract: `docs/specs/ENGINE_SPEC.md` §16 and `engine/engine-architecture.md` §16.
 
 use crate::units::QueryUnit;
 use std::collections::{BTreeMap, BTreeSet};

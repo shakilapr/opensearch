@@ -14,14 +14,14 @@
 //!   plus a counting LLM-tier *probe* that is only consulted when every cheaper
 //!   tier abstained. A simple query never reaches it (see the fast-path test),
 //!   so the model-call count stays **0** whenever rules/policy suffice
-//!   (`docs/STAGE4_SPEC.md` exit gate).
+//!   (`docs/specs/STAGE4_SPEC.md` exit gate).
 //! * [`plan_budget`] gives a simple (short, single-entity) query a tight budget
 //!   so it stays entirely in the fast path; a complex/multi-hop query scales
 //!   with `max_hops` and may loop more.
 //!
 //! ## Trace emission (`PolicyTrace`)
 //!
-//! `docs/STAGE8_SPEC.md` freezes `search_trace::{Phase, TraceEvent, PolicyTrace}`.
+//! `docs/specs/STAGE8_SPEC.md` freezes `search_trace::{Phase, TraceEvent, PolicyTrace}`.
 //! Emission goes through the small trait [`PhaseEmitter`]; the event type
 //! [`PhaseEvent`] **is** `search_trace::TraceEvent` (a type alias) and
 //! [`Phase`] **is** `search_trace::Phase` (re-exported), so a configured
@@ -52,7 +52,7 @@ use crate::pipeline::Pipeline;
 // ---------------------------------------------------------------------------
 
 /// Phase of one navigation request. Re-exported from `search_trace` so the
-/// pipeline emits the frozen wire type directly (`docs/STAGE8_SPEC.md`).
+/// pipeline emits the frozen wire type directly (`docs/specs/STAGE8_SPEC.md`).
 pub use search_trace::{Phase, TraceEvent};
 
 /// One structured phase event — this **is** `search_trace::TraceEvent`, the
@@ -318,7 +318,7 @@ impl SearchPolicy for CountingProbe {
 }
 
 // ---------------------------------------------------------------------------
-// Public result shapes (mirror docs/STAGE7_SPEC.md)
+// Public result shapes (mirror docs/specs/STAGE7_SPEC.md)
 // ---------------------------------------------------------------------------
 
 /// The result of a `deep_search`: the hits plus the navigation trace strings.
@@ -328,7 +328,7 @@ pub struct DeepResult {
     pub trace: Vec<String>,
 }
 
-/// One deep-search hit (mirrors the `docs/STAGE7_SPEC.md` wire shape
+/// One deep-search hit (mirrors the `docs/specs/STAGE7_SPEC.md` wire shape
 /// `{doc_id,url,title,snippet,provenance}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepHit {

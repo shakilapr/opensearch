@@ -3,7 +3,7 @@
 //! Implements the conservative planning rules from
 //! `engine/engine-architecture.md` §8 ("Query planning and resource allocation") and the
 //! per-mode ceilings from §17 ("Budgets, deadlines, and stopping"). Frozen contract:
-//! `docs/ENGINE_SPEC.md` §8.
+//! `docs/specs/ENGINE_SPEC.md` §8.
 //!
 //! Key §8 quotes this module encodes:
 //! > Avoid universal fan-out: an exact error-code query may need lexical retrieval and a

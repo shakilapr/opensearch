@@ -1,6 +1,6 @@
 //! The concept lane: retrieval through the weighted document↔concept matrix.
 //!
-//! This is the lane `docs/SEMANTIC_INDEX_ARCHITECTURE.md` specifies and the schema has held since
+//! This is the lane `docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` specifies and the schema has held since
 //! migration 0005, but which nothing consumed: `doc_concept` stores `(resource_id, concept_id,
 //! weight, relation_kind)` and the crawl fills nothing. A query is resolved to concepts, the
 //! matrix is read concept → documents, and the weights become the lane's scores.

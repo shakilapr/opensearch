@@ -1,6 +1,6 @@
 //! The sparse encoder: v2 §5.2 `z = TopK(ReLU(Wx + b))`.
 //!
-//! This is Model B of `docs/architecture-update-v2.md`. It maps a 384-dimensional teacher
+//! This is Model B of `docs/legacy/architecture-update-v2.md`. It maps a 384-dimensional teacher
 //! embedding onto a small vocabulary of *learned* features of which at most `active` fire for any
 //! document. Two properties make it useful for retrieval rather than merely compact:
 //!

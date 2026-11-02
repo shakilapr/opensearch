@@ -1,7 +1,7 @@
 # Stage status — what is done and what is left, per stage
 
-This answers one question precisely: **for each stage in `work-plan.md` §3, what remains?**
-`docs/ROADMAP.md` maps the plan to crates; this file is the item-level audit and is meant to be
+This answers one question precisely: **for each stage in `docs/legacy/work-plan.md` §3, what remains?**
+`docs/specs/ROADMAP.md` maps the plan to crates; this file is the item-level audit and is meant to be
 edited as items close. Nothing here is aspirational: every "left" item names what it needs
 (code, data, a decision, or scale) and where the evidence lives.
 
@@ -25,7 +25,7 @@ multi-week architecture work, gated by the plan on proven quality.
 - **Left:**
   1. **Source breadth — data.** 222 hosts in the serving index (3 948 across the fleet build)
     against a target of "hundreds–thousands"; the fleet is **not yet merged** into the serving
-    index (see `docs/ROADMAP.md` gap 1). The seeds file holds ~235 distinct roots ordered
+    index (see `docs/specs/ROADMAP.md` gap 1). The seeds file holds ~235 distinct roots ordered
     breadth-first, the crawl caps attempts per origin (`--origin-cap` / `ORIGIN_CAP`), and the
     crawler runs *beside* the server, so the corpus can grow without taking the API down. It
     needs hours of crawl time.
@@ -88,7 +88,7 @@ multi-week architecture work, gated by the plan on proven quality.
      documents (`crates/ann` exists for that), and the fixture benchmark has not been re-run to
      state a serving-quality delta.
   3. **Real sparse weights and a trained cross-encoder — decision taken: ship the documented
-     proxies.** They stay proxies, labelled as such in `docs/ROADMAP.md` gaps 5–6.
+     proxies.** They stay proxies, labelled as such in `docs/specs/ROADMAP.md` gaps 5–6.
   4. **Ablations measured on the real corpus — code.** Ablations exist, but only on the fixture.
 
 ## Stage 3 — Live freshness loop
@@ -117,7 +117,7 @@ multi-week architecture work, gated by the plan on proven quality.
   which the engine now actually *searches*: the §8 query variants `build_plan` always produced
   were previously computed and discarded, and are now launched in round 1 and fused per family
   under the §10 cap. Each probe is still rejected by `variant_preserves_constraints` if it drops a
-  constraint. See `docs/PLANNER.md`. *Remaining:* no live measurement of planner-on vs planner-off
+  constraint. See `docs/specs/PLANNER.md`. *Remaining:* no live measurement of planner-on vs planner-off
   quality (needs a key and the eval harness).
 - **Left:**
   1. **Real provider transports for the *action frontier* — code.** `ProviderPolicy` talks to a
@@ -152,7 +152,7 @@ multi-week architecture work, gated by the plan on proven quality.
 
 ## Stage 7 — Service surfaces & deployment
 - **Done:** MCP server with `search` / `deep_search` / `fetch_doc` over an `HttpBackend`;
-  `docs/MCP.md`; `deploy/` units + nginx; `dist/` build/publish/backup scripts.
+  `docs/specs/MCP.md`; `deploy/` units + nginx; `dist/` build/publish/backup scripts.
 - **Left:**
   1. **MCP needs a running API — by design, documented.** An embedded in-process backend does not
      exist.
@@ -171,7 +171,7 @@ multi-week architecture work, gated by the plan on proven quality.
 ## Stage 9 — Optional advanced retrieval & policy distillation
 - **Done:** int8 quantization + IVF/HNSW-lite (`crates/ann`), `SparseExpander` (fixture-backed),
   `LinearPolicy` (`crates/distill`) — all deterministic and fixture-trained.
-- **Left:** trained-by-real-data versions of all three; `docs/ROADMAP.md` gaps 4–6 record that the
+- **Left:** trained-by-real-data versions of all three; `docs/specs/ROADMAP.md` gaps 4–6 record that the
   shipped models are proxies.
 
 ## Stage 10 — Distribution & operations
@@ -191,8 +191,8 @@ true}` returning coverage 1.0 with a cited answer, no SQLite lock errors (WAL).
 
 ## v2 retrieval architecture — where it stands (2026-11-01)
 
-The v2 plan (`docs/PLAN-v2.md`, `docs/architecture-update-v2.md`) is tracked in
-`docs/EXECUTION-STATUS-v2.md` with measured numbers. In one paragraph: the concept layer (A), the
+The v2 plan (`docs/PLAN.md`, `docs/legacy/architecture-update-v2.md`) is tracked in
+`docs/STATUS.md` with measured numbers. In one paragraph: the concept layer (A), the
 dense fleet vectors (B) and the learned sparse-feature index (D) are built and serving-reachable;
 routing and stage-3 rerank (E) are implemented behind `SEARCH_ROUTE` / `SEARCH_RERANK` and off by
 default; the storage rebuild (C) is the one phase still pending, and it must run after B and D so
@@ -208,6 +208,6 @@ documents, 16.0 postings each, 22.2M `doc_feature` rows, 87.6–100% resource co
 
 ## Where to go next (2026-11-01)
 
-The architecture is specified in `docs/ARCHITECTURE-v2.md` (normative), the index model is IM-3
+The architecture is specified in `docs/ARCHITECTURE.md` (normative), the index model is IM-3
 (excerpt-only, 1,710 MB for 1.56M documents), and the remaining work is itemised with gates in
-`docs/WORK-QUEUE-v2.md`. This stage-status file records what was built; it is not a backlog.
+`docs/WORK-QUEUE.md`. This stage-status file records what was built; it is not a backlog.

@@ -46,7 +46,7 @@ found) / `-32602` (invalid params).
 - `deploy/search-api.service` — systemd unit for the HTTP API.
 - `deploy/nginx.conf` — reverse proxy to `127.0.0.1:8080` with sane timeouts + gzip.
 - `deploy/README.md` — install/run steps.
-- `docs/MCP.md` — how to register the MCP server with a client (command + args), tool list,
+- `docs/specs/MCP.md` — how to register the MCP server with a client (command + args), tool list,
   and example JSON-RPC exchange.
 - `ui/README.md` — add the `VITE_API_BASE` / build-and-serve note if not already covered.
 

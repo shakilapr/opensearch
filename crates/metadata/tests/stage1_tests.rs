@@ -1,5 +1,5 @@
 //! Stage-1 acceptance tests for the metadata additions (spec:
-//! `docs/STAGE1_SPEC.md` §"Metadata additions (Stage 1)", migration 0003).
+//! `docs/specs/STAGE1_SPEC.md` §"Metadata additions (Stage 1)", migration 0003).
 //!
 //! Covers the new tables/repositories, the `resource` freshness columns, the
 //! new `Mutation` variants (all writes through the single-writer API), and the

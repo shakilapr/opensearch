@@ -155,7 +155,7 @@ impl IndexDoc {
 
 /// Number of characters of the document the index keeps as lexical evidence.
 ///
-/// 500 is the figure `index-upgrade-plan.md` costed the target model at. It is enough for BM25 to
+/// 500 is the figure `docs/legacy/index-upgrade-plan.md` costed the target model at. It is enough for BM25 to
 /// see body prose and for a snippet to be a real fragment; it is ~5% of the measured average body
 /// (10.6 KB), which is the point.
 pub const EXCERPT_CHARS: usize = 500;

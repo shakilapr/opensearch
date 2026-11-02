@@ -1,14 +1,14 @@
 # v2 work queue — delegable tasks
 
-> The ordered *status* list is `docs/LEFT-TO-DO.md`; this file is the task detail (steps, pitfalls,
+> The ordered *status* list is `docs/STATUS.md`; this file is the task detail (steps, pitfalls,
 > gates) for the same work. Start there, pick the top unblocked item, take its detail here.
 
 For coding agents (opencode, Claude Code, Codex) working unattended. Each task is **self-contained**,
-sized to hours not minutes, and ends in a measurement. Read `docs/ARCHITECTURE-v2.md` first: it is
+sized to hours not minutes, and ends in a measurement. Read `docs/ARCHITECTURE.md` first: it is
 the normative design, and a change that contradicts a named section is not an implementation.
 
 A task is done when: code merged, tests pass, **its gate measured and written into
-`docs/EXECUTION-STATUS-v2.md`**, and committed. A task whose gate cannot be measured is not done —
+`docs/STATUS.md`**, and committed. A task whose gate cannot be measured is not done —
 say so instead of reporting success.
 
 ---
@@ -51,7 +51,7 @@ One task per agent, one task per branch/worktree, never two agents on one data r
 ```bash
 git worktree add ../wt-A2 -b task/A2-index-audit main
 cd ../wt-A2 && opencode run --model <model> \
-  "$(sed -n '/^### A2 /,/^### A3 /p' docs/WORK-QUEUE-v2.md)"
+  "$(sed -n '/^### A2 /,/^### A3 /p' docs/WORK-QUEUE.md)"
 ```
 
 Data roots: `/var/lib/search` (primary, 19K docs) and `/var/lib/search-fleet/shard-{0..3}`

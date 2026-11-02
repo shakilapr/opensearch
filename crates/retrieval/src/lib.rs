@@ -2,7 +2,7 @@
 //!
 //! Source-first retrieval: run BM25 scoped to each source whose profile matches the query,
 //! then merge global BM25 and source-scoped candidates. RRF fusion and reranking arrive in
-//! Stage 2. Interfaces frozen in `docs/STAGE1_SPEC.md`.
+//! Stage 2. Interfaces frozen in `docs/specs/STAGE1_SPEC.md`.
 //!
 //! Everything here is synchronous: the index backend ([`search_indexer`]) is a synchronous
 //! Tantivy wrapper, so the [`LaneSearcher`] boundary is sync too. A test/agent backend that
@@ -46,7 +46,7 @@ pub enum Lane {
     /// query names (plan §9.4). Its hits are what the API reports as `graph_expansion`.
     Graph,
     /// Concept lane: candidates reached through the weighted document↔concept matrix
-    /// (`doc_concept`). This is the lane `docs/SEMANTIC_INDEX_ARCHITECTURE.md` specifies — a
+    /// (`doc_concept`). This is the lane `docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` specifies — a
     /// query resolves to concepts, the matrix resolves concepts to document ids, and the weights
     /// become the score.
     Concept,

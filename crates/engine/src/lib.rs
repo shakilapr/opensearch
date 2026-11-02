@@ -1,7 +1,7 @@
 //! search-engine — the query-time algorithmic core.
 //!
 //! Implements the algorithm half of `engine/engine-architecture.md` (§6–§18) above the
-//! crawl/index spine. Frozen contract: `docs/ENGINE_SPEC.md`.
+//! crawl/index spine. Frozen contract: `docs/specs/ENGINE_SPEC.md`.
 //!
 //! Determinism rules (see the spec): no network, no clock reads (time is `now: i64`), no
 //! `unwrap`/`panic!`/`todo!` on request paths, and every loop statically bounded.

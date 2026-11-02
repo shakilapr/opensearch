@@ -2,7 +2,7 @@
 //!
 //! Captures what we know about a source: topics, entities, URL patterns, authority, observed
 //! change rate, JS probability, and fetch statistics. Pure types + logic; persistence lives
-//! in `search-metadata`. Interfaces frozen in `docs/STAGE1_SPEC.md`.
+//! in `search-metadata`. Interfaces frozen in `docs/specs/STAGE1_SPEC.md`.
 //!
 //! ## Interface note: `observe_fetch` signature
 //!

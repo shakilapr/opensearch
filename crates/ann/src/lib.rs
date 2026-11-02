@@ -1,5 +1,5 @@
 //! ANN indexes (plan Stage 9): int8 quantization, IVF, HNSW-lite.
-//! Honest-limit rules are in `docs/STAGE9_SPEC.md`.
+//! Honest-limit rules are in `docs/specs/STAGE9_SPEC.md`.
 //!
 //! Everything here is **deterministic**: k-means uses a fixed-seed k-means++ init, all tie
 //! breaks are insertion-order stable, and no `HashMap` iteration order is ever observed.

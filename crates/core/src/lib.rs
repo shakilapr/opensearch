@@ -2,7 +2,7 @@
 //!
 //! Contains the five semantic IDs, operational record types, resource/safety
 //! limits, error taxonomy, the IndexManifest, and time helpers. Nothing here
-//! performs I/O. See `docs/STAGE0_SPEC.md` for the authoritative definition.
+//! performs I/O. See `docs/specs/STAGE0_SPEC.md` for the authoritative definition.
 
 pub mod config;
 pub mod contract;

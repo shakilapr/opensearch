@@ -1,8 +1,8 @@
 # Plan v2 — from the current engine to a neural associative index
 
-This is the consolidated plan. It supersedes the sequencing in `index-upgrade-plan.md`,
-`semantic-brain-design.md` and `analysis-next-move.md`; those remain as the reasoning behind the
-decisions. `docs/architecture-update-v2.md` is the target design; this file is what we do, in what
+This is the consolidated plan. It supersedes the sequencing in `docs/legacy/index-upgrade-plan.md`,
+`docs/legacy/semantic-brain-design.md` and `docs/legacy/analysis-next-move.md`; those remain as the reasoning behind the
+decisions. `docs/legacy/architecture-update-v2.md` is the target design; this file is what we do, in what
 order, with the gates that decide whether a step is kept.
 
 Everything marked **measured** was read from the running system or the repository, not estimated.
@@ -115,7 +115,7 @@ restart — they are still on the previous binary.
 
 ### Phase 2 — Build the derived layer, then delete the source bytes (1 week)
 
-Per `index-upgrade-plan.md`, in this order, because each source can only be deleted after the next
+Per `docs/legacy/index-upgrade-plan.md`, in this order, because each source can only be deleted after the next
 artifact is built from it:
 
 1. `blobs → headings, web_link` (link edges are unrecoverable later);

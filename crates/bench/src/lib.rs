@@ -16,7 +16,7 @@
 //! lane it did not run. `--dim` sets the dimension of the hash embedder only; the reported
 //! `budget.embed_dim` is always the *actual* dimension of the selected embedder.
 //!
-//! Ablations (see `docs/STAGE2_SPEC.md`):
+//! Ablations (see `docs/specs/STAGE2_SPEC.md`):
 //! * `bm25`                          — global lexical BM25 over the Tantivy index.
 //! * `bm25+dense`                    — RRF(bm25, selected-embedder top-k over title+body).
 //! * `bm25+dense+sparse`             — RRF(bm25, dense, source-routed BM25 lane).

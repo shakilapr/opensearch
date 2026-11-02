@@ -1,7 +1,7 @@
 //! Deep-search + document-read request/response shapes and the [`DeepSearcher`]
 //! boundary the HTTP handlers dispatch to.
 //!
-//! Kept in the API crate (mirroring `docs/STAGE7_SPEC.md`'s Hit/DocText and the
+//! Kept in the API crate (mirroring `docs/specs/STAGE7_SPEC.md`'s Hit/DocText and the
 //! Stage-4 `/search_deep` + `/read` endpoints) so the router never depends on
 //! the pipeline or the navigation crate: agent0 implements [`DeepSearcher`] over
 //! its `Pipeline` and injects it into [`crate::AppState`].

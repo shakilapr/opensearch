@@ -1,4 +1,4 @@
-//! Stage-5 acceptance tests for metadata migration 0004 (`docs/STAGE5_SPEC.md`).
+//! Stage-5 acceptance tests for metadata migration 0004 (`docs/specs/STAGE5_SPEC.md`).
 //!
 //! Covers the `resource.storage_tier` column + index, the `Mutation::UpdateStorageTier`
 //! round-trip through the single-writer API, the `resource_tier` reader, and that the migration

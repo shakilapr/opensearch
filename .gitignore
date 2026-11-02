@@ -127,7 +127,7 @@ pnpm-debug.log*
 # Rust
 target/
 target-*/
-Cargo.lock
+# Cargo.lock stays tracked: this is a binary workspace, and a lockfile is the build.
 
 # Python
 __pycache__/

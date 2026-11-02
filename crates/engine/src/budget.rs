@@ -2,7 +2,7 @@
 //!
 //! Implements the per-mode budget ledger, the deadline accounting, and the first-applicable
 //! stopping rule from `engine/engine-architecture.md` §17. Frozen contract:
-//! `docs/ENGINE_SPEC.md` §17.
+//! `docs/specs/ENGINE_SPEC.md` §17.
 //!
 //! §17: "Stop on deadline or budget exhaustion, sufficient supported coverage, no admissible
 //! positive-value action, or explicit cancellation." The ledger is charged before dispatch:

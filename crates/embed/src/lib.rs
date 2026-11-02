@@ -2,7 +2,7 @@
 //!
 //! The default [`HashEmbedder`] is deterministic and dependency-free so the dense path can
 //! be exercised without a model download; the real BGE-small model sits behind
-//! `feature = "bge"`. Interfaces are frozen in `docs/STAGE2_SPEC.md`.
+//! `feature = "bge"`. Interfaces are frozen in `docs/specs/STAGE2_SPEC.md`.
 
 #![forbid(unsafe_code)]
 
@@ -322,7 +322,7 @@ pub mod bge {
     /// Real BGE-small-en-v1.5 embedder.
     ///
     /// Holds one ONNX session behind a `Mutex` because the underlying `embed` takes `&mut self`
-    /// while the [`Embedder`] trait (frozen in `docs/STAGE2_SPEC.md`) is `&self` + `Send + Sync`.
+    /// while the [`Embedder`] trait (frozen in `docs/specs/STAGE2_SPEC.md`) is `&self` + `Send + Sync`.
     /// Inference is CPU-bound; the lock serializes calls rather than corrupting them.
     pub struct BgeEmbedder {
         model: Mutex<TextEmbedding>,

@@ -22,11 +22,11 @@
 //!
 //! Full text remains on disk as `text/<hash>.txt` (the ingest source) and is read on demand by
 //! `Indexer::doc_text` and by batch jobs (`Pipeline::all_docs`). Deleting it is a separate,
-//! gated operation (`docs/PLAN-v2.md` Phase 2) because it cannot be undone.
+//! gated operation (`docs/PLAN.md` Phase 2) because it cannot be undone.
 //!
 //! Consequences to keep in mind: every schema change makes existing indices unopenable (the
 //! `_schema_hash` guard is deliberate), so a schema edit ships **with** a rebuild in one
-//! operation. See `docs/ARCHITECTURE-v2.md` §7.2.
+//! operation. See `docs/ARCHITECTURE.md` §7.2.
 
 use tantivy::schema::*;
 

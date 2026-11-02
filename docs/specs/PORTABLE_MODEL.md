@@ -10,7 +10,7 @@ offline by a cheap model, and queryable by any AI on another machine.
 
 Nothing is distilled and no model weights are produced: the artifact is a **hardcoded database of
 real web pages** plus the structure a cheap LLM gave them. The pack format is the frozen
-Stage-6 format (`docs/STAGE6_SPEC.md`); this work adds the two verbs and the seams they need,
+Stage-6 format (`docs/specs/STAGE6_SPEC.md`); this work adds the two verbs and the seams they need,
 not a new format.
 
 ## Commands

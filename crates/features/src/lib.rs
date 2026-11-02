@@ -1,4 +1,4 @@
-//! v2's sparse neural memory: the learned feature layer of `docs/architecture-update-v2.md` §5.2/§9.
+//! v2's sparse neural memory: the learned feature layer of `docs/legacy/architecture-update-v2.md` §5.2/§9.
 //!
 //! The engine has held a semantic *schema* since migration 0005 and semantic *vectors* since
 //! Phase B, but neither is a retrieval index: `doc_concept` is a hand-tagged matrix and the vector

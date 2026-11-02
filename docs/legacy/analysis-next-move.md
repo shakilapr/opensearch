@@ -1,10 +1,10 @@
-# Analysis of `next-move.md` — checked against the running system
+# Analysis of `docs/legacy/next-move.md` — checked against the running system
 
 **Measured 2026-10-24 on the serving host.** Every number here was read from the running
 service, the four fleet data roots, or the repository — not from the proposal under review.
 Where the proposal and the measurement disagree, the measurement is quoted.
 
-The question this file answers: *is `next-move.md` a sound next move for this system, given what
+The question this file answers: *is `docs/legacy/next-move.md` a sound next move for this system, given what
 the system actually is today?*
 
 ---
@@ -41,7 +41,7 @@ That is not a Phase-1 nicety; it is the current user-facing behaviour.
 
 ## 2. What the proposal gets right — verified
 
-| Claim in `next-move.md` | Check | Result |
+| Claim in `docs/legacy/next-move.md` | Check | Result |
 | --- | --- | --- |
 | Serving index is 3.84% of the fleet; 26× gap | 19,255 vs 501,161 manifest docs | **26.03×, 3.84%** ✓ |
 | Dense and graph lanes contribute nothing to ranking | `FusionPolicy::default()` weights | BM25 1.0, SourceFirst 0.8, dense/graph **absent → 0.0** ✓ |
@@ -282,7 +282,7 @@ and the refusal to start distributed infrastructure.
 
 ## 7. Bottom line
 
-`next-move.md` is a good architectural direction built on a partly wrong model of the current
+`docs/legacy/next-move.md` is a good architectural direction built on a partly wrong model of the current
 system. Its most valuable insight — *the durable asset is knowledge about sources, not copies of
 pages* — is reinforced by the measurements: 284 GB of raw HTML for 6 GB of index, 590K documents
 whose text is already on disk and unreachable, and 9M URLs already discovered.

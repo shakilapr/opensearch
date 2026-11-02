@@ -1,5 +1,5 @@
 //! Dataset builder (plan Stage 6): Common Crawl / Wikidata / OpenAlex / OAI-PMH adapters and
-//! release packs. Interfaces frozen in `docs/STAGE6_SPEC.md`.
+//! release packs. Interfaces frozen in `docs/specs/STAGE6_SPEC.md`.
 //!
 //! Every adapter is **offline-testable**: it reads an injected path/dir (a committed fixture in
 //! tests) and never performs network I/O or reads a credential. Parsing is bounded the same way

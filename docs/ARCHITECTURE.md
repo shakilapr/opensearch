@@ -1,20 +1,21 @@
-# Hexxica v2 — the architecture, complete
+# Hexxica — architecture
 
-**Revision 2.1 — 2026-11-01.** Normative for this repository.
-**Scope:** what the engine is, what it stores, how a query is answered, and which parts are real.
-Every number marked *measured* was read from this host on 2026-11-01; the commands that produce
-them are in §13.
+**Revision 3.0 — 2026-11-02.** The single architecture document for this repository. It describes
+what the code does, not what it once hoped to do: every component below names the crate that
+implements it, and every number is measured on this host.
 
-Reading order for anyone picking this up:
+Reading order:
 
 | Document | Role |
 | --- | --- |
-| **this file** | the design, the data model, the invariants. If code and this file disagree, one of them is wrong and must be fixed |
-| `docs/PLAN-v2.md` | sequencing and gates (what to do next, and what measurement decides it) |
-| `docs/EXECUTION-STATUS-v2.md` | measurements, including the ones that failed |
-| `docs/LEFT-TO-DO.md` | what remains, measured, ordered by dependency — the status list |
-| `docs/WORK-QUEUE-v2.md` | the delegable backlog (hours-sized tasks for coding agents) |
-| `docs/architecture-update-v2.md` | the original target design, kept as rationale; superseded where this file differs |
+| **this file** | design, data model, invariants, code map. If code and this file disagree, one of them is wrong and must be fixed |
+| `docs/PLAN.md` | sequencing and gates (what to do next, and what measurement decides it) |
+| `docs/STATUS.md` | current measurements and what is left |
+| `docs/BENCHMARKS.md` | every number this document quotes, with the command |
+| `docs/CONCEPT-RANKING.md` | ranking on concepts and their relatedness instead of words: analysis, model, measurements |
+| `docs/WORK-QUEUE.md` | delegable, hours-sized tasks |
+| `docs/specs/` | frozen contracts (engine, stages, semantic schema, crawler, MCP, answer, planner) |
+| `docs/legacy/` | superseded designs and snapshots, kept as rationale. **Not normative** |
 
 ---
 
@@ -86,7 +87,7 @@ derived and rebuildable, and is treated as such by every tool here.
 
 L6 is the only layer that can be deleted, and only after L1–L5 are verified: `text/` is what makes
 `/read`, embedding and graph building possible. Deleting it is a one-way operation
-(`docs/PLAN-v2.md` Phase 2) and is **not** part of the current model.
+(`docs/PLAN.md` Phase 2) and is **not** part of the current model.
 
 ---
 
@@ -318,9 +319,29 @@ any lane that ships off.
 | legacy `/search` (lexical, federated) | **35 ms** | **97 ms** |
 | `engine:true` (all lanes, planner, nav) | 620 ms | 2,541 ms |
 
-The target (<50 ms p95, §15) is met on the lexical path with the smaller index; the engine path is
-**not** within budget and is the reason routing exists. `SEARCH_ROUTE=1` removes 3 of 5 lane calls on
+The design target is **<50 ms p95**. The lexical path is 34 ms p50 but **97 ms p95 — the target is
+not met**, and this document previously claimed otherwise; correcting it is part of what the v3
+ranking work has to close. The engine path at 2.5 s p95 is not within any budget and is the reason
+routing exists. `SEARCH_ROUTE=1` removes 3 of 5 lane calls on
 the median query for −0.0007 nDCG, and ships off only because that cost must be chosen.
+
+### 8.3.1 Concept-first ranking (implemented 2026-11-02)
+
+The v2 design treated concepts as one more fusion lane, which makes words decide the order. The
+concept path now has the three things that let concepts decide instead:
+
+1. **Relatedness measured from the corpus.** `agent0 concepts relate` writes `cooccur` edges into
+   `concept_relation` by PMI over the document × concept matrix (`strength = PMI/(1+PMI)`), top-k per
+   concept, purged per rebuild. No external taxonomy: the edges describe how *this* corpus uses
+   concepts.
+2. **Expansion at a discount.** A query resolves to concepts by name/alias/stem, then to their
+   neighbours at λ = 0.4 of edge strength. Direct support still outranks related support.
+3. **Specificity.** Every contribution is multiplied by concept IDF (floored, never deleted), so a
+   concept on a third of the corpus cannot decide an order.
+
+With `SEARCH_FUSION_BM25=0 SEARCH_FUSION_CONCEPT=1 --lanes concept`, the ordering is decided by this
+score alone and no words are consulted at ranking time. `docs/CONCEPT-RANKING.md` states the model,
+the measurements, and the missing pieces (semantic query→concept by centroid; lexicon breadth).
 
 ### 8.4 Budget and degradation
 
@@ -388,12 +409,31 @@ Each is enforced somewhere a future change can be caught.
 | I-4 | Every association names its model; a rebuild purges its own version first | `doc_feature`/`doc_concept` columns; `concepts build --rebuild` |
 | I-5 | Direct and inferred never merge | `doc_concept.relation_kind` in the primary key |
 | I-6 | No byte-offset slicing of text | `excerpt_of`, prefix compares, stemmers (asserted with a CJK/Russian test) |
-| I-7 | The online path calls no LLM, scans no corpus, reads no article, traverses no unbounded graph | engine budgets, `lane_hint`, `doc_by_id` cost rules |
+| I-7 | The online path calls no hosted LLM, scans no corpus, reads no article, traverses no unbounded graph. **Bounded local query encoding is allowed** — resolving an arbitrary query to concepts or a feature vector requires computing something from it, and that is a milliseconds-scale CPU operation, not inference on the corpus | engine budgets, `lane_hint`, `doc_by_id` cost rules, `SEARCH_DENSE_FLEET` guard |
 | I-8 | A weight-0 lane costs nothing | `LaneSearcher::lane_hint` |
 | I-9 | Federation reports a non-zero generation and never overstates freshness | `FederatedSearcher::manifest` |
 | I-10 | A concept covering >20% of the corpus is downweighted, never deleted | ubiquity suppression in `concept_tag` |
 
 ---
+
+## 11.1 Code map — which crate owns what
+
+| Crate | Responsibility |
+| --- | --- |
+| `core` | config, ids, errors, the frozen `SearchResponse` types |
+| `metadata` | SQLite schema, migrations (9), single-writer queue, readers |
+| `indexer` | Tantivy schema (IM-3), indexing, overlay/base, snippets, `doc_text` |
+| `ingest`, `parser`, `pdf`, `organize`, `dedup`, `patterns` | extraction, normalisation, dedup |
+| `fetcher`, `frontier`, `discovery`, `scheduler`, `tiers`, `sources`, `browser` | the crawl: politeness, frontier, sitemaps/feeds, escalation |
+| `embed` | BGE-small embedding and `vectors.bin` (384-d, unit norm) |
+| `features` | TopK sparse encoder, postings, feature lane |
+| `retrieval` | lanes: lexical adapter, dense, concept (+ relatedness/IDF), sparse |
+| `engine` | query units, routing, budgets, fusion (RRF), evidence, rerank hooks |
+| `rerank` | stage-3 feature reranker (off by default) |
+| `api` | HTTP surface, federation, `/read`, `/search` |
+| `agent0` | the binary: `crawl`, `serve`, `index build|publish`, `concepts build|relate`, `features train|build|probe`, `embed build`, `eval run`, `export|import`, `migrate` |
+| `eval`, `bench`, `acceptance` | graded sets, harnesses, acceptance tests |
+| `nav`, `planner`, `answer`, `mcp`, `router`, `distill`, `cache`, `trace`, `graph`, `ann`, `dataset` | optional stages, surfaces and derived layers (several are schema-only — see §12) |
 
 ## 12. Implementation status
 

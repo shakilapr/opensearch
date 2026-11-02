@@ -2,7 +2,7 @@
 //! engine §13).
 //!
 //! In-memory graph of entities, aliases, and typed edges, plus DOI / arXiv / PMID
-//! normalization for WorkId resolution. Interfaces frozen in `docs/STAGE1_SPEC.md`.
+//! normalization for WorkId resolution. Interfaces frozen in `docs/specs/STAGE1_SPEC.md`.
 //!
 //! ## Traversal semantics
 //!
@@ -11,7 +11,7 @@
 //! keeps one code path; directional edge kinds (Cites / AuthoredBy / PublishedBy) are still
 //! distinguishable by [`Edge::kind`] for callers that care.
 //!
-//! Interfaces are frozen in `docs/STAGE1_SPEC.md`. Module layout is up to the owner.
+//! Interfaces are frozen in `docs/specs/STAGE1_SPEC.md`. Module layout is up to the owner.
 
 #![forbid(unsafe_code)]
 

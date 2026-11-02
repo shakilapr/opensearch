@@ -37,7 +37,7 @@ seeds ─▶ discovery (sitemap / RSS / links) ─▶ frontier ─▶ fetcher (H
 ```
 
 Everything is Rust: 36 crates in `crates/` (spine, crawl, retrieval, engine, model-facing, service).
-The engine core (`crates/engine`) is a frozen contract from `docs/ENGINE_SPEC.md`; the API adapts the
+The engine core (`crates/engine`) is a frozen contract from `docs/specs/ENGINE_SPEC.md`; the API adapts the
 index onto it (`crates/api/src/engine.rs`).
 
 Live proof on 2026-10-23:
@@ -237,7 +237,7 @@ run since; the disk is now full, so restarting it is blocked on space (§7).
 
 ## 5. Progress against the plan
 
-Stage status (from `docs/ROADMAP.md` and `docs/STAGE_STATUS.md`, both last edited 2026-10-13…16):
+Stage status (from `docs/specs/ROADMAP.md` and `docs/specs/STAGE_STATUS.md`, both last edited 2026-10-13…16):
 
 | Stage | State |
 | --- | --- |
@@ -271,7 +271,7 @@ What is genuinely new since the earlier reports:
 
 ## 6. Differences from the original architecture
 
-The original design is `docs/AGENT_NATIVE_SEARCH_ENGINE.md` (2,161 lines) for the engine and
+The original design is `docs/specs/AGENT_NATIVE_SEARCH_ENGINE.md` (2,161 lines) for the engine and
 `docs/ARCHITECTURE.md` (2,372 lines) for the universal crawler. These are the places where what
 runs today differs from what those documents describe.
 
@@ -312,10 +312,10 @@ fixture-tested only. No GROBID, no archive/Git/forum adapters, no OCR queue.
 
 ### 6.5 Documentation drift (specific)
 
-- `docs/ANSWER.md` still says the deployment runs **Sonar first and crowbot's deepseek last**. It
+- `docs/specs/ANSWER.md` still says the deployment runs **Sonar first and crowbot's deepseek last**. It
   does not: it runs OpenRouter `nvidia/nemotron-3-ultra-550b-a55b:free` first with **no fallback
   provider configured**.
-- `docs/ANSWER.md` says the key requirement is `CROWBOT_API_KEY`; the code accepts
+- `docs/specs/ANSWER.md` says the key requirement is `CROWBOT_API_KEY`; the code accepts
   `SEARCH_LLM_API_KEY`, `OPENROUTER_API_KEY` or `CROWBOT_API_KEY`.
 - The provider rename (kitani → crowbot → OpenRouter) exists in the working tree as **23
   uncommitted files**; HEAD still names the older providers in places.

@@ -1,5 +1,5 @@
 //! Near-duplicate detection (plan Stage 5): SimHash64, MinHash + LSH banding, shingling.
-//! Interfaces frozen in `docs/STAGE5_SPEC.md`.
+//! Interfaces frozen in `docs/specs/STAGE5_SPEC.md`.
 //!
 //! All hashing here is a fixed, dependency-free FNV-1a/64-bit mixer with constant seeds and
 //! `BTreeMap`/`BTreeSet` containers, so every result is deterministic and stable across runs

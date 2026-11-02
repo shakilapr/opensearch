@@ -36,7 +36,7 @@ projects/search/
 │   ├── indexer/               # Tantivy base + overlay, manifest publish
 │   ├── api/                   # POST /search, GET /health
 │   └── agent0/                # Stage-0 driver binary (crawl + serve)
-├── docs/STAGE0_SPEC.md        # this file
+├── docs/specs/STAGE0_SPEC.md        # this file
 └── data/                      # runtime state, server-only, NOT synced
     ├── meta/                  # SQLite (WAL) + migrations
     ├── tantivy/base/          # immutable-ish base index

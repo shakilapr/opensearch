@@ -277,7 +277,7 @@ fn build_graph_lane(
 
 /// Build the concept lane over the `doc_concept` matrix.
 ///
-/// This is the lane `docs/SEMANTIC_INDEX_ARCHITECTURE.md` describes and `architecture-update-v2.md`
+/// This is the lane `docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` describes and `architecture-update-v2.md`
 /// §6 requires, and until 2026-10-29 it existed but nothing in the serving path referenced it: the
 /// live API answered "chemical reactions that affect romance" with the band My Chemical Romance.
 ///

@@ -1,6 +1,6 @@
 //! `agent0 concepts build` — register the lexicon and fill the concept matrix.
 //!
-//! This is the producer for `doc_concept`, the table `docs/SEMANTIC_INDEX_ARCHITECTURE.md` builds
+//! This is the producer for `doc_concept`, the table `docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` builds
 //! the whole semantic index around. Measured 2026-10-28, it and its four sibling tables held **zero
 //! rows**: the schema, the migrations and their tests all existed, but nothing ever wrote a single
 //! association, so the concept lane had nothing to read and every query fell back to lexical scan.

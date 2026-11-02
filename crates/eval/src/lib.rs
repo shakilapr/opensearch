@@ -2,7 +2,7 @@
 //!
 //! Gives hybrid retrieval a measuring stick — nDCG / MRR / recall over a committed query
 //! set, with the resource budget recorded next to every number. Interfaces are frozen in
-//! `docs/STAGE2_SPEC.md`.
+//! `docs/specs/STAGE2_SPEC.md`.
 
 #![forbid(unsafe_code)]
 
@@ -133,7 +133,7 @@ fn gain_map(graded: &[(String, u8)]) -> HashMap<&str, u8> {
 
 /// Normalized discounted cumulative gain at `k`.
 ///
-/// Convention (frozen; see `docs/STAGE2_SPEC.md` §eval):
+/// Convention (frozen; see `docs/specs/STAGE2_SPEC.md` §eval):
 /// * `gain(doc)` is the doc's graded label when present (`0..3`), used **linearly**; docs
 ///   absent from `graded` have gain `0`. `graded` is deduped by doc id (max wins).
 /// * `DCG = Σ_{i=1..min(k,|ranked|)} gain(ranked[i]) / log2(i+1)`; a repeated doc id in

@@ -5,15 +5,15 @@ construction plan, not a status report. The UI shell (`ui/`) exists and currentl
 against mock/synthesized data. The Rust workspace skeleton now exists and compiles
 (`Cargo.toml`, `crates/core`, `crates/metadata`, typed stubs for
 `ingest`/`frontier`/`fetcher`/`indexer`/`api`/`agent0`); the frozen Stage-0 contract is
-`docs/STAGE0_SPEC.md`. See "Stage-0 review deltas" below for the changes folded in from
+`docs/specs/STAGE0_SPEC.md`. See "Stage-0 review deltas" below for the changes folded in from
 the architecture/consistency review.
 
 Source documents this plan must satisfy (deduped by content):
 
 | Doc | Covers |
 | :--- | :--- |
-| `docs/UNIVERSAL_CRAWLER_ARCHITECTURE.md` (= `crawler/*`, `docs/ARCHITECTURE.md`) | Crawler: 5 IDs, source registry, frontier, per-origin scheduling, robots, fetchers, routing, parsers, adapters, freshness, storage tiers, events, security |
-| `engine/ARCHITECTURE.md` (= `docs/AGENT_NATIVE_SEARCH_ENGINE.md`) | Engine: 3 planes, data model, retrieval lanes, query pipeline, ranking, agent policy, API, evaluation, 13 build stages |
+| `docs/specs/CRAWLER.md` (= `crawler/*`, `docs/ARCHITECTURE.md`) | Crawler: 5 IDs, source registry, frontier, per-origin scheduling, robots, fetchers, routing, parsers, adapters, freshness, storage tiers, events, security |
+| `engine/ARCHITECTURE.md` (= `docs/specs/AGENT_NATIVE_SEARCH_ENGINE.md`) | Engine: 3 planes, data model, retrieval lanes, query pipeline, ranking, agent policy, API, evaluation, 13 build stages |
 | `engine/engine-architecture.md` | Algorithm spec v2: contracts, persistent records, retrieval lanes, RRF, cascade, budgets, coordinator, service boundaries, acceptance tests |
 | `README.md` + `ui/README.md` | Repo topology, 5 IDs summary, modes, deployment, UI contract |
 
@@ -38,7 +38,7 @@ Observed on the target VPS (`85.137.250.157`, 16 vCPU / 64 GB RAM / 665 GB free,
 ## Stage-0 review deltas (folded into this plan)
 
 These were added before Stage 0 because they are painful to retrofit once the crawler is
-producing data. The authoritative, frozen form is `docs/STAGE0_SPEC.md`.
+producing data. The authoritative, frozen form is `docs/specs/STAGE0_SPEC.md`.
 
 1. **Consistency model + append-only ingestion journal.** `crates/ingest` is the sole owner
    of the ingestion consistency boundary. An operational `ingest_op` / `ingest_seq` (NOT a
@@ -134,7 +134,7 @@ projects/search/
 ├── models/             [exists]   # trained/local model artifacts (gitignored)
 ├── raw-dataset/        [exists]   # scraped web data + bulk dumps (gitignored)
 ├── deploy/            # systemd units, nginx, env templates
-└── work-plan.md        # this file
+└── docs/legacy/work-plan.md        # this file
 ```
 
 `raw-dataset/` is the on-disk home for **scraped web data**: raw HTML/PDF/JSON blobs, the

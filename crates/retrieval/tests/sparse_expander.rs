@@ -1,5 +1,5 @@
 //! Stage-9 exit-gate tests for `search-retrieval`'s `SparseExpander` (spec
-//! `docs/STAGE9_SPEC.md`).
+//! `docs/specs/STAGE9_SPEC.md`).
 //!
 //! The expander is built from the committed co-occurrence fixture and must (a) be deterministic
 //! and (b) improve recall on a fixture query versus the unexpanded query.

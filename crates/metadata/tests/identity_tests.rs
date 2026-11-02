@@ -1,5 +1,5 @@
 //! Acceptance tests for metadata migration 0006 — the identity layer
-//! (`docs/SEMANTIC_INDEX_ARCHITECTURE.md` §2–§3).
+//! (`docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` §2–§3).
 //!
 //! The properties pinned here are the ones a later refactor would quietly break:
 //! a website may span several hostnames and a hostname may host several websites;

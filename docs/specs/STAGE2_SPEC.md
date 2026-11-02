@@ -1,6 +1,6 @@
 # Stage 2 Spec — Search quality & benchmarks
 
-Frozen interfaces for Stage 2 (see `docs/STAGE1_SPEC.md` for Stage 1). Stop adding volume;
+Frozen interfaces for Stage 2 (see `docs/specs/STAGE1_SPEC.md` for Stage 1). Stop adding volume;
 build the measuring stick. Stage-1 crates stay as they are.
 
 ## Goal

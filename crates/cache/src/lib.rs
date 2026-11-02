@@ -1,5 +1,5 @@
 //! Caches (plan Stage 8): TTL + LRU with generation-based invalidation.
-//! Interfaces frozen in `docs/STAGE8_SPEC.md`.
+//! Interfaces frozen in `docs/specs/STAGE8_SPEC.md`.
 //!
 //! [`Cache`] stores `V: Clone` values keyed by `String`. Coordination state lives behind a
 //! [`Mutex`] so a `&self` cache is `Send + Sync` and shareable across threads. Two expiry

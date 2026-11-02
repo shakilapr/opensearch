@@ -1,4 +1,4 @@
-//! Stage-5 exit-gate tests for the dedup crate (spec `docs/STAGE5_SPEC.md`).
+//! Stage-5 exit-gate tests for the dedup crate (spec `docs/specs/STAGE5_SPEC.md`).
 //!
 //! A set of >=3 reworded documents must cluster as near-duplicates while a genuinely distinct
 //! document stays out — verified both by SimHash Hamming distance and by MinHash/LSH banding.

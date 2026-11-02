@@ -2,7 +2,7 @@
 //!
 //! `doc_concept` is the table the whole semantic index is built from, and until now nothing wrote
 //! to it: measured 2026-10-28, all five semantic tables held **zero rows** while the architecture
-//! in `docs/SEMANTIC_INDEX_ARCHITECTURE.md` described a weighted concept matrix. This module is the
+//! in `docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md` described a weighted concept matrix. This module is the
 //! producer side.
 //!
 //! **Why not a language model per document.** Tagging 1.17M documents with an LLM is ~1.17M

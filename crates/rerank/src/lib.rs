@@ -3,7 +3,7 @@
 //! Reciprocal Rank Fusion over lanes, a linear feature ranker, a cross-encoder interface (with
 //! a deterministic lexical default), greedy MMR diversification, and entity disambiguation
 //! that keeps competing hypotheses instead of collapsing them early. Interfaces are frozen in
-//! `docs/STAGE2_SPEC.md`.
+//! `docs/specs/STAGE2_SPEC.md`.
 //!
 //! Nothing here downloads a model or touches the network: every default is deterministic and
 //! hermetic so tests are reproducible.

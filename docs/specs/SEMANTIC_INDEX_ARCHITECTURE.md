@@ -271,7 +271,7 @@ Initial experimental envelope: 50K–100K training articles, 1K–5K concepts, 1
 | topic-hub weights (top 6/doc) | ~78 MB |
 
 **Well under 12 GB**, against **297 GB** of raw HTML and extracted text that the index-only model
-deletes (`index-upgrade-plan.md`). The semantic layer is what makes deleting the articles
+deletes (`docs/legacy/index-upgrade-plan.md`). The semantic layer is what makes deleting the articles
 acceptable: it is the part that still knows what the deleted pages were about.
 
 ---
@@ -301,7 +301,7 @@ Explicit acceptance criteria, beyond ids and weights:
 
 ## 9. Implementation order
 
-The consolidated, gated sequence is in **`docs/PLAN-v2.md`**; this section is the semantic-layer
+The consolidated, gated sequence is in **`docs/PLAN.md`**; this section is the semantic-layer
 slice of it. Two things precede all of it: the answer path must stop discarding its output, and the
 corpus must be reachable (federation), because a semantic layer over 3.8% of the corpus measures
 nothing.

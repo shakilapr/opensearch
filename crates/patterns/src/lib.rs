@@ -1,5 +1,5 @@
 //! URL pattern learning (plan Stage 5): templatization + pagination recognition.
-//! Interfaces frozen in `docs/STAGE5_SPEC.md`.
+//! Interfaces frozen in `docs/specs/STAGE5_SPEC.md`.
 //!
 //! [`templatize`] normalizes a URL by replacing variable path/query runs — digit runs, UUIDs and
 //! date-like runs — with stable tokens, while leaving the scheme and host untouched. Two URLs

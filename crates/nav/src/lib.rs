@@ -3,7 +3,7 @@
 //! `SearchState` + action frontier with exact cycle detection, best-first traversal, beam
 //! search for ambiguity, evidence joins for multi-hop, and a policy hierarchy (rules →
 //! classifier → local model → bounded LLM) that escalates only when a cheaper tier is not
-//! sufficient. Interfaces are frozen in `docs/STAGE4_SPEC.md`.
+//! sufficient. Interfaces are frozen in `docs/specs/STAGE4_SPEC.md`.
 //!
 //! ## Escalation rule (as implemented)
 //!

@@ -1,5 +1,5 @@
 //! Storage tiers (plan Stage 5): HOT/WARM/COLD placement + move planning.
-//! Distinct from the crawler's freshness classes. Interfaces frozen in `docs/STAGE5_SPEC.md`.
+//! Distinct from the crawler's freshness classes. Interfaces frozen in `docs/specs/STAGE5_SPEC.md`.
 //!
 //! A tier is a *storage* decision driven by how recently a document was accessed and how large
 //! it is — not by how often its source changes. [`classify`] maps one document's metadata to the

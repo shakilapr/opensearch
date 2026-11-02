@@ -1,5 +1,5 @@
 //! Acceptance tests for metadata migration 0005 — the semantic index
-//! (`docs/SEMANTIC_INDEX_ARCHITECTURE.md`).
+//! (`docs/specs/SEMANTIC_INDEX_ARCHITECTURE.md`).
 //!
 //! What is pinned here is the part that is expensive to get wrong later:
 //! the *shape* of the associations. A concept can point at documents without a

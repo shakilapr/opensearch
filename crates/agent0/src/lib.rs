@@ -24,7 +24,7 @@
 //! [`deep`] wires `crates/nav`'s [`search_nav::Navigator`] into the pipeline: a
 //! real [`search_nav::SearchExecutor`] over the index + retrieval lanes, a
 //! per-phase trace emitter, and [`Pipeline::deep_search`] (see
-//! `docs/STAGE4_SPEC.md`).
+//! `docs/specs/STAGE4_SPEC.md`).
 
 pub mod backfill;
 pub mod conceptbuild;

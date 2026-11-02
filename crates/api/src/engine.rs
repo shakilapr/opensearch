@@ -7,7 +7,7 @@
 //! which was built to sit *below* `search-api` — never learns about `IndexHit`
 //! or `SearchFilters`.
 //!
-//! Determinism/clock rule from the engine spec (`docs/ENGINE_SPEC.md`, ground
+//! Determinism/clock rule from the engine spec (`docs/specs/ENGINE_SPEC.md`, ground
 //! rules): the engine never reads a clock. The HTTP boundary computes `now` from
 //! `SystemTime::now()` and passes it in; `now_ms` here is that value in **unix
 //! seconds** (the engine's `Deps.now` unit), despite the historical `_ms` name.

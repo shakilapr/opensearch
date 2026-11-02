@@ -1,7 +1,7 @@
 //! `search-mcp` — a minimal MCP server (JSON-RPC 2.0 over stdio) exposing the
 //! local search engine as `search`, `deep_search`, and `fetch_doc` tools.
 //!
-//! Interfaces are frozen in `docs/STAGE7_SPEC.md`. The crate is deliberately
+//! Interfaces are frozen in `docs/specs/STAGE7_SPEC.md`. The crate is deliberately
 //! free of any external MCP SDK: the protocol subset is implemented by hand on
 //! top of `serde_json`, and the server is generic over [`Backend`] so it is
 //! fully testable without a live engine.

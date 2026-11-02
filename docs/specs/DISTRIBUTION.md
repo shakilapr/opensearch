@@ -23,7 +23,7 @@ package is a library that `agent0` links with its `real-indexer` feature enabled
 | binary | package | what it is |
 | :--- | :--- | :--- |
 | `agent0` | `search-agent0` | the driver: `agent0 ingest <url>` / `search <query> [limit]` / `serve` / `refresh` |
-| `search-mcp` | `search-mcp` | the stdio MCP server (`docs/MCP.md`) |
+| `search-mcp` | `search-mcp` | the stdio MCP server (`docs/specs/MCP.md`) |
 | `bench` | `search-bench` | the Stage-2 ablation harness |
 
 ```sh

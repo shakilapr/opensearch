@@ -29,7 +29,7 @@ projects/search/
 ├── scripts/              # build-release.sh, publish-pack.sh, backup.sh
 ├── raw-dataset/          # [server-only, gitignored] scraped data & dumps
 ├── models/               # [server-only, gitignored] model weights
-└── work-plan.md          # the 11-stage build plan
+└── docs/legacy/work-plan.md          # the 11-stage build plan
 ```
 
 ## The pipeline
@@ -112,10 +112,10 @@ Configuration is via the environment (`crates/core::Config::from_env`):
 
 ## Service surfaces
 
-* **HTTP API** — `POST /search` (the `SearchResponse` contract in `docs/STAGE0_SPEC.md` §7)
+* **HTTP API** — `POST /search` (the `SearchResponse` contract in `docs/specs/STAGE0_SPEC.md` §7)
   and `GET /health` (`generation`, `index_manifest_id`, uptime). Served by `agent0 serve`.
 * **MCP server** — `search-mcp`, JSON-RPC 2.0 over stdio, for MCP clients (Hermes, Claude
-  Desktop). Register it with `command`/`args`; see [`docs/MCP.md`](docs/MCP.md).
+  Desktop). Register it with `command`/`args`; see [`docs/specs/MCP.md`](docs/specs/MCP.md).
 
 ## Data & server-only paths
 
@@ -123,7 +123,7 @@ Configuration is via the environment (`crates/core::Config::from_env`):
 packs, and the runtime data root `/var/lib/search` (WAL SQLite + Tantivy mmap + blobs +
 text) are **gitignored and server-only**. A WAL SQLite database or a Tantivy
 `MmapDirectory` copied mid-write is corrupt — the data root must live outside any synced
-path (`Config::assert_not_synced` enforces this). See `docs/DISTRIBUTION.md`.
+path (`Config::assert_not_synced` enforces this). See `docs/specs/DISTRIBUTION.md`.
 
 ## Where the specs live
 
@@ -132,19 +132,19 @@ otherwise.
 
 | doc | covers |
 | :--- | :--- |
-| `work-plan.md` | the 11-stage build plan |
-| `docs/STAGE0_SPEC.md` … `docs/STAGE10_SPEC.md` | the frozen contract for each stage |
-| `docs/ARCHITECTURE.md`, `docs/AGENT_NATIVE_SEARCH_ENGINE.md`, `docs/UNIVERSAL_CRAWLER_ARCHITECTURE.md` | the original architecture documents |
-| `docs/MCP.md` | MCP server registration, tools, protocol |
-| `docs/DISTRIBUTION.md` | what ships, pack format/versioning, server-only paths |
+| `docs/legacy/work-plan.md` | the 11-stage build plan |
+| `docs/specs/STAGE0_SPEC.md` … `docs/specs/STAGE10_SPEC.md` | the frozen contract for each stage |
+| `docs/ARCHITECTURE.md`, `docs/specs/AGENT_NATIVE_SEARCH_ENGINE.md`, `docs/specs/CRAWLER.md` | the original architecture documents |
+| `docs/specs/MCP.md` | MCP server registration, tools, protocol |
+| `docs/specs/DISTRIBUTION.md` | what ships, pack format/versioning, server-only paths |
 | `docs/OPERATIONS.md` | runbook: services, refresh, backup/restore, bounds |
-| `docs/ROADMAP.md` | stage status + honest remaining gaps |
-| `docs/CONTRIBUTING.md` | build/test commands and the per-stage workflow |
+| `docs/specs/ROADMAP.md` | stage status + honest remaining gaps |
+| `docs/specs/CONTRIBUTING.md` | build/test commands and the per-stage workflow |
 | `deploy/README.md`, `benchmarks/README.md`, `ui/README.md` | deployment, bench, UI |
 
 ## Status
 
-The build stages and their real status are in [`docs/ROADMAP.md`](docs/ROADMAP.md). In
+The build stages and their real status are in [`docs/specs/ROADMAP.md`](docs/specs/ROADMAP.md). In
 short: the single-box spine (Stages 0–10) is implemented and covered by hermetic tests.
 All three MCP tools (`search`/`deep_search`/`fetch_doc`) are backed by `HttpBackend` — a
 loopback HTTP client, so MCP still needs a running API, but nothing is stubbed. The Stage-8

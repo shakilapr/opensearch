@@ -184,8 +184,8 @@ Largest source modules (code lines):
 | `datasets/fixtures/` | JSON 167, XML 96 | 263 | Hermetic inputs for the Stage-6 adapters. |
 | `references/repos/` | C++ 108,498; Rust 146,334; Python 89,377; headers 54,140; CUDA 26,740; JSON 102,310; … | 649,227 | **Vendored, not first-party**: tantivy 248,607; faiss 231,389; pyserini 104,691; pisa 46,853; seismic 11,837; splade 5,814. Exclude from "our code". |
 
-Working notes (`next-move.md` 56 KB, `recieved.md` 49 KB, `to-be-sent.md` 22 KB,
-`analysis-next-move.md`) are untracked Markdown and not included in the committed totals.
+Working notes (`docs/legacy/next-move.md` 56 KB, `recieved.md` 49 KB, `to-be-sent.md` 22 KB,
+`docs/legacy/analysis-next-move.md`) are untracked Markdown and not included in the committed totals.
 
 ---
 
@@ -237,7 +237,7 @@ into ~0.3 GiB of extracted text and a ~0.3 GiB inverted index.
 | Published packs | 35,786 records, 395 MB |
 | Storage amplification | raw→text **27.3×**, text→index **0.57×**, raw→index **47.5×** |
 
-**Important discrepancy:** `README.md` and `docs/ROADMAP.md` still cite **~323,000 fleet
+**Important discrepancy:** `README.md` and `docs/specs/ROADMAP.md` still cite **~323,000 fleet
 documents / 3,948 hosts**, and `ops/state.json` (2026-10-16) records 894,181 total docs. The
 databases now hold **1.09M doc versions / 129,299 hosts**. The prose is stale; cite these
 measured counts, and re-check them before any capacity decision.

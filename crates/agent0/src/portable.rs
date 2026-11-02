@@ -7,7 +7,7 @@
 //! The source of truth is the Tantivy index, not the blob store: the schema `STOREs`
 //! `url`/`title`/`body`/`source_id`/`published_at`, which is exactly what a pack record needs.
 //! The mapping is therefore lossy on the fields the schema does not store (`headings`,
-//! `entities`) — by design, and documented in `docs/PORTABLE_MODEL.md`.
+//! `entities`) — by design, and documented in `docs/specs/PORTABLE_MODEL.md`.
 
 use search_dataset::Record;
 use search_indexer::IndexDoc;
