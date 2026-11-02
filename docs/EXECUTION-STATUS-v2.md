@@ -246,7 +246,8 @@ fusion weight — one case shifts nDCG by ~0.017. Needs ~50 cases.
 |---|---|---|
 | Concept lane served | present in `lane_ranks` | **yes, 1–2 of 40** |
 | Cross-disciplinary acceptance | oxytocin paper for a romance query | **fails on corpus** — 1.34M docs, 2 with "oxytocin" in the title |
-| Storage ≤15 GB | after Phase C rebuild | 41 GB (rebuild pending) |
+| Index size (Tantivy, all roots) | ≤2 GB | **1.71 GB** (IM-3) |
+| Fleet storage ≤15 GB | after deleting `text/` | **not met: 33.6 GB** — index 1.71 + meta 11.6 + vectors 2.14 + text 18.2; deleting `text/` is deliberately unfired until the derived layer is proven |
 | Dense lane covers corpus | all shards have vectors | **4 of 4** (1.39M documents) |
 | nDCG@10 semantic > BM25 | strictly better | **measured: dense +0.0017, graph 0.0000, concept −0.0114, features −0.0910 at w=0.8** |
 
