@@ -115,7 +115,7 @@ gate — `docs/STATUS.md` §4 names which measurement.
 | Legacy `/search` p95 | <50 ms (design target at scale) | **97 ms** at 1.59M docs |
 | `engine:true` p95 | <150 ms | **2,541 ms** — open (P4) |
 | nDCG@10 semantic lane vs BM25 | strictly better | dense +0.0017, concept −0.0114, features −0.0910 → **not met** |
-| Cross-disciplinary recall | measured | 3.9× BM25 at n=6 → **instrument too small** |
+| Cross-disciplinary recall | measured | **2.6× BM25 with concept-only ranking** (0.2718 vs 0.1052, n=6) → instrument still too small to set weights |
 | Sparse candidate recall vs BM25 | ≥ at equal candidates | measured by `features probe`; weight 0.0 → **not met** |
 | Fleet storage ≤15 GB | after deleting `text/` | 33.6 GB with text, 15.4 GB without → **deletion unfired** |
 

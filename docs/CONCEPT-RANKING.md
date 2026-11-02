@@ -119,12 +119,19 @@ pair-bonding scores on `c-hormones` + `c-psychology` even if its title never say
 
 *(filled from `ops/bench-2026-11-02/`; see BENCHMARKS.md for the commands and the caveats)*
 
-| Set | Ranking | nDCG@10 | recall@10 | p50 |
+Measured 2026-11-02, federated over five roots, crawlers active (so latencies are contended):
+
+| Set | Ranking | nDCG@10 | recall@10 | MRR |
 | --- | --- | --- | --- | --- |
-| 600 corpus-derived | BM25 | _pending_ | _pending_ | _pending_ |
+| 600 corpus-derived | BM25 | 0.2112 | 0.4200 | 0.1476 |
 | 600 corpus-derived | concept-only | _pending_ | _pending_ | _pending_ |
-| cross-disciplinary (n=6) | BM25 | _pending_ | _pending_ | _pending_ |
-| cross-disciplinary (n=6) | concept-only | _pending_ | _pending_ | _pending_ |
+| cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 | 0.0833 |
+| cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** | **0.2500** |
+
+The result that matters: on queries whose words do not appear in the answer, concept-only ranking
+scores **2.6× BM25** and returns twice the relevant documents. On the title-derived set it is expected
+to lose — that set's labels are the document's own words — and the number is reported when it lands
+rather than suppressed.
 
 ## 6. What would make this the primary ranker
 

@@ -42,7 +42,17 @@ fusion weight. That distinction is the whole of the current state.
 | features w=0.8 | −0.0021 fleet / −0.0910 primary | harm |
 | features only, no lexical lanes | 0.0677 | the lane cannot stand alone |
 
-Cross-disciplinary set — query shares no content word with the answer's title (n=6):
+Concept-first ranking (corpus-derived relatedness graph, `agent0 concepts relate`; 2026-11-02):
+
+| Set | Ranking | nDCG@10 | recall@10 |
+| --- | --- | --- | --- |
+| 600 corpus-derived | BM25 | 0.2112 | 0.4200 |
+| 600 corpus-derived | concept-only | _pending_ | _pending_ |
+| cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 |
+| cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** |
+
+Cross-disciplinary set — query shares no content word with the answer's title (n=6, lanes at weight
+0.8 rather than concept-only):
 
 | Lane | nDCG@10 | vs BM25 |
 | --- | --- | --- |

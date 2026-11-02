@@ -78,12 +78,22 @@ At n=6 one case moves nDCG by ~0.017: this establishes capability, not a weight.
 
 Corpus-derived relatedness graph built with `agent0 concepts relate` on all five roots, then:
 
-| Set | Ranking | nDCG@10 | recall@10 | p50 |
-| --- | --- | --- | --- | --- |
-| 600 corpus | BM25 | _pending_ | _pending_ | _pending_ |
-| 600 corpus | concept-only (`SEARCH_FUSION_BM25=0`, concept=1) | _pending_ | _pending_ | _pending_ |
-| cross-disciplinary | BM25 | _pending_ | _pending_ | _pending_ |
-| cross-disciplinary | concept-only | _pending_ | _pending_ | _pending_ |
+Measured 2026-11-02 with four crawlers active, five roots federated — so the latency columns
+describe a contended host, not capacity.
+
+| Set | Ranking | nDCG@10 | recall@10 | MRR | p50 | p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 600 corpus | BM25 | 0.2112 | 0.4200 | 0.1476 | 294 ms | 5,101 ms |
+| 600 corpus | concept-only | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 | 0.0833 | 2,506 ms | 5,627 ms |
+| cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** | **0.2500** | 2,031 ms | 4,594 ms |
+
+On the shape the concept layer exists for, concept-only ranking is **2.6× BM25** (0.2718 vs 0.1052)
+and finds twice the documents. On the title-derived corpus set it is expected to lose, because those
+labels are the document's own words — that measurement is pending and will be reported as it lands,
+not tuned away. The cross-disciplinary baseline here (0.1052) differs from the 0.0645 recorded on
+2026-11-01 because the corpus and the index both changed (1.59M documents, rebuilt index, crawlers
+committed more pages); compare within a run, not across days.
 
 Command:
 
