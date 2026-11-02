@@ -110,7 +110,7 @@ gate — `docs/STATUS.md` §4 names which measurement.
 
 | Gate | Target | Measured |
 | --- | --- | --- |
-| Reachable documents | ≥500K | **1,592,836** |
+| Reachable documents | ≥500K | **1,593,844** (`index audit`, 2026-11-02) |
 | Index size, fleet | ≤2 GB | **1.75 GB** |
 | Legacy `/search` p95 | <50 ms (design target at scale) | **97 ms** at 1.59M docs |
 | `engine:true` p95 | <150 ms | **2,541 ms** — open (P4) |

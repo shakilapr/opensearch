@@ -9,7 +9,7 @@ Updated 2026-11-02. Every number is from this host; the commands that produced t
 
 | Fact | Value |
 | --- | --- |
-| Indexed documents | 1,593,844 (5 roots federated; `index audit` ratio ≥0.998 per shard) |
+| Indexed documents | 1,593,844 (5 roots; `index audit` ratio ≥0.998 per shard) |
 | Resources in metadata | 1,595,771 |
 | Index size, all roots | 1.75 GB (1.10 KB/doc) |
 | Extracted text on disk | 18.2 GB (the ingest source; not deleted) |
