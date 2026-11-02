@@ -203,3 +203,11 @@ Every semantic lane exists and none of them yet beats BM25 on the 600-query grad
 fusion weight is therefore whatever was measured, and for features that is **0.0** — the lane is
 built, tested, and deliberately absent from scoring. The sparse index itself is complete: 1.39M
 documents, 16.0 postings each, 22.2M `doc_feature` rows, 87.6–100% resource coverage.
+
+---
+
+## Where to go next (2026-11-01)
+
+The architecture is specified in `docs/ARCHITECTURE-v2.md` (normative), the index model is IM-3
+(excerpt-only, 1,710 MB for 1.56M documents), and the remaining work is itemised with gates in
+`docs/WORK-QUEUE-v2.md`. This stage-status file records what was built; it is not a backlog.

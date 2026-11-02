@@ -1,3 +1,8 @@
+> **Status: rationale, not the normative spec.** `docs/ARCHITECTURE-v2.md` (rev 2.1) is the
+> normative document: it states the implemented data model, the matrices with measured row counts,
+> and what is deliberately absent. This file is kept because the reasoning for each component lives
+> here; where the two differ, ARCHITECTURE-v2.md wins.
+
 # Hexxica — Neural Associative Search Architecture
 
 **Revision:** 2.0 — LLM-Inspired Semantic Memory  

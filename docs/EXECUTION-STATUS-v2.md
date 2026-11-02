@@ -55,16 +55,26 @@ previously recorded, because four crawlers are competing for the same 16 cores. 
 `vectors.bin` is not yet present on any shard, so the dense lane still serves only the 19K primary
 root.
 
-## Phase C — storage ⏳ code done, rebuild pending
+## Phase C — storage ✅ done (2026-11-01, index model IM-3)
 
-`body_boost` removed, `excerpt` (500 chars, STORED) added. `body` stays `TEXT | STORED` so ranking
-and snippet generation are unchanged — verified by the existing snippet tests passing.
+The first attempt (48198c4) was reverted (8655408) because it changed the schema without rebuilding,
+leaving every index unopenable. It is now done as one operation.
 
-The schema hash changed, so **the four indices must be rebuilt** before this takes effect. That
-rebuild is deliberately blocked behind Phase B: the fleet is currently the only copy of the extracted
-text, and PLAN-v2 orders "build excerpt → verify → delete" for exactly this reason.
+`body` and `body_boost` are **gone from the schema**; `excerpt` (500 chars, STORED) replaces them,
+`headings`/`doc_type`/`language` are STORED, and the article is not in the index at all. `/read`
+reads `text/<hash>.txt` (resolving both `docver_id` and `resource_id`, across every served root);
+`Pipeline::all_docs` hydrates full text for export/embed/graph and counts the documents it cannot.
 
-Current fleet storage: **41 GB** (tantivy 17.3, text 15.6, meta 7.2).
+| | Before | After |
+|---|---|---|
+| Tantivy, all 5 roots | 19,624 MB | **1,710 MB** |
+| Per document | 12.7 KB | **1.10 KB** |
+| Serving root | 315 MB | 20 MB |
+| Indexed documents | 1.54M | 1,557,504 (0 missing text) |
+| Legacy `/search` p50 / p95 at 1.56M docs | 71–92 ms at 19K docs | **35 / 97 ms** |
+
+Rebuild cost: 10.4 min for 1.54M documents (~1,850 docs/s per shard). `text/` (17.9 GB) is still on
+disk and is still the ingest source; deleting it is the separate gated step in PLAN-v2 Phase 2.
 
 ## Phase D — learned sparse features ✅ built, measured, weight 0.0
 

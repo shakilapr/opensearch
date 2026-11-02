@@ -1,3 +1,8 @@
+> **Historical snapshot (2026-10-27).** Kept because it records the state before the semantic
+> layer was built. Do not use it for the current design or current numbers:
+> **`docs/ARCHITECTURE-v2.md`** is normative (2026-11-01) and `docs/EXECUTION-STATUS-v2.md` carries
+> the measurements.
+
 # Current architecture — what the system actually is
 
 Measured on the host on **2026-10-27**, against the running service, the live databases and the
