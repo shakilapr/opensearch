@@ -141,7 +141,25 @@ Without that row the IM-3 rebuild emptied both fields — measured on 1.56M docu
 table exists. Excerpts are deliberately *not* stored there: they are a pure function of the text and
 a copy could drift from it.
 
-### 5.3 Size, measured after the IM-3 rebuild
+### 5.3 How the index model fits the matrices
+
+The lexical index is not "the index" — it is one expert beside the matrices, and each part has one
+job:
+
+| Structure | Answers | Role in the model |
+| --- | --- | --- |
+| Tantivy (IM-3) | "which documents contain these words, in title/headings/entities/excerpt" | candidate generation + snippets; the identity and evidence store |
+| M1/M2 (features) | "which documents discuss this *meaning*" | the learned associative expert |
+| M3/M4 (concepts) | "which documents are *about* this concept, and how" | the explicit semantic expert, with provenance |
+| M5 (concept graph) | "what else is near this concept" | bounded expansion, always marked inferred |
+| M6 (source/graph) | "who publishes this" / "what links here" | source discovery and authority |
+| L2 dense | "what is nearest in embedding space" | recall for what the sparse vocabulary misses |
+
+Nothing in this table stores an article, a URL list, or a concept's text. The index holds the
+addresses and the short evidence; the matrices hold the associations; L6 holds the bytes and can be
+deleted once the rest is verified.
+
+### 5.4 Size, measured after the IM-3 rebuild
 
 | Root | Documents | Tantivy |
 | --- | --- | --- |

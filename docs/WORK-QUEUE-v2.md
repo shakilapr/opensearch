@@ -43,6 +43,14 @@ Hard rules, each learned from a real failure:
 10. **Read the failure, not the symptom.** A lane that returns nothing, a build that "is slow", a test
     that "flakes" each has a known cause listed in §2; check it before redesigning.
 
+One task per agent, one task per branch/worktree, never two agents on one data root:
+
+```bash
+git worktree add ../wt-A2 -b task/A2-index-audit main
+cd ../wt-A2 && opencode run --model <model> \
+  "$(sed -n '/^### A2 /,/^### A3 /p' docs/WORK-QUEUE-v2.md)"
+```
+
 Data roots: `/var/lib/search` (primary, 19K docs) and `/var/lib/search-fleet/shard-{0..3}`
 (1.54M docs). Serving: `127.0.0.1:8090`, federated over all five.
 
