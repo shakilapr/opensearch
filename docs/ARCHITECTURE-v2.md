@@ -12,6 +12,7 @@ Reading order for anyone picking this up:
 | **this file** | the design, the data model, the invariants. If code and this file disagree, one of them is wrong and must be fixed |
 | `docs/PLAN-v2.md` | sequencing and gates (what to do next, and what measurement decides it) |
 | `docs/EXECUTION-STATUS-v2.md` | measurements, including the ones that failed |
+| `docs/LEFT-TO-DO.md` | what remains, measured, ordered by dependency — the status list |
 | `docs/WORK-QUEUE-v2.md` | the delegable backlog (hours-sized tasks for coding agents) |
 | `docs/architecture-update-v2.md` | the original target design, kept as rationale; superseded where this file differs |
 

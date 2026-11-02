@@ -1,5 +1,8 @@
 # v2 work queue — delegable tasks
 
+> The ordered *status* list is `docs/LEFT-TO-DO.md`; this file is the task detail (steps, pitfalls,
+> gates) for the same work. Start there, pick the top unblocked item, take its detail here.
+
 For coding agents (opencode, Claude Code, Codex) working unattended. Each task is **self-contained**,
 sized to hours not minutes, and ends in a measurement. Read `docs/ARCHITECTURE-v2.md` first: it is
 the normative design, and a change that contradicts a named section is not an implementation.
