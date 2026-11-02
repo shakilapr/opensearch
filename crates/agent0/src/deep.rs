@@ -570,24 +570,19 @@ impl Pipeline {
 
     /// Read the normalized text of a previously-ingested document.
     ///
-    /// `doc_id` is the stable document id (the resource id `crawl_one` assigns).
-    /// Reads the latest `document_version`'s content text path.
+    /// Two ids reach this function and both must resolve, because the index stores the *version*
+    /// id (`docver_id`, e.g. `res_ab12:1`) as its delete term while callers quote either that or the
+    /// resource id:
+    ///
+    /// * `docver_id = ?` — the exact version the index row names;
+    /// * `resource_id = ?` — the latest version, which is what a URL-level caller has.
+    ///
+    /// The ordering prefers an exact version match, so asking for an older version returns that
+    /// version's text rather than the newest one. Before this, `/read` answered 404 for every
+    /// `doc_id` the search response handed back, because those carry the `:N` suffix and the query
+    /// only compared `resource_id` — a live endpoint that could not read what search returned.
     pub fn read_doc(&self, doc_id: &str) -> AppResult<DocText> {
-        let text_path: Option<String> = self.with_meta_conn(|conn| {
-            conn.query_row(
-                "SELECT c.text_path
-                   FROM document_version dv
-                   JOIN content c ON c.content_id = dv.content_id
-                  WHERE dv.resource_id = ?1
-                  ORDER BY dv.version_no DESC
-                  LIMIT 1",
-                rusqlite::params![doc_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(search_metadata::db_err)
-            .map(|o| o.flatten())
-        })?;
+        let text_path: Option<String> = self.with_meta_conn(|conn| text_path_for(conn, doc_id))?;
         let path = text_path.ok_or_else(|| {
             AppError::NotFound(format!("no normalized document for doc_id {doc_id}"))
         })?;
@@ -607,12 +602,74 @@ impl Pipeline {
 /// `/search_deep` and `/read` endpoints can be served from the real pipeline.
 pub struct PipelineDeepSearcher {
     pipeline: Arc<Pipeline>,
+    /// The other roots this process serves, when `SEARCH_FEDERATE_DIRS` is set.
+    ///
+    /// `/read` resolves a `doc_id` through metadata, and a federated result usually lives on a
+    /// shard whose metadata the primary pipeline never opens — so the endpoint answered 404 for
+    /// documents the same process had just returned from `/search`. Each root is consulted in
+    /// federation order and only when the primary has no row; `/read` is not a hot path.
+    extra_roots: Vec<std::path::PathBuf>,
 }
 
 impl PipelineDeepSearcher {
     pub fn new(pipeline: Arc<Pipeline>) -> Self {
-        Self { pipeline }
+        Self {
+            pipeline,
+            extra_roots: Vec::new(),
+        }
     }
+
+    /// Consult these data roots' metadata when a document is not in the primary root.
+    pub fn with_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.extra_roots = roots;
+        self
+    }
+
+    /// Resolve a document that lives on one of the federated shards.
+    fn read_from_shards(&self, doc_id: &str) -> AppResult<DocText> {
+        for root in &self.extra_roots {
+            let db = root.join("meta").join("meta.sqlite");
+            if !db.exists() {
+                continue;
+            }
+            let Ok(conn) = rusqlite::Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) else {
+                continue;
+            };
+            if let Some(path) = text_path_for(&conn, doc_id)? {
+                let text = std::fs::read_to_string(&path)?;
+                return Ok(DocText {
+                    doc_id: doc_id.to_string(),
+                    text,
+                });
+            }
+        }
+        Err(AppError::NotFound(format!(
+            "no normalized document for doc_id {doc_id} on any served root"
+        )))
+    }
+}
+
+/// The extracted-text path for one document id, preferring an exact version match.
+///
+/// Returns `None` when this metadata root has never seen the id (a federated shard's document
+/// reached the primary root), which is different from "the row exists but has no text".
+fn text_path_for(conn: &rusqlite::Connection, doc_id: &str) -> AppResult<Option<String>> {
+    conn.query_row(
+        "SELECT c.text_path
+           FROM document_version dv
+           JOIN content c ON c.content_id = dv.content_id
+          WHERE dv.docver_id = ?1 OR dv.resource_id = ?1
+          ORDER BY (dv.docver_id = ?1) DESC, dv.version_no DESC
+          LIMIT 1",
+        rusqlite::params![doc_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(search_metadata::db_err)
+    .map(|o| o.flatten())
 }
 
 impl DeepSearcher for PipelineDeepSearcher {
@@ -637,7 +694,16 @@ impl DeepSearcher for PipelineDeepSearcher {
     }
 
     fn read(&self, doc_id: &str) -> AppResult<DocResponse> {
-        let d = self.pipeline.read_doc(doc_id)?;
+        let d = match self.pipeline.read_doc(doc_id) {
+            Ok(d) => d,
+            // A federated result lives on a shard, so the primary metadata has no row for it.
+            // `/read` is not a hot path: a handful of read-only lookups is cheaper than keeping
+            // every shard's metadata connection open for an endpoint that is called per result.
+            Err(AppError::NotFound(_)) if !self.extra_roots.is_empty() => {
+                self.read_from_shards(doc_id)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok(DocResponse {
             doc_id: d.doc_id,
             text: d.text,

@@ -561,8 +561,12 @@ async fn run_serve() -> ExitCode {
         }
     };
     // Deep search / document read are served from the same pipeline instance.
-    let deep: std::sync::Arc<dyn search_api::DeepSearcher + Send + Sync> =
-        std::sync::Arc::new(search_agent0::PipelineDeepSearcher::new(pipeline.clone()));
+    // `/read` must resolve the ids `/search` returns. A federated result lives on a shard, so the
+    // deep searcher is told every served root rather than assuming the primary root owns them.
+    let deep: std::sync::Arc<dyn search_api::DeepSearcher + Send + Sync> = std::sync::Arc::new(
+        search_agent0::PipelineDeepSearcher::new(pipeline.clone())
+            .with_roots(search_agent0::fedserve::dirs_from_env(&cfg.data_dir)),
+    );
 
     // §22.1 answer generation is opt-in and env-driven. `None` (no key, or the feature
     // disabled) keeps the engine lexical-only; the search path is then unchanged.
