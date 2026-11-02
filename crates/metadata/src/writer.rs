@@ -150,6 +150,26 @@ pub enum Mutation {
         modified_at: Option<i64>,
         fetched_at: i64,
     },
+    /// Record one typed concept→concept edge (v2 §13).
+    ///
+    /// The graph is derived, not authoritative: `cooccur` edges are computed from the document ×
+    /// concept matrix by pointwise mutual information, so the relation records *how the corpus uses
+    /// the concepts together* rather than a claim from an external taxonomy. `strength` is the
+    /// normalised PMI, and `model_version` names the pass that produced it, so a rebuilt graph can
+    /// replace its own rows without touching a curator's hand-written edges.
+    UpsertConceptRelation {
+        src_concept_id: String,
+        dst_concept_id: String,
+        relation: String,
+        strength: Option<f64>,
+        model_version: Option<String>,
+        at: i64,
+    },
+    /// Delete every edge of one relation kind (a rebuild's purge). Scoped by `relation`, so
+    /// `cooccur` can be recomputed while `mechanism_of` edges survive.
+    DeleteConceptRelations {
+        relation: String,
+    },
     /// Record the ingest-time fields that extracted text cannot reproduce (migration 0009).
     ///
     /// `headings` and `entities` are produced by the parser/organising model while the page is in
@@ -1252,6 +1272,39 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     fetched_at,
                     now
                 ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertConceptRelation {
+            src_concept_id,
+            dst_concept_id,
+            relation,
+            strength,
+            model_version,
+            at,
+        } => {
+            tx.execute(
+                "INSERT INTO concept_relation(src_concept_id, dst_concept_id, relation,
+                        strength, evidence, model_version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)
+                 ON CONFLICT(src_concept_id, dst_concept_id, relation) DO UPDATE SET
+                     strength      = excluded.strength,
+                     model_version = excluded.model_version",
+                rusqlite::params![
+                    src_concept_id,
+                    dst_concept_id,
+                    relation,
+                    strength,
+                    model_version,
+                    at
+                ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::DeleteConceptRelations { relation } => {
+            tx.execute(
+                "DELETE FROM concept_relation WHERE relation = ?1",
+                rusqlite::params![relation],
             )
             .map_err(crate::db_err)?;
         }

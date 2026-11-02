@@ -36,6 +36,10 @@ const UBIQUITY_STRONG_EVIDENCE: f64 = 0.30;
 /// teacher can be introduced without guessing which rows it produced (v2 §4, §6).
 const MODEL_VERSION: &str = "lexicon-v1";
 
+/// Relation kind written by `concepts relate`. A determinstic, corpus-derived edge, kept distinct
+/// from hand-written taxonomy relations (`related`, `mechanism_of`) in the same table.
+const MODEL_RELATION: &str = "cooccur";
+
 fn flag_usize(args: &[String], flag: &str) -> Option<usize> {
     let idx = args.iter().position(|a| a == flag)?;
     args.get(idx + 1)?.parse().ok()
@@ -339,8 +343,195 @@ fn build_root(
     Ok(())
 }
 
+/// `agent0 concepts relate [--dir PATH]... [--topk N] [--min-support N]`
+///
+/// Build the concept relatedness graph from the document × concept matrix, with no external
+/// taxonomy and no model: two concepts are related when the corpus uses them on the same page more
+/// often than chance, measured by pointwise mutual information.
+///
+///     PMI(a,b) = ln( (n_ab · N) / (n_a · n_b) )
+///
+/// Why co-occurrence rather than an imported hierarchy: the corpus is software docs, news and
+/// science pages, and the concept vocabulary is grown from it. An external taxonomy describes
+/// scholarly subfields and would relate concepts the corpus never puts together, while missing the
+/// pair that actually explains a cross-disciplinary answer ("chemical reactions that affect
+/// romance" needs `chemistry` ≈ `romance` *in this corpus*, which no dictionary states).
+///
+/// Only positive PMI is kept (co-occurrence above chance), `strength` is `pmi / (1 + pmi)` so it is
+/// bounded and comparable with the hand-written edges the same table holds, and the top `--topk`
+/// neighbours per concept survive so a broad field cannot drag everything along. Rows are
+/// `relation = 'cooccur'` with a model version, and the pass deletes its own previous rows first —
+/// a growing lexicon that is not purged leaves stale edges behind forever.
+pub async fn run_relate(args: &[String]) -> ExitCode {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => match args.get(i + 1) {
+                Some(v) => {
+                    dirs.push(PathBuf::from(v));
+                    i += 2;
+                }
+                None => return usage("--dir needs a path"),
+            },
+            _ => i += 1,
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(Config::from_env().data_dir);
+    }
+    let topk = flag_usize(args, "--topk").unwrap_or(8).max(1);
+    let min_support = flag_usize(args, "--min-support").unwrap_or(3).max(2);
+
+    let mut failed = false;
+    for dir in dirs {
+        match relate_one(&dir, topk, min_support) {
+            Ok(()) => {}
+            Err(e) => {
+                failed = true;
+                eprintln!("{}: {e}", dir.display());
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn relate_one(dir: &std::path::Path, topk: usize, min_support: usize) -> AppResult<()> {
+    let started = Instant::now();
+    let db = dir.join("meta").join("meta.sqlite");
+    let reader = search_metadata::MetadataReader::from_path(&db)?;
+
+    // concept -> set of documents. A document is counted once per concept even when the matrix
+    // holds both a direct and an inferred row, because co-occurrence is about the page.
+    let mut by_concept: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    // doc -> its concepts, for pair counting.
+    let mut by_doc: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    {
+        let conn = reader.conn();
+        let mut stmt = conn
+            .prepare("SELECT resource_id, concept_id FROM doc_concept WHERE relation_kind = 'direct'")
+            .map_err(search_metadata::db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(search_metadata::db_err)?;
+        for row in rows {
+            let (doc, concept) = row.map_err(search_metadata::db_err)?;
+            by_concept.entry(concept.clone()).or_default().insert(doc.clone());
+            by_doc.entry(doc).or_default().push(concept);
+        }
+    }
+    let n_docs = by_doc.len() as f64;
+    if n_docs == 0.0 {
+        println!("{}: no direct associations; nothing to relate", dir.display());
+        return Ok(());
+    }
+
+    // Pair counts. A document with k concepts contributes k(k-1)/2 pairs; the measured mean is
+    // 1.75 concepts per document, so this is small.
+    let mut pair: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for concepts in by_doc.values() {
+        for a in 0..concepts.len() {
+            for b in (a + 1)..concepts.len() {
+                let (x, y) = if concepts[a] < concepts[b] {
+                    (&concepts[a], &concepts[b])
+                } else {
+                    (&concepts[b], &concepts[a])
+                };
+                *pair.entry((x.clone(), y.clone())).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Keep the strongest `topk` neighbours per concept, symmetrically: an edge kept for `a` must
+    // also be walkable from `b`, or expansion depends on which concept the query happened to name.
+    let mut best: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
+    for ((a, b), n_ab) in pair.iter() {
+        if (*n_ab as usize) < min_support {
+            continue;
+        }
+        let n_a = by_concept.get(a).map(|s| s.len()).unwrap_or(0) as f64;
+        let n_b = by_concept.get(b).map(|s| s.len()).unwrap_or(0) as f64;
+        if n_a == 0.0 || n_b == 0.0 {
+            continue;
+        }
+        let pmi = ((*n_ab as f64 * n_docs) / (n_a * n_b)).ln();
+        if pmi > 0.0 {
+            best.insert((a.clone(), b.clone()), pmi / (1.0 + pmi));
+        }
+    }
+    // Rank per endpoint, then take the union of both endpoints' top-k.
+    let mut per_concept: std::collections::HashMap<String, Vec<(String, f64)>> =
+        std::collections::HashMap::new();
+    for ((a, b), s) in best.iter() {
+        per_concept.entry(a.clone()).or_default().push((b.clone(), *s));
+        per_concept.entry(b.clone()).or_default().push((a.clone(), *s));
+    }
+    let mut edges: Vec<(String, String, f64)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let concept_count = per_concept.len();
+    for (c, mut nbrs) in per_concept {
+        nbrs.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        nbrs.truncate(topk);
+        for (other, s) in nbrs {
+            let key = if c < other {
+                (c.clone(), other.clone())
+            } else {
+                (other.clone(), c.clone())
+            };
+            if seen.insert(key.clone()) {
+                edges.push((key.0, key.1, s));
+            }
+        }
+    }
+    edges.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut w = MetadataWriter::from_path(&db)?;
+    w.apply_batch(&[Mutation::DeleteConceptRelations {
+        relation: MODEL_RELATION.to_string(),
+    }])?;
+    let now = search_core::time::now_unix_s();
+    let mut written = 0usize;
+    for chunk in edges.chunks(500) {
+        let batch: Vec<Mutation> = chunk
+            .iter()
+            .map(|(a, b, s)| Mutation::UpsertConceptRelation {
+                src_concept_id: a.clone(),
+                dst_concept_id: b.clone(),
+                relation: MODEL_RELATION.to_string(),
+                strength: Some(*s),
+                model_version: Some(MODEL_VERSION.to_string()),
+                at: now,
+            })
+            .collect();
+        w.apply_batch(&batch)?;
+        written += batch.len();
+    }
+
+    println!(
+        "{}: {} concepts over {} document(s), {} co-occurring pair(s) above chance, {written} edge(s) kept (topk {topk}, support {min_support}) in {:.1}s",
+        dir.display(),
+        concept_count,
+        n_docs as u64,
+        pair.len(),
+        started.elapsed().as_secs_f64()
+    );
+    for (a, b, s) in edges.iter().take(5) {
+        println!("  {a} <-> {b}  strength {s:.3}");
+    }
+    Ok(())
+}
+
 fn usage(why: &str) -> ExitCode {
     eprintln!("error: {why}");
-    eprintln!("usage: agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]");
+    eprintln!(
+        "usage: agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]\n       agent0 concepts relate [--dir PATH]... [--topk N] [--min-support N]"
+    );
     ExitCode::from(2)
 }

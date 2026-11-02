@@ -336,6 +336,7 @@ async fn main() -> ExitCode {
         Some("migrate") => search_agent0::migrate::run(&args),
         Some("concepts") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::conceptbuild::run(&args).await,
+            Some("relate") => search_agent0::conceptbuild::run_relate(&args).await,
             _ => {
                 eprintln!("usage: agent0 concepts build [--dir PATH]... [--batch N] [--limit N] [--dry-run]");
                 ExitCode::from(2)
@@ -343,6 +344,7 @@ async fn main() -> ExitCode {
         },
         Some("index") => match args.get(2).map(String::as_str) {
             Some("build") => search_agent0::indexbuild::run(&args).await,
+            Some("publish") => search_agent0::indexbuild::run_publish(&args),
             _ => {
                 eprintln!("usage: agent0 index build [--dir PATH]... [--batch N] [--limit N]");
                 ExitCode::from(2)

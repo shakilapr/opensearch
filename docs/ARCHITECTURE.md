@@ -1,2372 +1,472 @@
-# Universal Crawling & Scraping Architecture
+# Hexxica v2 — the architecture, complete
 
-## 1. Design Goal
+**Revision 2.1 — 2026-11-01.** Normative for this repository.
+**Scope:** what the engine is, what it stores, how a query is answered, and which parts are real.
+Every number marked *measured* was read from this host on 2026-11-01; the commands that produce
+them are in §13.
 
-The crawler must support:
+Reading order for anyone picking this up:
 
-```text
-normal websites
-news/blogs
-documentation
-forums
-Git repositories
-research papers
-PDFs
-books
-library catalogs
-archives
-RSS / Atom
-XML sitemaps
-OAI-PMH repositories
-JSON/XML APIs
-JavaScript applications
-images
-datasets/files
-historical archives
-```
-
-without building a unique crawler from scratch for every source.
-
-The central design is:
-
-```text
-                     SEEDS
-                       │
-                       ▼
-                SOURCE DISCOVERY
-                       │
-                       ▼
-                GLOBAL FRONTIER
-                       │
-                       ▼
-               POLICY + SCHEDULER
-                       │
-                       ▼
-                    FETCHER
-                       │
-                 RESPONSE ROUTER
-          ┌────────────┼──────────────┐
-          ▼            ▼              ▼
-        HTML          PDF         STRUCTURED
-          │            │              │
-          ▼            ▼              ▼
-       parser        document       XML/JSON/
-                    processor      feeds/etc.
-          │            │              │
-          └────────────┼──────────────┘
-                       ▼
-                 NORMALIZED OBJECT
-                       │
-             ┌─────────┼─────────┐
-             ▼         ▼         ▼
-           INDEX      GRAPH     LINKS
-                                   │
-                                   ▼
-                              NEW FRONTIER
-```
-
-The crawler continuously loops.
+| Document | Role |
+| --- | --- |
+| **this file** | the design, the data model, the invariants. If code and this file disagree, one of them is wrong and must be fixed |
+| `docs/PLAN-v2.md` | sequencing and gates (what to do next, and what measurement decides it) |
+| `docs/EXECUTION-STATUS-v2.md` | measurements, including the ones that failed |
+| `docs/LEFT-TO-DO.md` | what remains, measured, ordered by dependency — the status list |
+| `docs/WORK-QUEUE-v2.md` | the delegable backlog (hours-sized tasks for coding agents) |
+| `docs/architecture-update-v2.md` | the original target design, kept as rationale; superseded where this file differs |
 
 ---
 
-# 2. Core Objects
+## 1. Objective
 
-The entire crawler operates around five IDs.
+Identify relevant articles across the web **without storing the articles**, return their addresses in
+milliseconds, and rank them by learned semantic association rather than exact words.
 
-```text
-DomainID
-SourceID
-ResourceID
-WorkID
-ContentID
-```
+The design constraint that shapes everything else: **the expensive work happens at indexing time.**
+The online path may not call a hosted LLM, scan a whole corpus, read article content, or traverse a
+graph without a bound (§15 of the original design, restated as invariant I-7).
 
-### Domain
-
-A hostname:
-
-```text
-arxiv.org
-docs.python.org
-github.com
-example.com
-```
-
-### Source
-
-A meaningful section or logical collection:
-
-```text
-arxiv.org / cs.AI
-docs.python.org / asyncio
-github.com / llama.cpp
-example.com / news
-```
-
-### Resource
-
-A fetchable address:
-
-```text
-URL
-feed URL
-sitemap URL
-PDF URL
-API endpoint
-repository object
-```
-
-### Work
-
-A logical intellectual object that may exist at multiple URLs:
-
-```text
-research paper
-book
-article
-software release
-```
-
-### Content
-
-The unique material itself.
-
-Several URLs may point at one ContentID.
-
-```text
-URL A ─┐
-URL B ─┼── ContentID 91828
-URL C ─┘
-```
-
-This is important for deduplication.
+Non-goals, until a measurement demands them: distributed indexing, training a transformer, trillion
+edge materialisation, Matryoshka/ANN retrieval, and any learned router before a rule-based one.
 
 ---
 
-# 3. Source Registry
+## 2. Principles and the rules they impose
 
-Before crawling URLs, maintain a database about websites.
-
-```text
-SourceProfile {
-    source_id
-    domain_id
-
-    root_url
-    type
-
-    topics[]
-    entities[]
-
-    robots_url
-    sitemap_urls[]
-    feed_urls[]
-
-    known_path_patterns[]
-
-    discovery_methods[]
-
-    authority
-    quality
-
-    crawl_priority
-
-    expected_change_rate
-
-    requires_js_probability
-
-    successful_fetch_rate
-
-    average_response_size
-    average_latency
-
-    last_crawled
-    next_discovery_at
-}
-```
-
-Examples of `type`:
-
-```text
-documentation
-news
-blog
-forum
-academic_repository
-publisher
-software_repository
-library
-archive
-government
-company
-dataset
-market_data
-```
-
-The registry is effectively the crawler's memory.
+| # | Principle | Rule it imposes on the code |
+| --- | --- | --- |
+| P1 | Intelligence is built offline | a query path may not do inference; batches (`concepts build`, `features build`, `embed build`) do |
+| P2 | The index stores addresses and evidence, not documents | `body` is not a Tantivy field (§5). Full text lives on disk as an ingest source and is read on demand |
+| P3 | Associations are sparse and typed | only activated features / supported concepts are materialised; nothing allocates a dense document×concept matrix (§6) |
+| P4 | Every learned number names its model | `model_id`+`version`+`space_id` travel with the association; a rebuild purges its own version before writing (I-4) |
+| P5 | Direct evidence and inference stay distinguishable | `doc_concept.relation_kind` = `direct` \| `inferred`; never summed into one number |
+| P6 | The measurement sets the weight | a lane ships at weight 0.0 until a graded run shows a gain; "it is new" or "it took work" is not evidence |
+| P7 | Nothing is silently degraded | missing vectors/text/model ⇒ an explicit count or error, never a plausible substitute |
 
 ---
 
-# 4. Seed Layer
-
-The crawler can accept many kinds of seeds.
+## 3. System map
 
 ```text
-SEED
-├ domain
-├ URL
-├ sitemap
-├ RSS/Atom feed
-├ DOI
-├ arXiv ID
-├ Git repository
-├ OAI-PMH endpoint
-├ ISBN
-├ archive identifier
-├ imported dataset
-└ community source pack
+OFFLINE (CPU, hours, resumable, checkpointed)          ONLINE (per query, ~35 ms p50)
+
+ fetch ─► extract ─► identity ─► ┌ lexical index  (title/headings/entities/excerpt)
+                                  ├ dense vectors   (384-d, unit norm)
+                                  ├ concept matrix  (doc × concept × dimension)
+                                  ├ feature matrix  (doc × 4096, 16 active) + postings
+                                  └ graph (concept_relation, entity edges)
+
+ query ─► normalise ─► route ─► lanes ─► fuse (RRF) ─► rerank? ─► resolve ─► result rows
+                                                                     └ /read ─► text/<hash>.txt
 ```
 
-Seeds can come from:
+Five roots are served as one corpus (`SEARCH_FEDERATE_DIRS`): the 19K-document primary plus four
+fleet shards. Identity is globally stable (`resource_id`), so federation needs no id rewriting.
 
-```text
-manual lists
-Common Crawl
-Wikidata
-OpenAlex
-Crossref
-Open Library
-existing source packs
-links discovered by crawling
-agent searches
-user submissions
-```
-
-Common Crawl's URL Index is particularly useful for large-scale bootstrap discovery because it exposes its crawl URL index in Parquet and can be queried locally with systems such as DuckDB, Spark, Arrow, or Polars.
+**Measured fleet:** 1,558,543 resources, 1,557,504 indexed documents, 5 roots, 37 crates, 66,248
+lines of Rust.
 
 ---
 
-# 5. Domain Discovery
+## 4. Storage layers
 
-A new domain first enters:
+Only one layer is authoritative: **metadata (SQLite) + extracted text on disk**. Everything else is
+derived and rebuildable, and is treated as such by every tool here.
 
-```text
-DOMAIN_DISCOVERED
-```
+| Layer | Contents | Store | Measured size | Authoritative? |
+| --- | --- | --- | --- | --- |
+| L0 identity | domain, resource, document_version, content, sitemap, frontier, fetch journal | `meta/meta.sqlite` per root | 11.7 GB (5 roots) | **yes** |
+| L1 evidence | title, headings, entities, excerpt, doc_type, language, timestamps, ids | Tantivy `tantivy/` | **1,710 MB** | derived from L0 |
+| L2 dense | 384-d unit vectors keyed by resource | `vectors.bin` per root | 2.14 GB, 1.39M docs | derived |
+| L3 sparse features | forward `doc_feature` + inverted `features/postings.bin` | SQLite + file per root | 22.2M rows, 180 MB postings | derived from L2 |
+| L4 concepts | `concept`, `concept_alias`, `doc_concept`, `doc_concept_dim` | SQLite | 885,364 / 1,892,440 rows, 15 concepts | derived from L1 text |
+| L5 source/graph | `source_concept`, `concept_relation`, `web_link`, `graph_edge`, `entity` | SQLite | mostly **empty** (see §6.5) | derived from L1/L0 |
+| L6 source bytes | extracted text `text/<h2>/<hash>.txt` (raw HTML only if opted in) | filesystem | 18.2 GB | **ingest source** |
 
-not immediately:
-
-```text
-CRAWL_EVERYTHING
-```
-
-Run cheap checks first.
-
-```text
-DNS valid?
-        │
-        ▼
-HTTPS reachable?
-        │
-        ▼
-robots.txt
-        │
-        ▼
-homepage headers
-        │
-        ▼
-site type prediction
-        │
-        ▼
-sitemap/feed discovery
-        │
-        ▼
-quality score
-```
-
-Possible domain states:
-
-```text
-UNKNOWN
-PROBING
-ACTIVE
-LOW_VALUE
-BLOCKED
-DEAD
-TEMP_FAILURE
-BLACKLISTED
-```
+L6 is the only layer that can be deleted, and only after L1–L5 are verified: `text/` is what makes
+`/read`, embedding and graph building possible. Deleting it is a one-way operation
+(`docs/PLAN-v2.md` Phase 2) and is **not** part of the current model.
 
 ---
 
-# 6. robots.txt Layer
+## 5. The index model
 
-Every origin has a cached `RobotsPolicy`.
+### 5.1 Why the article left the index
 
-RFC 9309 standardizes `robots.txt`, including user-agent groups, allow/disallow rules, fetching and caching behavior.
+Three models were measured, in this order:
 
-```text
-RobotsPolicy {
-    origin
-    fetched_at
-    expires_at
+| Model | Fields | Fleet index | Per doc | Problem |
+| --- | --- | --- | --- | --- |
+| IM-1 | `body` TEXT\|STORED, `body_boost` | 19,624 MB | 12.7 KB | the page indexed *and* stored; `body_boost` duplicated title+headings+body |
+| IM-2 | IM-1 + `excerpt`, keep `body` stored | — | — | reversible half-step; still two copies of every article |
+| **IM-3 (current)** | `excerpt` (500 chars) instead of `body`; `headings`/`doc_type`/`language` STORED | **1,710 MB** | **1.10 KB** | none for retrieval; `/read` needs L6 |
 
-    rules[]
-    sitemaps[]
+IM-3 is 11.5× smaller than IM-1 for the same corpus and the same 600-query quality (a title-derived
+query set that never used body prose — see §9 for what that instrument can and cannot judge).
 
-    status
-}
-```
+The rule that made this safe: **a schema edit and its rebuild are one operation.** Changing the
+field set changes the schema hash, and `Indexer` refuses to open an index whose hash differs — so
+"change the schema" without "rebuild every root" leaves the fleet unreadable, which is exactly what
+forced the revert in `8655408`. `scripts/rebuild-fleet-index.sh` is the atomic form: stop writers →
+move the old directory aside → build → restart. Rebuild cost measured: 12.1 minutes for 1.56M documents (206 s per 385K-document shard,
+~1,870 docs/s).
 
-Before fetching:
+### 5.2 Tantivy fields (frozen)
 
-```text
-ALLOW(resource)?
-```
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `doc_id` | STRING, STORED | delete term; the *version* id (`res_<hash>:N`) |
+| `version` | u64, INDEXED+FAST | overlay/base precedence |
+| `resource_id`, `work_id`, `content_id` | STRING, STORED | identity; `content_id` resolves the text file |
+| `url` | TEXT, STORED | resolution; indexed at low weight |
+| `title` | TEXT, STORED | display |
+| `title_boost` | TEXT | the indexed copy of the title, boosted 3.0 (Tantivy cannot boost inside a field) |
+| `headings` | TEXT, **STORED** | organising model's H1/H2 summary; boost 2.0; readable by export |
+| `excerpt` | TEXT, **STORED** | ~500 chars of the document — the only article text in the index; boost 1.0; snippet source |
+| `entities` | TEXT, STORED | key entities from the organising model; boost 3.0 |
+| `source_id` | STRING, STORED | site identity |
+| `doc_type`, `language` | STRING, **STORED** | facets/export (were indexed-only and silently lost) |
+| `published_at`, `modified_at`, `fetched_at` | i64 | freshness |
+| `visible_generation` | u64 FAST | watermark gating |
+| `tombstone` | u64 FAST | deletion without a re-index |
 
-If false:
+Deliberately absent: `body`, `body_boost`, anchors, link targets, full URL lists, concept names.
+A posting list never carries a URL string or article text — it carries ids and quantised weights.
 
-```text
-DROP / LINK_ONLY
-```
+**Rebuild fidelity.** Extracted text can rebuild the excerpt, the vectors and the concept tags; it
+cannot rebuild `headings` or `entities`, which the parser and organising model produce while the page
+is in hand. They are therefore persisted at ingest in `document_derived(docver_id, headings,
+entities)` (migration 0009, same commit as the document) and read back by `agent0 index build`.
+Without that row the IM-3 rebuild emptied both fields — measured on 1.56M documents, which is why the
+table exists. Excerpts are deliberately *not* stored there: they are a pure function of the text and
+a copy could drift from it.
 
-Don't make every worker download robots independently.
+### 5.3 How the index model fits the matrices
 
-There should be one centralized policy cache.
+The lexical index is not "the index" — it is one expert beside the matrices, and each part has one
+job:
 
----
+| Structure | Answers | Role in the model |
+| --- | --- | --- |
+| Tantivy (IM-3) | "which documents contain these words, in title/headings/entities/excerpt" | candidate generation + snippets; the identity and evidence store |
+| M1/M2 (features) | "which documents discuss this *meaning*" | the learned associative expert |
+| M3/M4 (concepts) | "which documents are *about* this concept, and how" | the explicit semantic expert, with provenance |
+| M5 (concept graph) | "what else is near this concept" | bounded expansion, always marked inferred |
+| M6 (source/graph) | "who publishes this" / "what links here" | source discovery and authority |
+| L2 dense | "what is nearest in embedding space" | recall for what the sparse vocabulary misses |
 
-# 7. Sitemap Discovery
+Nothing in this table stores an article, a URL list, or a concept's text. The index holds the
+addresses and the short evidence; the matrices hold the associations; L6 holds the bytes and can be
+deleted once the rest is verified.
 
-Try known locations:
+### 5.4 Size, measured after the IM-3 rebuild
 
-```text
-robots.txt declarations
+| Root | Documents | Tantivy |
+| --- | --- | --- |
+| shard-0 | 385,024 | 427 MB |
+| shard-1 | 461,312 | 510 MB |
+| shard-2 | 464,896 | 514 MB |
+| shard-3 | 227,328 | 239 MB |
+| primary | 18,944 | 20 MB |
+| **total** | **1,557,504** | **1,710 MB** |
 
-/sitemap.xml
-/sitemap_index.xml
-/sitemap.xml.gz
-/sitemap-index.xml
-```
-
-Then follow sitemap indexes.
-
-A standard sitemap can contain up to 50,000 URLs or 50 MB uncompressed; larger collections can be represented using sitemap indexes.
-
-Create records without necessarily fetching each page:
-
-```text
-SitemapURLRecord {
-    url
-    lastmod
-    sitemap_id
-    source_id
-    discovered_at
-    fetched = false
-}
-```
-
-This means:
-
-```text
-1 sitemap fetch
-→ 40,000 known URLs
-```
-
-without:
-
-```text
-40,000 page downloads
-```
-
----
-
-# 8. Feed Discovery
-
-Detect:
-
-```text
-RSS
-Atom
-JSON Feed
-```
-
-through:
-
-```text
-<link rel="alternate">
-known paths
-source configuration
-HTML links
-```
-
-Feeds belong to the **freshness subsystem**.
-
-Google's own sitemap guidance notes that RSS and Atom feeds are useful for exposing recent URLs, whereas full sitemaps are better suited for broader site coverage.
-
-The crawler therefore treats:
-
-```text
-SITEMAP
-→ coverage
-
-FEED
-→ freshness
-```
-
-differently.
+0 missing text, 0 empty per root — every indexed document had a readable source file at build time.
 
 ---
 
-# 9. Frontier
+## 6. The matrices
 
-Every candidate resource enters a central distributed priority queue.
+Six matrices, one per association kind. "Density" is non-zeros ÷ cells; the point of the sparse
+design is that every one of them is far below 1%.
 
-```text
-FrontierEntry {
-    resource_id
-    url
+### M1 — document × learned feature (forward index)
 
-    domain_id
-    source_id
+`doc_feature(resource_id, feature_id, model_id, version, space_id, activation)`.
 
-    resource_type_guess
+| Property | Value |
+| --- | --- |
+| Shape | 1,387,584 documents × 4,096 features |
+| Non-zeros | **22,201,352** (16.0 per document) |
+| Density | 0.39% |
+| Producer | `agent0 features build` (encoder `z = TopK(ReLU(W e_d + b))`, 16 active, tied decoder) |
+| Consumers | feature rerank (candidate features without a postings scan), update/retraction |
+| Provenance | `model_id`, `version`, `space_id` on every row |
 
-    discovered_from
-    discovery_method
+### M2 — feature postings (inverted index)
 
-    priority
+`features/postings.bin`, magic `ANSEPOST1`: `features × { count u32, count × { doc u32, q u8 } }`,
+plus a per-document id table. 8-bit quantised activation, as the design requires.
 
-    earliest_fetch_at
+| Property | Value |
+| --- | --- |
+| Shape | 4,096 features × 1,387,584 documents, sparse |
+| Size | 180 MB across 5 roots (13.5 MB primary, 40/49/51/26 MB shards) |
+| Score | `Σ_f q_f · z_df · idf_f`, `q = TopK(ReLU(W e_q + b))` |
+| Query side | same encoder, so query and document features share a vocabulary by construction |
+| Measured behaviour | lane recall@100 is the instrument (`features probe`); fusion weight 0.0 (§8.3) |
 
-    retry_count
+### M3 — document × concept (scalar associations)
 
-    expected_cost
-    expected_value
+`doc_concept(resource_id, concept_id, weight, relation_kind, evidence, passage_id, via_concept_id,
+model_version)`.
 
-    status
-}
-```
+| Property | Value |
+| --- | --- |
+| Rows | **885,364** over 506,363 distinct documents and 15 concepts |
+| Coverage | **32.5%** of documents carry at least one association (1.75 concepts each, on average) |
+| Producer | `agent0 concepts build` — deterministic lexicon tagging at 749–802 docs/s per shard |
+| Consumers | `ConceptLane`, `FederatedConceptLane`; source profiles (not yet built) |
+| Kind | `direct` (the page states it) vs `inferred` (through `concept_relation`) |
 
-Possible statuses:
+### M4 — document × concept × dimension (R(d,c))
 
-```text
-NEW
-QUEUED
-FETCHING
-FETCHED
-UNCHANGED
-FAILED
-RETRY
-SKIPPED
-BLOCKED
-```
+`doc_concept_dim(resource_id, concept_id, dim, value, model_version)` — the vector the original
+design asks for at §6, so one article can be strong on `mechanism` for one query and strong on
+`contextual` for another without reindexing.
 
----
+| Property | Value |
+| --- | --- |
+| Rows | **1,892,440** (2.14 dimensions per association) |
+| Dimensions in use | `direct`, `contextual`, `mechanism`, plus `evidence`/`confidence` where recorded |
+| Evidence rule | each dimension must have independent evidence, or it is decoration: when all three were derived from the same body counts, `mechanism` was a strict subset of `direct` and could change no ranking |
+| Key | the dimension is a string, not an ordinal: a new model may discover a dimension without a migration |
 
-# 10. Frontier Priority
+### M5 — concept × concept (typed graph)
 
-Do not use FIFO.
+`concept_relation(src, dst, relation, strength, evidence, model_version)` with SKOS relations
+(`equivalent`, `broader`, `narrower`, `related`) and free typed relations (`mechanism_of`, …).
+**0 rows — schema only.** Traversal is bounded by design; inferred associations must be marked
+`inferred` and are never allowed to compound across hops.
 
-Calculate approximately:
+### M6 — source × concept, and document-level graphs
 
-```text
-priority =
+| Matrix | Table | Rows | State |
+| --- | --- | --- | --- |
+| source × concept (normalised) | `source_concept` | 0 | **not built**; the column `doc_count` exists so the normalisation is auditable |
+| page → page links | `web_link` | 0 | **not captured**; derivable only from raw HTML, so it must be built before any blob deletion |
+| entity co-occurrence | `graph_edge` | 130,359 (primary only) | present on the primary root, absent on the fleet |
+| passage → concept | `passage`, `passage_concept` | 0 | schema only |
 
-source_quality
-× expected_information_value
-× freshness_need
-× query_demand
-× discovery_confidence
-× uniqueness_probability
+### How they combine
 
-÷ expected_fetch_cost
-```
+$$\text{score}(d,q) = w_{bm25}\,S_{bm25} + w_{dense}\,S_{dense} + w_{concept}\,S_{concept} + w_{features}\,S_{features}$$
 
-Then add modifiers for:
-
-```text
-important entity
-important topic
-new source
-recent feed entry
-sitemap lastmod
-historical success
-document rarity
-```
-
-And penalties for:
-
-```text
-duplicate patterns
-faceted URLs
-infinite calendars
-search pages
-session URLs
-tracking URLs
-very large resources
-repeated failures
-```
+with the shipped engine using reciprocal-rank fusion (`w_l/(c+rank_l)`, `c=60`) rather than the
+linear form — RRF needs no calibration, and the linear form is only legitimate once its coefficients
+are fitted (§11 of the original design). Measured consequence of `c=60`: a document found by one
+lane scores 0.0138 at rank 1, one found by two lanes 0.0303, so **a single extra lane can re-rank
+but cannot outvote the lexical pair** until `c` or the weights are tuned against graded data.
 
 ---
 
-# 11. Per-Origin Queues
+## 7. Identity, resolution and "no article stored"
 
-The global queue should not directly dispatch URLs.
+| Identifier | Meaning |
+| --- | --- |
+| `resource_id` | canonical fetchable URL (`res_<hash>`) |
+| `docver_id` | one version of a resource (`res_<hash>:N`) — the index's `doc_id` |
+| `content_id` | one byte-representation (`cnt_<hash>`) — resolves `text/<h2>/<hash>.txt` |
+| `work_id` / `content hash` | logical article / dedupe across mirrors |
+| `concept_id`, `feature_id` | stable taxonomy id / model-scoped learned id (**never interchangeable**) |
 
-Use:
+Resolution is now honest end to end: `/read?doc_id=` accepts either the version id `/search`
+returns or the resource id, and consults every served root's metadata when a federated result lives
+on a shard. Verified live: a shard-3 result returned 15,375 chars from disk while the index held
+none of them.
 
-```text
-GLOBAL SCHEDULER
-
-example.com queue
-python.org queue
-arxiv.org queue
-site-a queue
-site-b queue
-...
-```
-
-Each origin has:
-
-```text
-OriginState {
-    concurrency_limit
-
-    next_allowed_time
-
-    observed_latency
-
-    error_rate
-
-    rate_limit_state
-
-    robots_policy
-
-    adaptive_delay
-}
-```
-
-This lets the crawler use enormous aggregate bandwidth while remaining gentle to individual websites.
+When L6 is eventually deleted, `/read` degrades to the stored excerpt — a real fragment, not an
+invented document. That is a deliberate, documented state, not an error path.
 
 ---
 
-# 12. Adaptive Politeness
+## 8. Online retrieval
 
-Start conservatively.
-
-For an unknown site:
+### 8.1 Stages
 
 ```text
-1 request concurrently
+query ─► prune/normalise ─► (optional planner: cached, never blocking)
+      ─► lanes: bm25 · source_first · dense · graph · concept · features
+      ─► candidate set (ids only) ─► docmap (lookup_doc per id)
+      ─► RRF fusion ─► optional stage-3 rerank (top 50) ─► result rows
 ```
 
-Observe:
+The engine builds its document map from the lexical lanes' retained hits, so **any lane whose hits
+are not resolvable via `Searcher::lookup_doc` can only re-rank, never retrieve**. Any new lane must
+therefore be index-backed and cheap to look up (`Indexer::doc_by_id`: term lookup, no `reload()`,
+no stored body).
 
-```text
-latency
-429
-503
-timeouts
-Retry-After
-server errors
-```
+### 8.2 Lanes and their measured weights
 
-Healthy:
+| Lane | Backing | Weight shipped | Evidence |
+| --- | --- | --- | --- |
+| `bm25` | Tantivy fields above | 1.0 | baseline of every measurement |
+| `source_first` | same index, source-scoped | **0.0** | identical to BM25 on 64/64 results — a duplicate lane, not an accelerator |
+| `dense` | `vectors.bin`, 384-d cosine | 0.0 | +0.0017 nDCG on the 600-set; 3.7× BM25 on cross-disciplinary (n=6) |
+| `graph` | `graph_edge` | 0.0 | ±0.0000; empty on the fleet |
+| `concept` | M3/M4 | 0.0 | −0.0114 on the 600-set (monotonic in weight); 3.9× BM25 on cross-disciplinary (n=6) |
+| `features` | M1/M2 | 0.0 | −0.0910 at w=0.8 on the primary root, −0.0021 at fleet scale |
 
-```text
-possibly increase slowly
-```
+A weight-0 lane is still *executed* unless it implements `lane_hint`; the concept lane costs ~1.5 s
+per query across five shards for output that cannot change a result, so the hint is mandatory for
+any lane that ships off.
 
-Errors:
+### 8.3 Latency, measured at 1,557,504 documents
 
-```text
-decrease immediately
-```
+| Path | p50 | p95 |
+| --- | --- | --- |
+| legacy `/search` (lexical, federated) | **35 ms** | **97 ms** |
+| `engine:true` (all lanes, planner, nav) | 620 ms | 2,541 ms |
 
-For example:
+The target (<50 ms p95, §15) is met on the lexical path with the smaller index; the engine path is
+**not** within budget and is the reason routing exists. `SEARCH_ROUTE=1` removes 3 of 5 lane calls on
+the median query for −0.0007 nDCG, and ships off only because that cost must be chosen.
 
-```text
-site A    1 concurrent
-site B    2 concurrent
-site C    1 concurrent
-GitHub    API-specific limits
-```
+### 8.4 Budget and degradation
 
-At high scale, concurrency comes from crawling **many hosts**, not hammering one host.
-
----
-
-# 13. URL Canonicalization
-
-Before placing a URL on the frontier:
-
-```text
-normalize scheme
-normalize hostname
-remove fragments
-normalize default ports
-resolve relative URLs
-normalize safe path segments
-remove known tracking parameters
-sort safe query arguments
-```
-
-Examples removed:
-
-```text
-utm_source
-utm_medium
-utm_campaign
-fbclid
-gclid
-ref
-```
-
-when semantics allow it.
-
-Maintain both:
-
-```text
-original_url
-canonical_url
-```
+Every request has a candidate cap and a time budget; exceeding it returns partial results with
+`degraded: true` rather than blocking. Zero-weight lanes are skipped before execution. A lane that
+errors is reported in `failures` and does not fail the request.
 
 ---
 
-# 14. URL Pattern Engine
+## 9. Evaluation
 
-Group URLs into templates.
+Three instruments, each blind to something:
 
-Example:
+| Set | Shape | Size | What it can judge | What it cannot |
+| --- | --- | --- | --- | --- |
+| `queries.corpus.jsonl` | query = the document's own title | 600 | lexical correctness, latency, regressions | semantic ability: a title query shares its words with the answer |
+| `queries.body.jsonl` | query = a sentence from the document's body | 600 | whether a lane can map prose to its source | cross-topic association; still one known-relevant doc |
+| `queries.cross_disciplinary.jsonl` | query shares **no content word** with the answer's title | 6 | the capability the semantic lanes exist for | nothing statistical at n=6 (one case ≈ 0.017 nDCG) |
 
-```text
-/blog/{slug}
-/article/{id}
-/docs/{version}/{page}
-/users/{name}
-/tag/{tag}?page={n}
-```
+Headline results (600 cases, Fast mode, one process per configuration):
 
-Create:
+| Configuration | nDCG@10 |
+| --- | --- |
+| federated BM25 baseline | 0.2481 |
+| + dense w=0.8 | +0.0017 (primary-root run: 0.4830 vs 0.4813) |
+| + concept w=0.8 | −0.0114 |
+| + features w=0.8 | −0.0021 at fleet scale (−0.0910 primary) |
+| BM25, cross-disciplinary (n=6) | 0.0645 |
+| concept, cross-disciplinary (n=6) | **0.2500** |
+| dense, cross-disciplinary (n=6) | 0.2384 |
 
-```text
-URLPattern {
-    source_id
-    template
-    document_type
-    value_score
-    crawl_probability
-}
-```
+Both facts are true and must be reported together: the semantic lanes are noise-to-harm on the set
+that cannot represent their capability, and ~4× the baseline on the set that can. Neither justifies
+a fusion weight until the cross-disciplinary set reaches ~50 hand-judged cases.
 
-After enough evidence:
-
-```text
-/article/{slug}
-→ FETCH
-
-/tag/{tag}?page=N
-→ DISCOVERY_ONLY
-
-/login
-→ IGNORE
-
-/share
-→ IGNORE
-```
-
-This prevents crawl traps.
+Rules for any future measurement: one process per configuration, `env -u` every `SEARCH_FUSION_*`
+first, `--mode fast` always, and reconcile the deployed systemd drop-in in the same step (§13.3).
 
 ---
 
-# 15. Seen-Resource Layer
+## 10. Models
 
-Every discovered normalized URL is hashed.
+| Model | Role | State | Cost | Gate |
+| --- | --- | --- | --- | --- |
+| A — teacher | BGE-small-en-v1.5, 384-d | **in use**, 1.39M documents embedded | 13.2 docs/s at 2,000 chars under crawl contention | retrieval quality, not reconstruction |
+| B — sparse encoder | `TopK(ReLU(We+b))`, 4,096 features, 16 active, tied decoder | **trained** (`features/encoder.bin`, 283K samples, 4 epochs, 775 s) | CPU, minutes/epoch; matrix is 6.0 MiB | candidate recall ≥ BM25 at equal candidates; **not met** |
+| C — concept predictor | multi-label over the lexicon | **deterministic lexicon** replaces it (`concepts build`) | ~750–800 docs/s | coverage and false-positive rate by reading titles |
+| D — query encoder | projection through the same `W` | **in use** (same encoder, max-normalised) | ~1 ms | end-to-end p95 |
+| E — router/ranker | rule router + feature rerank | **built, off** (`SEARCH_ROUTE`, `SEARCH_RERANK`) | 67 ms saved p50; rerank +2 ms | router: recall@20 not reduced; rerank: nDCG improves |
 
-```text
-url_hash = HASH(canonical_url)
-```
-
-Check:
-
-```text
-Bloom / XOR filter
-        ↓ maybe present
-persistent URL index
-```
-
-Only unseen or refresh-due URLs reach the frontier.
-
-The in-memory approximate filter avoids expensive database lookups for obvious duplicates.
+The trained encoder is the design's core and currently earns no weight. The next honest experiment
+is training it on titles as well as bodies, and IDF-weighting the postings — not raising its weight.
 
 ---
 
-# 16. Fetcher Architecture
+## 11. Invariants
 
-Use several fetch classes.
+Each is enforced somewhere a future change can be caught.
 
-```text
-Fetcher
-├ HTTPFetcher
-├ BrowserFetcher
-├ FileFetcher
-├ StructuredProtocolFetcher
-├ RepositoryFetcher
-└ ArchiveFetcher
-```
-
-The dispatcher chooses based on resource metadata.
-
----
-
-# 17. HTTP Fetcher
-
-This handles most resources.
-
-Requirements:
-
-```text
-HTTP/1.1
-HTTP/2
-connection pooling
-compression
-redirects
-timeouts
-range requests
-conditional requests
-content limits
-DNS caching
-TLS reuse
-```
-
-Keep persistent clients.
-
-Do not establish a fresh TLS connection for every page.
+| # | Invariant | Where |
+| --- | --- | --- |
+| I-1 | The index never stores the article | `crates/indexer/src/schema.rs` (no `body` field), test `all_docs_...: body == ""` |
+| I-2 | A schema change ships with a rebuild | `_schema_hash` guard + `scripts/rebuild-fleet-index.sh` |
+| I-3 | `body` is never passed off as a document | `Pipeline::all_docs` leaves it empty and counts the misses |
+| I-4 | Every association names its model; a rebuild purges its own version first | `doc_feature`/`doc_concept` columns; `concepts build --rebuild` |
+| I-5 | Direct and inferred never merge | `doc_concept.relation_kind` in the primary key |
+| I-6 | No byte-offset slicing of text | `excerpt_of`, prefix compares, stemmers (asserted with a CJK/Russian test) |
+| I-7 | The online path calls no LLM, scans no corpus, reads no article, traverses no unbounded graph | engine budgets, `lane_hint`, `doc_by_id` cost rules |
+| I-8 | A weight-0 lane costs nothing | `LaneSearcher::lane_hint` |
+| I-9 | Federation reports a non-zero generation and never overstates freshness | `FederatedSearcher::manifest` |
+| I-10 | A concept covering >20% of the corpus is downweighted, never deleted | ubiquity suppression in `concept_tag` |
 
 ---
 
-# 18. Conditional Refresh
+## 12. Implementation status
 
-Store:
+Honest, by layer. "Partial" means it exists for some roots or some paths only.
 
-```text
-ETag
-Last-Modified
-```
-
-On refresh:
-
-```text
-If-None-Match
-If-Modified-Since
-```
-
-HTTP conditional requests let the crawler validate cached resources without retransmitting unchanged content.
-
-Response:
-
-```text
-304
-→ unchanged
-→ update timestamp
-→ no parsing/indexing required
-```
-
-This becomes extremely important for hot sources.
+| Capability | State | Evidence |
+| --- | --- | --- |
+| Identity, migration ledger, watermark, tombstones | **done** | 8 migrations on all roots |
+| Excerpt-only index (IM-3) | **done**, all 5 roots | 1,557,504 docs, 1.71 GB |
+| Rebuild fidelity (`document_derived`) | **done**, migration 9 on all roots | new ingests persist headings/entities; pre-existing documents stay empty until re-crawled |
+| `/read` resolution incl. federation | **done** | live 15,375-char read of a shard doc |
+| Dense vectors | **done**, 1.39M docs | 2.14 GB across 5 roots |
+| Feature encoder + postings + forward index | **done**, weight 0.0 | 22.2M rows, 180 MB postings |
+| Concept matrix M3/M4 | **done**, weight 0.0 | 885,364 / 1,892,440 rows, 15 concepts |
+| Concept vocabulary breadth | **weak** | 15 concepts over 1.56M docs; a lexicon, not a taxonomy |
+| Concept graph M5 | **absent** | 0 rows |
+| Source profiles M6 | **absent** | 0 rows |
+| Link graph (`web_link`) | **absent** | 0 rows; raw HTML no longer retained, so it is only recoverable from a re-crawl |
+| Passage layer | **absent** | 0 rows |
+| Router, rerank | **built, off** | flags + tests |
+| Query planner / answers | **opt-in** | `SEARCH_PLANNER_ENABLED=1`, answers off |
+| Cross-disciplinary set at usable size | **absent** | n=6 |
+| Distributed index | **absent, by design** | single node |
 
 ---
 
-# 19. Response Router
+## 13. Operations
 
-After receiving headers, route by MIME type before reading/processing unnecessarily.
+### 13.1 Deploy
 
-```text
-text/html
-→ HTML
-
-application/pdf
-→ PDF
-
-application/json
-→ JSON
-
-application/xml
-text/xml
-→ XML
-
-application/rss+xml
-→ FEED
-
-application/atom+xml
-→ FEED
-
-image/*
-→ IMAGE
-
-text/plain
-→ TEXT
-
-application/zip
-→ ARCHIVE policy
-
-other
-→ FILE policy
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo test -p search-indexer -p search-agent0 -p search-api -p search-engine -p search-features
+cargo build --release -p search-agent0          # default features include bge
+cp /opt/search/bin/agent0 /opt/search/bin/agent0.rollback-$(date +%Y%m%d-%H%M)
+install -m 0755 target/release/agent0 /opt/search/bin/agent0
+systemctl restart search-api && curl -s http://127.0.0.1:8090/health
 ```
 
-Large unknown files should be rejected or range-probed before full download.
+### 13.2 Rebuild an index (required with any schema change)
+
+`scripts/rebuild-fleet-index.sh` under `systemd-run` (a plain tool-call process is OOM-killed at
+~4 GB). It stops the crawlers and the API, moves each `tantivy/` to `tantivy.fulltext-<ts>`, rebuilds
+from metadata + text, restarts both. Measured 12.1 min for the fleet.
+
+### 13.3 Measurement hygiene
+
+* `systemctl show search-api -p Environment` must agree with the weights this document claims;
+  drop-ins are additive and a stale `fusion.conf` silently overrode a measured 0.0 once.
+* `eval run` must use `--mode fast` and federate exactly as `serve` does.
+* Quote a rate with its window and contention, and a storage number with the root it was measured on.
+
+### 13.4 Monitoring signals that actually distinguish states
+
+| Signal | Healthy | Failure it exposes |
+| --- | --- | --- |
+| ingest count per 10 min per shard | > 0 | alive-but-idle crawler (lock zombie, rate-limit starvation) |
+| `generation` across shards | advancing | nothing is being published |
+| shard log mtime | recent | a crawler spinning at 99% CPU with a frozen log |
+| `doc_count` vs `document_version` | equal (minus textless) | index behind the corpus |
+| lane `docs=N` at startup | matches corpus | lane built on one root, served from another |
 
 ---
 
-# 20. HTML Route
-
-Normal path:
-
-```text
-HTTP
- ↓
-HTML
- ↓
-metadata/layout analysis
- ↓
-normalized document
- ↓
-links
- ↓
-new candidates
-```
-
-If meaningful content appears in static HTML:
-
-```text
-DONE
-```
-
-If the response is clearly an empty JavaScript shell:
-
-```text
-SEND_TO_BROWSER_QUEUE
-```
-
----
-
-# 21. Browser Queue
-
-Browser rendering is an escalation path, not the default.
-
-```text
-STATIC_FETCH
- ↓
-insufficient?
- ↓ yes
-BROWSER_QUEUE
-```
-
-Run:
-
-```text
-persistent Chromium
-```
-
-with short-lived isolated browser contexts.
-
-Playwright BrowserContexts are isolated sessions and can be created within one running browser without requiring one browser process per page.
-
-Set limits:
-
-```text
-max browser time
-max network requests
-block ads/analytics
-block fonts where safe
-block video
-optional block images
-max DOM size
-```
-
-Once DOM/data is obtained:
-
-```text
-close context
-```
-
-Never keep browser state unless a source adapter specifically requires it.
-
----
-
-# 22. Network Interception for JS Sites
-
-Sometimes the HTML is useless but the page itself calls:
-
-```text
-/api/articles
-/graphql
-/api/search
-```
-
-During browser rendering, observe network responses.
-
-If a clean data endpoint is discovered:
-
-```text
-Browser page
-     ↓ discovers
-JSON endpoint
-     ↓
-register endpoint pattern
-```
-
-Future fetches can potentially bypass rendering:
-
-```text
-HTTP → JSON
-```
-
-This is an important optimization.
-
----
-
-# 23. PDFs
-
-A PDF resource goes through:
-
-```text
-PDF discovered
- ↓
-size check
- ↓
-hash/check duplicate
- ↓
-text-layer test
- ↓
-document type classifier
-```
-
-For scientific documents:
-
-```text
-GROBID
-```
-
-GROBID is explicitly designed to transform scholarly PDFs into structured TEI and extracts bibliographic information including title, abstract, authors, affiliations, keywords, references, and document structure.
-
-Generic PDFs can use:
-
-```text
-PDF text parser
-```
-
-Scanned PDFs:
-
-```text
-OCR queue
-```
-
-but OCR only when document value warrants it.
-
----
-
-# 24. Research Paper Pipeline
-
-Discovery methods:
-
-```text
-DOI
-arXiv ID
-OAI-PMH
-sitemap
-citation
-repository
-OpenAlex
-links
-Common Crawl
-```
-
-Identity:
-
-```text
-DOI
-arXiv
-PMID/PMCID
-repository IDs
-title+author fallback
-```
-
-A paper can have several locations:
-
-```text
-publisher
-preprint
-repository
-author copy
-```
-
-OpenAlex uses essentially this location→work model and resolves many copies into one scholarly work.
-
-Our crawler should do:
-
-```text
-LOCATION
-  ↓
-WORK RESOLUTION
-  ↓
-WorkID
-```
-
-not index every copy as a separate paper.
-
----
-
-# 25. OAI-PMH Repositories
-
-Support OAI-PMH as a first-class adapter.
-
-OAI-PMH is specifically designed for metadata harvesting between repositories and service providers and exposes six standardized HTTP operations.
-
-Adapter:
-
-```text
-Identify
- ↓
-ListMetadataFormats
- ↓
-ListSets
- ↓
-ListRecords
- ↓
-follow resumptionToken
-```
-
-Store checkpoints:
-
-```text
-repository
-metadataPrefix
-set
-last_datestamp
-resumption_token
-```
-
-This allows incremental scholarly/library harvesting.
-
----
-
-# 26. Books and Libraries
-
-Book discovery:
-
-```text
-ISBN
-library dumps
-OAI
-catalog pages
-Open Library IDs
-archive IDs
-publisher catalogs
-```
-
-Use:
-
-```text
-Work
-  ├ editions
-  ├ authors
-  └ locations
-```
-
-instead of treating every edition as unrelated.
-
-Open Library publishes monthly works, editions and authors dumps specifically for bulk processing; current public dumps are multi-gigabyte but manageable for builder infrastructure.
-
-Crawler behavior:
-
-```text
-catalog metadata
-→ index
-
-public/open full text
-→ optionally process
-
-restricted full text
-→ location only
-```
-
----
-
-# 27. Archives
-
-Archives need a two-level architecture.
-
-```text
-ARCHIVE ITEM
-     │
-     ├ metadata
-     └ files[]
-```
-
-Do not immediately fetch all files.
-
-Create resource children:
-
-```text
-item
-├ PDF
-├ EPUB
-├ TXT
-├ images
-└ metadata XML
-```
-
-Prioritize preferred representations:
-
-```text
-structured text
-> EPUB
-> searchable PDF
-> scanned PDF
-> images
-```
-
-depending on the task.
-
----
-
-# 28. Git and Software Repositories
-
-Treat repositories specially.
-
-Logical resources:
-
-```text
-repository
-README
-releases
-tags
-issues
-discussions
-pull requests
-documentation
-package metadata
-```
-
-Do not clone all Git history during ordinary crawling.
-
-Use repository pages/APIs/dumps where allowed.
-
-GitHub's REST infrastructure has explicit rate limits, including separate treatment for search operations, so adapter scheduling must understand provider-specific quotas instead of treating it like an ordinary website.
-
-For known repositories:
-
-```text
-repo activity observed
- ↓
-release/tag changed?
- ↓
-fetch new relevant objects
-```
-
----
-
-# 29. Forums
-
-Forum crawler detects structures:
-
-```text
-forum
-  ↓
-category
-  ↓
-thread
-  ↓
-pages/replies
-```
-
-Frontier policy differs from news:
-
-```text
-new/high-quality thread
-→ high
-
-page 87 of old low-value thread
-→ low
-```
-
-Watch:
-
-```text
-thread updated timestamp
-reply count
-last post date
-```
-
-so active technical discussions are refreshed while dead threads remain cold.
-
----
-
-# 30. News and Blogs
-
-Discovery priority:
-
-```text
-RSS/Atom
- ↓
-news sitemap
- ↓
-normal sitemap
- ↓
-section pages
- ↓
-internal links
-```
-
-Hot news sources should be feed-driven rather than continuously recrawling entire sites.
-
-Store a `publication cadence` model:
-
-```text
-articles/hour
-articles/day
-usual publishing hours
-feed delay
-sitemap delay
-```
-
-Use it to estimate the next check.
-
----
-
-# 31. Documentation Sites
-
-Docs sites usually contain:
-
-```text
-versioned trees
-navigation hierarchy
-sitemaps
-internal TOCs
-```
-
-Crawler learns:
-
-```text
-/docs/v1/
-/docs/v2/
-/docs/latest/
-```
-
-and creates source clusters by version.
-
-Avoid indexing duplicate:
-
-```text
-/latest/
-```
-
-and:
-
-```text
-/v3.5/
-```
-
-as independent content when they are identical.
-
-Canonical/version relationships should be recorded.
-
----
-
-# 32. APIs / JSON / XML
-
-If a public data endpoint is discovered and permitted:
-
-```text
-endpoint
- ↓
-schema fingerprint
- ↓
-pagination strategy
- ↓
-incremental strategy
-```
-
-Possible pagination:
-
-```text
-page=
-offset=
-cursor=
-next URL
-continuation token
-```
-
-Store checkpoint state.
-
-The generic crawler should know:
-
-```text
-collection endpoint
-```
-
-versus:
-
-```text
-single-object endpoint
-```
-
-to prevent infinite enumeration.
-
----
-
-# 33. S3/Object Storage/Public Datasets
-
-If a source exposes directory manifests or index files:
-
-```text
-manifest
- ↓
-objects
-```
-
-do not list/download blindly.
-
-Create lightweight resource records first.
-
-Use:
-
-```text
-size
-last modified
-content type
-checksum
-```
-
-to decide what is useful.
-
-Large dataset files can remain pointers unless a specialized importer exists.
-
----
-
-# 34. Images
-
-Images are normally secondary objects.
-
-Store:
-
-```text
-URL
-mime
-dimensions
-alt text
-caption
-parent document
-hash
-```
-
-Do not download every full-resolution image.
-
-Fetch image bytes when:
-
-```text
-image search requested
-vision analysis requested
-diagram/chart important
-OCR required
-```
-
-Use thumbnails or image hashing where useful.
-
----
-
-# 35. Video/Audio
-
-MVP should mostly store:
-
-```text
-metadata
-title
-description
-captions/transcripts if legitimately available
-duration
-source
-```
-
-not giant media files.
-
-Full media downloading is outside the normal search-crawl path.
-
----
-
-# 36. Canonical Content Deduplication
-
-After processing:
-
-```text
-exact_hash
-```
-
-checks exact duplicates.
-
-Then:
-
-```text
-SimHash / MinHash / shingles
-```
-
-detect near duplicates.
-
-Example:
-
-```text
-publisher article
-syndicated article
-printer view
-AMP page
-tracking URL
-```
-
-may collapse into:
-
-```text
-ContentID 99127
-```
-
-while retaining all source URLs.
-
----
-
-# 37. Link Extraction
-
-Links are not merely crawl candidates.
-
-Classify them.
-
-```text
-INTERNAL_NAVIGATION
-RELATED_CONTENT
-CITATION
-DOWNLOAD
-AUTHOR
-CANONICAL
-NEXT_PAGE
-PREVIOUS_PAGE
-TAG
-CATEGORY
-EXTERNAL_REFERENCE
-SOCIAL
-ADVERTISEMENT
-LOGIN
-```
-
-Only useful link types enter the frontier.
-
-Citation edges enter the knowledge graph even when their URL is already known.
-
----
-
-# 38. Discovery Feedback
-
-Every successful fetch can produce:
-
-```text
-new domains
-new sources
-new feeds
-new sitemaps
-new works
-new entities
-new URL patterns
-```
-
-Therefore:
-
-```text
-FETCH
- ↓
-DISCOVER
- ↓
-FRONTIER
- ↓
-FETCH
-```
-
-is self-expanding.
-
----
-
-# 39. Freshness Scheduler
-
-Every SourceID learns a change model.
-
-```text
-FreshnessModel {
-    mean_change_interval
-    variance
-
-    recent_change_rate
-
-    feed_available
-    sitemap_lastmod_quality
-
-    conditional_request_support
-
-    demand_score
-
-    importance
-}
-```
-
-Then estimate:
-
-```text
-next_check =
-f(change_rate,
-  importance,
-  demand,
-  freshness_requirements)
-```
-
-Examples:
-
-```text
-breaking news       minutes
-crypto news         minutes
-GitHub releases     hours
-API pricing         hours/days
-documentation       days
-old research PDF    months
-book metadata       months
-```
-
-`Last-Modified` and ETags allow inexpensive validation of known resources.
-
----
-
-# 40. Query-Driven Freshness
-
-The background crawler cannot make everything fresh.
-
-Search queries can create crawl jobs.
-
-Example:
-
-```text
-query:
-"Ethereum news today"
-
- ↓
-
-search engine activates:
-crypto / Ethereum source cluster
-
- ↓
-
-FreshnessScheduler sees:
-sources stale for query requirement
-
- ↓
-
-URGENT_REFRESH jobs
-```
-
-These jobs outrank background crawling.
-
-So the scheduler has queues:
-
-```text
-P0 QUERY CRITICAL
-P1 HOT UPDATES
-P2 NORMAL REFRESH
-P3 DISCOVERY
-P4 ARCHIVAL/BACKFILL
-```
-
----
-
-# 41. Crawler Budget Model
-
-Every fetch carries an estimated cost:
-
-```text
-network bytes
-CPU parse time
-browser cost
-OCR cost
-storage cost
-```
-
-and value:
-
-```text
-query demand
-source quality
-freshness
-novelty
-graph importance
-```
-
-Calculate:
-
-```text
-crawl_value =
-expected_value / expected_cost
-```
-
-This prevents:
-
-```text
-100 MB PDF with low value
-```
-
-from outranking:
-
-```text
-30 KB high-value release page
-```
-
-without good reason.
-
----
-
-# 42. Failure Handling
-
-Classify errors.
-
-```text
-DNS
-connection
-TLS
-timeout
-429
-403
-404
-410
-500
-503
-parsing
-browser
-oversized
-unsupported
-robots
-```
-
-Each has different behavior.
-
-Example:
-
-```text
-404
-→ don't retry soon
-
-410
-→ mark deleted
-
-429
-→ obey Retry-After / slow origin
-
-500
-→ exponential retry
-
-timeout
-→ limited retries
-
-403
-→ don't continuously hammer
-
-robots denied
-→ blocked
-```
-
----
-
-# 43. Retry Policy
-
-Use exponential backoff with jitter.
-
-Conceptually:
-
-```text
-retry =
-base × 2^attempt + jitter
-```
-
-but respect:
-
-```text
-Retry-After
-```
-
-when present.
-
-Put retry scheduling into the frontier, not sleeping worker threads.
-
----
-
-# 44. Deletion Detection
-
-Resources disappear.
-
-If previously indexed URL now gives:
-
-```text
-404
-410
-```
-
-record:
-
-```text
-deleted_at
-```
-
-Do not immediately erase search history.
-
-Mark:
-
-```text
-ACTIVE
-STALE
-DELETED
-ARCHIVED
-```
-
-Historical results may still matter.
-
----
-
-# 45. Security Boundary
-
-Fetched web content is untrusted.
-
-Crawler workers must not have unrestricted network access.
-
-Block:
-
-```text
-127.0.0.0/8
-private RFC1918 networks
-link local
-cloud metadata IPs
-Unix sockets
-file://
-internal service names
-```
-
-unless explicitly required.
-
-This prevents SSRF.
-
----
-
-# 46. Resource Limits
-
-Every job has:
-
-```text
-max_response_bytes
-max_decompressed_bytes
-max_redirects
-max_parse_time
-max_browser_time
-max_dom_nodes
-max_pdf_pages
-max_archive_expansion
-```
-
-Never trust remote `Content-Length` alone.
-
----
-
-# 47. Archive Bomb Protection
-
-For:
-
-```text
-ZIP
-gzip
-tar
-```
-
-check:
-
-```text
-compressed size
-declared expanded size
-file count
-compression ratio
-nested depth
-```
-
-before expanding.
-
-Large archives go to specialized dataset workers, not generic extraction.
-
----
-
-# 48. Storage Tiers
-
-### Tier 0 — Discovery
-
-```text
-URL
-source
-type guess
-priority
-lastmod
-```
-
-### Tier 1 — Indexed metadata
-
-```text
-title
-description/abstract
-date
-entities
-topics
-links
-```
-
-### Tier 2 — Extracted content
-
-```text
-normalized content blocks
-```
-
-### Tier 3 — Raw cache
-
-```text
-HTML
-PDF
-JSON
-etc.
-```
-
-Raw cache should have short TTL unless particularly valuable.
-
----
-
-# 49. Cache Types
-
-Maintain:
-
-```text
-DNS cache
-robots cache
-HTTP body cache
-parsed document cache
-browser result cache
-sitemap cache
-feed cache
-entity/source cache
-```
-
-Each has its own TTL.
-
----
-
-# 50. Distributed Architecture
-
-Even if the MVP runs on one machine, design job ownership for later distribution.
-
-```text
-                    COORDINATOR
-                         │
-             ┌───────────┼───────────┐
-             ▼           ▼           ▼
-         scheduler    registry     frontier
-                         │
-      ┌──────────────────┼──────────────────┐
-      ▼                  ▼                  ▼
- HTTP workers        PDF workers       Browser workers
-      │                  │                  │
-      └──────────────────┼──────────────────┘
-                         ▼
-                    result queue
-                         │
-                         ▼
-                      indexer
-```
-
-Workers should be stateless where possible.
-
----
-
-# 51. MVP Single-Server Layout
-
-On the current 16-vCPU / 64-GB server:
-
-```text
-crawler-api
-scheduler
-frontier-db
-source-registry
-
-HTTP workers          32–64 async tasks
-parser workers        4–8
-PDF workers           2–4
-browser contexts      2
-index workers         2–4
-```
-
-Those are starting values, not fixed production values.
-
-The important distinction is:
-
-```text
-HTTP concurrency
-≠
-CPU worker count
-```
-
-Async fetches can greatly outnumber CPUs.
-
----
-
-# 52. Database Responsibilities
-
-Use separate logical stores.
-
-```text
-Metadata DB
-───────────
-domains
-sources
-resources
-crawl state
-freshness
-
-Frontier
-────────
-priority jobs
-
-Search index
-────────────
-documents
-titles
-abstracts
-
-Graph
-─────
-links
-entities
-concepts
-works
-
-Blob cache
-──────────
-temporary/raw content
-```
-
-Avoid forcing all workloads through one database.
-
----
-
-# 53. Event Architecture
-
-Every component communicates through events.
-
-```text
-DOMAIN_DISCOVERED
-
-RESOURCE_DISCOVERED
-
-RESOURCE_FETCHED
-
-RESOURCE_UNCHANGED
-
-RESOURCE_FAILED
-
-DOCUMENT_PARSED
-
-WORK_RESOLVED
-
-SOURCE_DISCOVERED
-
-LINK_DISCOVERED
-
-CONTENT_CHANGED
-
-RESOURCE_DELETED
-```
-
-For example:
-
-```text
-RESOURCE_FETCHED
-    │
-    ├→ parser
-    ├→ cache metrics
-    └→ freshness model
-```
-
-This makes later distributed scaling much easier.
-
----
-
-# 54. Specialized Adapters
-
-The core remains generic, but adapters improve high-value sources.
-
-```text
-GenericWebAdapter
-SitemapAdapter
-FeedAdapter
-OAIAdapter
-ArxivAdapter
-GitHubAdapter
-OpenLibraryAdapter
-ArchiveAdapter
-ScholarlyPDFAdapter
-JavaScriptSiteAdapter
-```
-
-An adapter does **not** replace the crawler.
-
-It supplies things like:
-
-```text
-discovery rules
-identity rules
-pagination
-freshness hints
-preferred representations
-```
-
----
-
-# 55. Adapter Interface
-
-Conceptually:
-
-```text
-SourceAdapter {
-    matches(url/source)
-
-    discover(source)
-
-    canonicalize(resource)
-
-    fetch_strategy(resource)
-
-    identify(resource)
-
-    child_resources(document)
-
-    refresh_strategy(source)
-}
-```
-
-If no adapter matches:
-
-```text
-GenericWebAdapter
-```
-
-handles it.
-
----
-
-# 56. Source Learning
-
-The crawler should gradually learn source behavior.
-
-For every source record:
-
-```text
-static_success_rate
-browser_success_rate
-
-useful_document_ratio
-
-duplicate_ratio
-
-average_document_value
-
-changes_per_day
-
-feed_delay
-
-sitemap_accuracy
-
-query_success_rate
-```
-
-Example:
-
-```text
-Site A:
-95% static HTML success
-→ stop trying browser
-
-Site B:
-90% empty HTML but browser succeeds
-→ route straight to browser
-
-Site C:
-RSS finds updates faster than sitemap
-→ prioritize RSS
-```
-
-This removes wasted work.
-
----
-
-# 57. URL Pattern Learning
-
-Likewise:
-
-```text
-/docs/*
-→ useful 98%
-
-/tag/*
-→ useful 12%
-
-/author/*
-→ useful 10%
-
-/article/*
-→ useful 95%
-
-/calendar/*
-→ crawl trap
-```
-
-The frontier automatically learns priorities by template.
-
----
-
-# 58. Query-Demand Learning
-
-If users frequently search:
-
-```text
-crypto
-LLM releases
-PyTorch
-CUDA
-```
-
-increase:
-
-```text
-source crawl budget
-refresh frequency
-content cache duration
-```
-
-for related sources.
-
-Therefore crawling evolves according to actual agent demand.
-
----
-
-# 59. Bootstrap Strategy
-
-The crawler should start in stages.
-
-```text
-PHASE 1
-manual/high-quality seeds
-
-PHASE 2
-sitemaps + feeds
-
-PHASE 3
-outgoing links
-
-PHASE 4
-open dataset imports
-
-PHASE 5
-Common Crawl discovery
-
-PHASE 6
-query-driven expansion
-```
-
-Do not immediately dump millions of random domains into the frontier.
-
----
-
-# 60. Data Lifecycle
-
-A resource progresses through:
-
-```text
-DISCOVERED
-    ↓
-SCORED
-    ↓
-QUEUED
-    ↓
-FETCHED
-    ↓
-CLASSIFIED
-    ↓
-INDEXED
-    ↓
-MONITORED
-    ↓
-REFRESHED
-    ↓
-STALE / DELETED
-```
-
-Or:
-
-```text
-DISCOVERED
-    ↓
-LOW VALUE
-    ↓
-METADATA ONLY
-```
-
-Not everything must become a fetched/indexed document.
-
----
-
-# 61. Complete Crawl Algorithm
-
-```text
-while running:
-
-    process discovery events
-
-    update frontier priorities
-
-    for each available origin:
-
-        if origin.next_allowed > now:
-            continue
-
-        job = frontier.best_eligible(origin)
-
-        if no job:
-            continue
-
-        if !robots.allow(job.url):
-            mark_blocked(job)
-            continue
-
-        dispatch(job)
-
-    for each fetch result:
-
-        update_origin_statistics()
-
-        if unchanged:
-            schedule_next_refresh()
-            continue
-
-        if failed:
-            apply_failure_policy()
-            continue
-
-        route_by_content_type()
-
-        normalize_document()
-
-        resolve_identity()
-
-        deduplicate()
-
-        send_to_index()
-
-        update_graph()
-
-        discover_links()
-
-        discover_feeds()
-
-        discover_sitemaps()
-
-        add_new_resources_to_frontier()
-
-        update_source_statistics()
-
-        calculate_next_refresh()
-```
-
----
-
-# 62. Full Architecture
-
-```text
-                             SEEDS
-                               │
-     ┌─────────────────────────┼──────────────────────────┐
-     ▼                         ▼                          ▼
- OPEN DATASETS              LINKS                   USER/AGENT
-     │                         │                          │
-     └─────────────────────────┼──────────────────────────┘
-                               ▼
-                       DISCOVERY ENGINE
-                               │
-                               ▼
-                         SOURCE REGISTRY
-                               │
-                               ▼
-                       RESOURCE FRONTIER
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-                  robots              scheduler
-                    │                     │
-                    └──────────┬──────────┘
-                               ▼
-                          FETCH ROUTER
-                               │
-       ┌───────────────┬───────┼────────┬───────────────┐
-       ▼               ▼       ▼        ▼               ▼
-      HTTP           Browser   PDF    Structured      Archive
-       │               │       │        │               │
-       └───────────────┴───────┼────────┴───────────────┘
-                               ▼
-                        CONTENT ROUTER
-                               │
-                               ▼
-                       NORMALIZED OBJECT
-                               │
-              ┌────────────────┼───────────────────┐
-              ▼                ▼                   ▼
-            INDEX             GRAPH            CACHE/BLOBS
-              │                │
-              │                ▼
-              │           NEW DISCOVERY
-              │                │
-              │                └──────► FRONTIER
-              │
-              ▼
-                         SEARCH ENGINE
-                              │
-                              ▼
-                          USER QUERY
-                              │
-                     freshness needed?
-                        /           \
-                      no             yes
-                      │               │
-                      │        PRIORITY CRAWL JOB
-                      │               │
-                      └───────┬───────┘
-                              ▼
-                           RESULTS
-```
-
----
-
-# 63. Guiding Rule
-
-The crawler should not ask:
-
-> **“Can I download this?”**
-
-It should ask:
-
-> **“How much will knowing or refreshing this resource improve search?”**
-
-That distinction determines whether the project becomes a useful search engine or merely a huge web archive.
-
-For ordinary pages we may store the extracted content. For papers we may store title + abstract + locations. For books we may keep metadata. For a dynamic price page we may refresh frequently. For an old PDF we may only keep the URL. For a JavaScript dashboard we may discover the underlying data endpoint and stop using Chromium.
-
-The crawler therefore becomes a **resource-allocation engine**, not simply a downloader.
+## 14. What would change this architecture
+
+Named so the design is falsifiable:
+
+1. **Sparse features beat BM25 on a 50-case cross-disciplinary set** → give them weight, enable the
+   router, and the index-of-associations claim becomes measured rather than asserted.
+2. **Dense recovers recall the sparse vocabulary misses** → then, and only then, evaluate an MRL
+   teacher and compressed vectors (§10 of the original design).
+3. **A single node cannot hold the corpus** → partitioned posting lists and a coordinator; today
+   1.56M documents occupy 1.7 GB of index and 2.2 GB of vectors on one host.
+4. **Source-level retrieval is requested** → build `source_concept` from `doc_concept` normalised by
+   `doc_count`, not by summing article weights.

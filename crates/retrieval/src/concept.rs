@@ -39,6 +39,10 @@ const INFERRED_FACTOR: f32 = 0.5;
 /// hundreds of concepts cannot dominate merely by being broad.
 const MAX_CONCEPTS_PER_DOC: usize = 32;
 
+/// Query concepts after expansion. Bounded so a hub concept cannot turn into a corpus scan, and so
+/// the score stays explainable: every contribution is one row of `doc_concept`.
+const MAX_QUERY_CONCEPTS: usize = 12;
+
 /// How much each dimension of `R(d,c)` counts for a particular query (v2 §6).
 ///
 /// v2 §6's example: a query about *chemical processes involved in romance* should emphasise the
@@ -83,6 +87,21 @@ impl DimensionWeights {
         }
     }
 
+    /// Dimensions for a query: a how/why question emphasises mechanism, a topic question direct
+    /// coverage. This is a rule over the query's *shape*, not a learned model — the honest first
+    /// version, and it is measurable against the plain default.
+    pub fn mechanic_if_asked(query: &str) -> Self {
+        let q = query.to_ascii_lowercase();
+        let asks_mechanism = ["how ", "why ", "mechanism", "cause", "effect of", "because"]
+            .iter()
+            .any(|m| q.contains(m));
+        if asks_mechanism {
+            Self::mechanism_focused()
+        } else {
+            Self::default()
+        }
+    }
+
     /// Weighted combination, normalised so the result stays in the range a scalar weight occupies
     /// and fused scores remain comparable across lanes.
     fn score(&self, direct: f64, contextual: f64, mechanism: f64) -> f32 {
@@ -97,22 +116,58 @@ impl DimensionWeights {
     }
 }
 
+/// How strongly a related concept contributes relative to a concept the query named directly.
+///
+/// Below 1.0 on purpose: a neighbour is evidence, not a statement. `0.4` means a document tagged
+/// only with a neighbour of a query concept scores at most 40% of a document tagged with the
+/// concept itself, so expansion can reorder candidates but cannot outvote direct support.
+pub const DEFAULT_EXPANSION_LAMBDA: f32 = 0.4;
+
+/// Query concepts after expansion: `(concept_id, weight)`, best first.
+pub type WeightedConcepts = Vec<(String, f32)>;
+
 /// The lane's read side: the metadata database, opened once.
 pub struct ConceptLane {
     db_path: PathBuf,
     /// Concepts to return per query term before scoring, bounded to keep one broad concept from
     /// pulling the whole corpus.
     per_concept_limit: usize,
+    /// Concept → related concepts with strength, from `concept_relation` (`cooccur` edges).
+    relations: HashMap<String, Vec<(String, f32)>>,
+    /// Concept → inverse document frequency, so a concept present on a third of the corpus cannot
+    /// dominate a score the way a rare one should.
+    idf: HashMap<String, f32>,
+    /// Expansion strength; 0.0 disables the graph without rebuilding the lane.
+    expansion: f32,
 }
 
 impl ConceptLane {
     /// A lane over `db_path`. The path is stored rather than a connection because the lane must be
     /// `Send + Sync` and is used across threads; SQLite connections are opened per call.
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
+        let db_path = db_path.into();
+        let (relations, idf) = load_graph(&db_path).unwrap_or_default();
         Self {
-            db_path: db_path.into(),
+            db_path,
             per_concept_limit: 2_000,
+            relations,
+            idf,
+            expansion: DEFAULT_EXPANSION_LAMBDA,
         }
+    }
+
+    /// Override the expansion strength (`0.0` disables graph expansion).
+    pub fn with_expansion(mut self, lambda: f32) -> Self {
+        self.expansion = lambda.max(0.0);
+        self
+    }
+
+    /// Concepts related to `concept`, with normalised strength.
+    pub fn related(&self, concept: &str) -> &[(String, f32)] {
+        self.relations
+            .get(concept)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Override how many documents one concept may contribute per query.
@@ -250,6 +305,57 @@ impl ConceptLane {
         self.documents_for_dimensions(concepts, limit, &DimensionWeights::default())
     }
 
+    /// Resolve a query to concepts *and their neighbours*, each with a weight.
+    ///
+    /// This is the part that stops ranking being keyword matching in disguise. The query resolves
+    /// to concepts (by name, alias or stem), then the `concept_relation` graph adds the concepts the
+    /// corpus associates with them at `lambda` of their strength. A query naming `chemistry` can
+    /// therefore reach a page tagged `romance` and `chemistry` even when the page's own words never
+    /// appear in the query — and a page tagged only with a neighbour still scores, at a discount.
+    ///
+    /// Weights are normalised so the strongest concept is 1.0; the list is capped so a hub concept
+    /// cannot expand into the whole vocabulary.
+    pub fn resolve_weighted(&self, query: &str) -> AppResult<WeightedConcepts> {
+        let base = self.concepts_for(query)?;
+        if base.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut weights: HashMap<String, f32> = HashMap::new();
+        for c in &base {
+            weights.insert(c.clone(), 1.0);
+        }
+        if self.expansion > 0.0 {
+            for c in &base {
+                for (neighbour, strength) in self.related(c) {
+                    let w = self.expansion * strength;
+                    let slot = weights.entry(neighbour.clone()).or_insert(0.0);
+                    if w > *slot {
+                        *slot = w;
+                    }
+                }
+            }
+        }
+        let max = weights.values().cloned().fold(0.0f32, f32::max).max(f32::MIN_POSITIVE);
+        let mut out: WeightedConcepts = weights
+            .into_iter()
+            .map(|(c, w)| (c, (w / max).clamp(0.0, 1.0)))
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out.truncate(MAX_QUERY_CONCEPTS);
+        Ok(out)
+    }
+
+    /// Weight of one concept's evidence: its IDF, floored so a concept present on every document
+    /// still carries a little signal rather than none. A ubiquitous concept is downweighted, never
+    /// deleted — deleting it turns a weak answer into no answer.
+    pub fn concept_weight(&self, concept: &str) -> f32 {
+        self.idf.get(concept).copied().unwrap_or(1.0)
+    }
+
     /// Documents weighted for `concepts`, scoring each association's dimensions with `weights`.
     ///
     /// This is the v2 §6 requirement made operational: "When a user searches for chemical processes
@@ -263,6 +369,17 @@ impl ConceptLane {
     pub fn documents_for_dimensions(
         &self,
         concepts: &[String],
+        limit: usize,
+        dim_weights: &DimensionWeights,
+    ) -> AppResult<Vec<(String, f32)>> {
+        let weighted: WeightedConcepts = concepts.iter().map(|c| (c.clone(), 1.0)).collect();
+        self.documents_for_weighted(&weighted, limit, dim_weights)
+    }
+
+    /// Documents weighted for `concepts` with per-concept query weights and concept IDF.
+    pub fn documents_for_weighted(
+        &self,
+        concepts: &[(String, f32)],
         limit: usize,
         dim_weights: &DimensionWeights,
     ) -> AppResult<Vec<(String, f32)>> {
@@ -295,7 +412,11 @@ impl ConceptLane {
             )
             .map_err(search_metadata::db_err)?;
 
-        for concept in concepts {
+        for (concept, q_weight) in concepts {
+            // Query importance × how specific the concept is. A concept on 32% of the corpus is
+            // real evidence but weak evidence; multiplying by IDF is what stops the broadest
+            // concept from deciding every ranking.
+            let concept_gain = q_weight * self.concept_weight(concept);
             let rows = stmt
                 .query_map(
                     rusqlite::params![concept, self.per_concept_limit as i64],
@@ -331,7 +452,7 @@ impl ConceptLane {
                     (None, None, None) => scalar as f32,
                     _ => dim_weights.score(r1.unwrap_or(0.0), r2.unwrap_or(0.0), r3.unwrap_or(0.0)),
                 };
-                let contribution = base * factor;
+                let contribution = base * factor * concept_gain;
                 // Sum across concepts: a document weighting both `oxytocin` and `romance` is a
                 // better answer than one weighting either alone, which is the whole point of a
                 // multi-axis matrix.
@@ -347,6 +468,69 @@ impl ConceptLane {
     }
 }
 
+/// Read the relatedness graph and concept IDF from one metadata database.
+///
+/// Both are optional: a corpus tagged before `agent0 concepts relate` ran has no edges, and the lane
+/// then behaves exactly as it did before (aliases only, equal concept weights). Absence of the graph
+/// must degrade the capability, never the correctness of the lane.
+fn load_graph(
+    db_path: &Path,
+) -> AppResult<(HashMap<String, Vec<(String, f32)>>, HashMap<String, f32>)> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| search_core::AppError::Db(format!("concept lane: {e}")))?;
+
+    // Undirected on purpose: if the corpus says chemistry and romance appear together, the
+    // relationship is walkable from either name a query happens to use.
+    let mut relations: HashMap<String, Vec<(String, f32)>> = HashMap::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT src_concept_id, dst_concept_id, strength FROM concept_relation WHERE strength IS NOT NULL")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (a, b, s) = row;
+                let s = s.unwrap_or(0.0) as f32;
+                if !(s.is_finite() && s > 0.0) {
+                    continue;
+                }
+                relations.entry(a.clone()).or_default().push((b.clone(), s));
+                relations.entry(b).or_default().push((a, s));
+            }
+        }
+    }
+    for edges in relations.values_mut() {
+        edges.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        edges.dedup_by(|x, y| x.0 == y.0);
+    }
+
+    // IDF over documents, floored at 0.1. A concept every document carries is weak evidence, not
+    // no evidence: deleting it converts a poor ranking into none, which is worse.
+    let mut idf: HashMap<String, f32> = HashMap::new();
+    let total: i64 = conn
+        .query_row("SELECT COUNT(DISTINCT resource_id) FROM doc_concept", [], |r| r.get(0))
+        .unwrap_or(0);
+    if total > 0 {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT concept_id, COUNT(DISTINCT resource_id) FROM doc_concept GROUP BY concept_id")
+        {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (concept, df) in rows.flatten() {
+                    let v = 1.0 + ((total as f32 + 1.0) / (df as f32 + 1.0)).ln();
+                    idf.insert(concept, v.max(0.1));
+                }
+            }
+        }
+    }
+    Ok((relations, idf))
+}
+
 impl LaneSearcher for ConceptLane {
     fn lane_hint(&self) -> Option<Lane> {
         Some(Lane::Concept)
@@ -360,11 +544,13 @@ impl LaneSearcher for ConceptLane {
         // filtering here would need a join this lane does not do. Fusion re-applies the facet.
         _source_id: Option<&str>,
     ) -> Result<Vec<Candidate>, RetrievalError> {
+        // Resolve to concepts *and their corpus-derived neighbours*, each weighted. The lane's
+        // score is therefore a measure of conceptual relatedness, not of shared words.
         let concepts = self
-            .concepts_for(query)
+            .resolve_weighted(query)
             .map_err(|e| RetrievalError::index(e.to_string()))?;
         let docs = self
-            .documents_for(&concepts, limit)
+            .documents_for_weighted(&concepts, limit, &DimensionWeights::mechanic_if_asked(query))
             .map_err(|e| RetrievalError::index(e.to_string()))?;
         Ok(docs
             .into_iter()
@@ -588,6 +774,48 @@ mod tests {
             "a stated association beats an inferred one at equal weight: {hits:?}"
         );
         assert!(hits[0].score > hits[1].score);
+    }
+
+    /// A concept the query named reaches documents tagged only with a *related* concept, at a
+    /// discount — the behaviour that makes this more than keyword search over concept names.
+    #[test]
+    fn a_related_concept_extends_the_candidate_set() {
+        let (dir, lane) = corpus(&[
+            ("direct-doc", "c-love", 0.9, "direct"),
+            ("neighbour-doc", "c-oxytocin", 0.8, "direct"),
+        ]);
+        // No edge yet: the query cannot leave `romance`.
+        assert_eq!(lane.related("c-love").len(), 0);
+        let before = lane.search("romance", 10, None).unwrap();
+        assert_eq!(before.len(), 1, "only the directly tagged doc: {before:?}");
+
+        // Add the corpus-derived edge, then rebuild the lane so it loads the graph.
+        let path = dir.path().join("meta.sqlite");
+        {
+            let mut w = MetadataWriter::from_path(&path).unwrap();
+            w.apply_batch(&[Mutation::UpsertConceptRelation {
+                src_concept_id: "c-love".into(),
+                dst_concept_id: "c-oxytocin".into(),
+                relation: "cooccur".into(),
+                strength: Some(0.7),
+                model_version: Some("test".into()),
+                at: 1_700_000_000,
+            }])
+            .unwrap();
+        }
+        let lane = ConceptLane::new(&path);
+        assert_eq!(lane.related("c-love").len(), 1, "edge loaded");
+
+        let after = lane.search("romance", 10, None).unwrap();
+        assert_eq!(after.len(), 2, "expansion must reach the neighbour: {after:?}");
+        assert_eq!(
+            after[0].doc_id, "direct-doc",
+            "direct support still outranks a related concept: {after:?}"
+        );
+        assert!(
+            after[1].score < after[0].score,
+            "an expanded concept contributes at a discount: {after:?}"
+        );
     }
 
     /// An alias reaches the concept it belongs to.
