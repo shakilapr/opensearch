@@ -4,7 +4,7 @@
 #
 # A pack is produced by the Stage-6 dataset builder (crate `search-dataset`):
 # a directory of JSONL shards plus `manifest.json` (see crates/dataset/src/pack.rs
-# and docs/DISTRIBUTION.md). This script takes an already-built pack directory,
+# and docs/specs/DISTRIBUTION.md). This script takes an already-built pack directory,
 # re-checks it against its manifest, copies it to dist/packs/<name>/<version>/,
 # and prints the manifest + checksums.
 #

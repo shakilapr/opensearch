@@ -1,6 +1,6 @@
 > **Historical snapshot (2026-10-27).** Kept because it records the state before the semantic
 > layer was built. Do not use it for the current design or current numbers:
-> **`docs/ARCHITECTURE-v2.md`** is normative (2026-11-01) and `docs/EXECUTION-STATUS-v2.md` carries
+> **`docs/ARCHITECTURE.md`** is normative (2026-11-01) and `docs/STATUS.md` carries
 > the measurements.
 
 # Current architecture — what the system actually is
@@ -10,8 +10,8 @@ working tree at commit `dbb5a22`. Every number below was read from the system du
 analysis, not copied from an earlier document. Where a number is a *label-derived* metric (nDCG on
 corpus-derived queries) that is said so.
 
-This supersedes the "where we are" tables in `PLAN-v2.md` and `analysis-next-move.md`. It describes
-what runs; `docs/architecture-update-v2.md` describes what is intended.
+This supersedes the "where we are" tables in `PLAN-v2.md` and `docs/legacy/analysis-next-move.md`. It describes
+what runs; `docs/legacy/architecture-update-v2.md` describes what is intended.
 
 ---
 
@@ -244,7 +244,7 @@ downloaded articles.** The honest reading, which the code supports:
 | link graph | |
 
 Today the system keeps **both**: 4.5 GB of raw HTML and 309 MB of text sit beside the index. The
-deletion pass is planned (`index-upgrade-plan.md`) and **not done** — the shards are being crawled
+deletion pass is planned (`docs/legacy/index-upgrade-plan.md`) and **not done** — the shards are being crawled
 right now, so `raw-dataset/` (49 GB) is a live output directory.
 
 ---

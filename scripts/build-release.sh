@@ -9,7 +9,7 @@
 #
 # There is NO `search-api` binary: the HTTP API is served by `agent0 serve`
 # (crates/api is a library wired in behind the `real-indexer` feature, which
-# crates/agent0 already enables). See docs/DISTRIBUTION.md and deploy/README.md.
+# crates/agent0 already enables). See docs/specs/DISTRIBUTION.md and deploy/README.md.
 #
 # Usage:
 #   scripts/build-release.sh [--out DIR] [--no-verify]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage-1 corpus run: build release `agent0` and crawl the seed list into
-# `raw-dataset/` (the Tier-3 raw blob cache, work-plan.md §Stage 0).
+# `raw-dataset/` (the Tier-3 raw blob cache, docs/legacy/work-plan.md §Stage 0).
 #
 # Idempotent and resumable: the crawl log and the frontier live in `--out`, and
 # every URL with a terminal outcome is skipped on a re-run.

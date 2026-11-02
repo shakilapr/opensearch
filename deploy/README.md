@@ -12,7 +12,7 @@ the nginx front end for the UI + HTTP API.
 | `nginx.conf`             | static UI (`/var/www/search`) + reverse proxy to `127.0.0.1:8080` |
 
 The MCP server (`search-mcp`) is a **stdio** program launched by an MCP client,
-not a daemon, so it has no unit here — see [`../docs/MCP.md`](../docs/MCP.md).
+not a daemon, so it has no unit here — see [`../docs/specs/MCP.md`](../docs/specs/MCP.md).
 
 > **Modular-monolith note.** Today `agent0 serve` is *both* the agent and the
 > HTTP API (there is no separate daemon binary). `search-agent.service` owns
