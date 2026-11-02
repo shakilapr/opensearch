@@ -45,16 +45,12 @@ stop_crawlers() {
 }
 
 start_crawlers() {
+  # Through `start-crawler.sh`, which launches each crawler as its own transient systemd unit.
+  # `nohup ... &` from inside this script does not survive: the script runs under
+  # `systemd-run --wait`, and systemd kills the unit's cgroup when it exits.
   for i in 0 1 2 3; do
-    SEARCH_DATA_DIR="/var/lib/search-fleet/shard-$i" \
-    SEARCH_CRAWL_ORIGIN_INTERVAL_MS=250 \
-    SEARCH_CRAWL_ORIGIN_CAP=250 \
-    SEARCH_MIN_FREE_GB=20 \
-    nohup timeout 86400 "$BIN" crawl "/var/lib/search-fleet/work/shard-$i.txt" \
-      --out "raw-dataset/shard-$i" --max-docs 250000 --max-urls 1000000 \
-      --concurrency 32 --compress \
-      >> "/var/lib/search-fleet/shard-$i.log" 2>&1 &
-    log "shard-$i crawler started pid=$!"
+    bash scripts/start-crawler.sh "$i" >> "$LOG" 2>&1
+    log "shard-$i: $(tail -1 "$LOG")"
   done
 }
 

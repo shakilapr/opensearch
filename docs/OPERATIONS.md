@@ -359,3 +359,23 @@ did **not** reduce writes, and bigger batches trade throughput for a ~13% write 
 remaining ~7x write amplification (13 GB written for a 2 GB index) is merge churn, and fixing it
 needs a merge policy that suppresses background merges during bulk ingest and force-merges once at
 the end — not yet implemented.
+
+## The fleet crawlers run as systemd units
+
+Each shard's crawler is a transient unit, `crawler-shard-N`, not a background shell job:
+
+```bash
+bash scripts/start-crawler.sh 2        # idempotent; starts the unit if the shard is idle
+systemctl status crawler-shard-2
+bash scripts/restart-crawlers.sh       # stop all four, free the duplicate blobs, start all four
+```
+
+Why it matters: a `nohup ./agent0 crawl … &` launched from inside a `systemd-run --wait` job is a
+child of that unit's cgroup, and systemd kills the whole cgroup when the unit exits. On 2026-11-02
+the rebuild script restarted four crawlers that way; all four were dead minutes later, every shard
+idle, and nothing reported it — the process list was simply empty. A crawler that owns its unit
+outlives whatever started it.
+
+Supervision must be liveness-based, not presence-based: check ingest per 10 minutes and the index
+`generation`, not the process count. A crawler can be alive, busy, and publishing nothing (see the
+lock-zombie and rate-limit-starvation cases in the crawl notes).
