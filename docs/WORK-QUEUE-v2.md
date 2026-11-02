@@ -66,18 +66,17 @@ The IM-3 rebuild proved the model, and exposed a gap: `agent0 index build` sets
 entities** — the two fields boosted at 2.0 and 3.0. Search still works; it ranks worse than the
 ingest path would. This track closes that and makes it verifiable.
 
-### A1 — persist headings and entities so a rebuild is lossless (~5 h)
+### A1 — ✅ done: persist headings and entities (migration 0009)
 
-*Why:* rebuilds are now routine (any schema change, any new root), and every rebuild silently drops
-the organising model's headings/entities because they live only in the ingest-time `IndexDoc`.
-*Do:* add a `document_derived` table (or columns on `document_version`) holding `headings` and
-`entities` as written at ingest; write it in `Pipeline::commit_metadata`; read it in
-`agent0 index build`. Migration 0009, additive.
-*Gate:* rebuild one shard; count documents with non-empty headings before/after → equal. Then
-re-measure the 600-case nDCG and report the delta (headings/entities restored should be ≥ the
-current baseline).
-*Risk:* the fleet's existing rows have no stored headings — the first rebuild after this task will
-still be empty for old documents. State that plainly; it fills as pages are re-crawled.
+`document_derived(docver_id, headings, entities)` is written in the same commit as the document and
+read by `agent0 index build`; applied to all five roots. Follow-up, still open:
+
+**A1b — backfill the pre-existing corpus (~6 h).** 1.56M documents have no `document_derived` row.
+Entities can be recovered from the pre-rebuild index (`tantivy.fulltext-<ts>` still holds STORED
+`entities`); headings cannot, because they were indexed-only. Options: (a) recover entities from the
+old index into `document_derived`; (b) re-crawl the top-N documents by inbound link or query traffic.
+Gate: count of documents with non-empty headings before/after, and the 600-case nDCG delta.
+Do not claim the ranking effect is known before measuring it — the title-derived set cannot see it.
 
 ### A2 — `agent0 index audit` (~3 h)
 
@@ -305,7 +304,7 @@ the pack's format version explicit.
 
 | Order | Task | Hours | Why now |
 | --- | --- | --- | --- |
-| 1 | A1 headings/entities persistence | 5 | the rebuild currently loses ranking signal |
+| 1 | A1b backfill headings/entities | 6 | the rebuild left 1.56M documents without them |
 | 2 | A2 index audit | 3 | every later gate needs it |
 | 3 | B1 concept lexicon | 8 | coverage is the matrix's weakest dimension |
 | 4 | C1 encoder on titles | 5 | cheapest path to a non-zero feature weight |

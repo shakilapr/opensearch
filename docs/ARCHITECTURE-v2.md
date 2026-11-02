@@ -77,11 +77,11 @@ derived and rebuildable, and is treated as such by every tool here.
 | --- | --- | --- | --- | --- |
 | L0 identity | domain, resource, document_version, content, sitemap, frontier, fetch journal | `meta/meta.sqlite` per root | 11.7 GB (5 roots) | **yes** |
 | L1 evidence | title, headings, entities, excerpt, doc_type, language, timestamps, ids | Tantivy `tantivy/` | **1,710 MB** | derived from L0 |
-| L2 dense | 384-d unit vectors keyed by resource | `vectors.bin` per root | 2.16 GB, 1.39M docs | derived |
-| L3 sparse features | forward `doc_feature` + inverted `features/postings.bin` | SQLite + file per root | 22.2M rows, 185 MB postings | derived from L2 |
+| L2 dense | 384-d unit vectors keyed by resource | `vectors.bin` per root | 2.14 GB, 1.39M docs | derived |
+| L3 sparse features | forward `doc_feature` + inverted `features/postings.bin` | SQLite + file per root | 22.2M rows, 180 MB postings | derived from L2 |
 | L4 concepts | `concept`, `concept_alias`, `doc_concept`, `doc_concept_dim` | SQLite | 885,364 / 1,892,440 rows, 15 concepts | derived from L1 text |
 | L5 source/graph | `source_concept`, `concept_relation`, `web_link`, `graph_edge`, `entity` | SQLite | mostly **empty** (see §6.5) | derived from L1/L0 |
-| L6 source bytes | extracted text `text/<h2>/<hash>.txt` (raw HTML only if opted in) | filesystem | 17.9 GB | **ingest source** |
+| L6 source bytes | extracted text `text/<h2>/<hash>.txt` (raw HTML only if opted in) | filesystem | 18.2 GB | **ingest source** |
 
 L6 is the only layer that can be deleted, and only after L1–L5 are verified: `text/` is what makes
 `/read`, embedding and graph building possible. Deleting it is a one-way operation
@@ -108,8 +108,8 @@ The rule that made this safe: **a schema edit and its rebuild are one operation.
 field set changes the schema hash, and `Indexer` refuses to open an index whose hash differs — so
 "change the schema" without "rebuild every root" leaves the fleet unreadable, which is exactly what
 forced the revert in `8655408`. `scripts/rebuild-fleet-index.sh` is the atomic form: stop writers →
-move the old directory aside → build → restart. Rebuild cost measured: 10.4 minutes for 1.54M
-documents (206 s per 385K-document shard, ~1,850 docs/s).
+move the old directory aside → build → restart. Rebuild cost measured: 12.1 minutes for 1.56M documents (206 s per 385K-document shard,
+~1,870 docs/s).
 
 ### 5.2 Tantivy fields (frozen)
 
@@ -132,6 +132,14 @@ documents (206 s per 385K-document shard, ~1,850 docs/s).
 
 Deliberately absent: `body`, `body_boost`, anchors, link targets, full URL lists, concept names.
 A posting list never carries a URL string or article text — it carries ids and quantised weights.
+
+**Rebuild fidelity.** Extracted text can rebuild the excerpt, the vectors and the concept tags; it
+cannot rebuild `headings` or `entities`, which the parser and organising model produce while the page
+is in hand. They are therefore persisted at ingest in `document_derived(docver_id, headings,
+entities)` (migration 0009, same commit as the document) and read back by `agent0 index build`.
+Without that row the IM-3 rebuild emptied both fields — measured on 1.56M documents, which is why the
+table exists. Excerpts are deliberately *not* stored there: they are a pure function of the text and
+a copy could drift from it.
 
 ### 5.3 Size, measured after the IM-3 rebuild
 
@@ -159,8 +167,8 @@ design is that every one of them is far below 1%.
 
 | Property | Value |
 | --- | --- |
-| Shape | 1,392,740 documents × 4,096 features |
-| Non-zeros | **22,201,352** (15.9 per document) |
+| Shape | 1,387,584 documents × 4,096 features |
+| Non-zeros | **22,201,352** (16.0 per document) |
 | Density | 0.39% |
 | Producer | `agent0 features build` (encoder `z = TopK(ReLU(W e_d + b))`, 16 active, tied decoder) |
 | Consumers | feature rerank (candidate features without a postings scan), update/retraction |
@@ -173,8 +181,8 @@ plus a per-document id table. 8-bit quantised activation, as the design requires
 
 | Property | Value |
 | --- | --- |
-| Shape | 4,096 features × 1.39M documents, sparse |
-| Size | 185 MB across 5 roots (13.5 MB primary, 40/49/51/26 MB shards) |
+| Shape | 4,096 features × 1,387,584 documents, sparse |
+| Size | 180 MB across 5 roots (13.5 MB primary, 40/49/51/26 MB shards) |
 | Score | `Σ_f q_f · z_df · idf_f`, `q = TopK(ReLU(W e_q + b))` |
 | Query side | same encoder, so query and document features share a vocabulary by construction |
 | Measured behaviour | lane recall@100 is the instrument (`features probe`); fusion weight 0.0 (§8.3) |
@@ -186,8 +194,8 @@ model_version)`.
 
 | Property | Value |
 | --- | --- |
-| Rows | **885,364** over 1,557,504 documents and 15 concepts |
-| Coverage | 56.8% of documents carry at least one association |
+| Rows | **885,364** over 506,363 distinct documents and 15 concepts |
+| Coverage | **32.5%** of documents carry at least one association (1.75 concepts each, on average) |
 | Producer | `agent0 concepts build` — deterministic lexicon tagging at 749–802 docs/s per shard |
 | Consumers | `ConceptLane`, `FederatedConceptLane`; source profiles (not yet built) |
 | Kind | `direct` (the page states it) vs `inferred` (through `concept_relation`) |
@@ -376,9 +384,10 @@ Honest, by layer. "Partial" means it exists for some roots or some paths only.
 | --- | --- | --- |
 | Identity, migration ledger, watermark, tombstones | **done** | 8 migrations on all roots |
 | Excerpt-only index (IM-3) | **done**, all 5 roots | 1,557,504 docs, 1.71 GB |
+| Rebuild fidelity (`document_derived`) | **done**, migration 9 on all roots | new ingests persist headings/entities; pre-existing documents stay empty until re-crawled |
 | `/read` resolution incl. federation | **done** | live 15,375-char read of a shard doc |
-| Dense vectors | **done**, 1.39M docs | 2.16 GB across 5 roots |
-| Feature encoder + postings + forward index | **done**, weight 0.0 | 22.2M rows, 185 MB postings |
+| Dense vectors | **done**, 1.39M docs | 2.14 GB across 5 roots |
+| Feature encoder + postings + forward index | **done**, weight 0.0 | 22.2M rows, 180 MB postings |
 | Concept matrix M3/M4 | **done**, weight 0.0 | 885,364 / 1,892,440 rows, 15 concepts |
 | Concept vocabulary breadth | **weak** | 15 concepts over 1.56M docs; a lexicon, not a taxonomy |
 | Concept graph M5 | **absent** | 0 rows |
@@ -409,7 +418,7 @@ systemctl restart search-api && curl -s http://127.0.0.1:8090/health
 
 `scripts/rebuild-fleet-index.sh` under `systemd-run` (a plain tool-call process is OOM-killed at
 ~4 GB). It stops the crawlers and the API, moves each `tantivy/` to `tantivy.fulltext-<ts>`, rebuilds
-from metadata + text, restarts both. Measured 10.4 min for the fleet.
+from metadata + text, restarts both. Measured 12.1 min for the fleet.
 
 ### 13.3 Measurement hygiene
 

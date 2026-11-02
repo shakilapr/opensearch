@@ -73,8 +73,24 @@ reads `text/<hash>.txt` (resolving both `docver_id` and `resource_id`, across ev
 | Indexed documents | 1.54M | 1,557,504 (0 missing text) |
 | Legacy `/search` p50 / p95 at 1.56M docs | 71–92 ms at 19K docs | **35 / 97 ms** |
 
-Rebuild cost: 10.4 min for 1.54M documents (~1,850 docs/s per shard). `text/` (17.9 GB) is still on
+Rebuild cost: 12.1 min for 1.56M documents (~1,850 docs/s per shard). `text/` (18.2 GB) is still on
 disk and is still the ingest source; deleting it is the separate gated step in PLAN-v2 Phase 2.
+
+### The rebuild exposed what the index model assumes
+
+A rebuild reads metadata + `text/`, so it can reproduce the excerpt, the vectors and the concept tags
+— but **not** `headings` and `entities`, which the parser and organising model produced at ingest and
+which existed only in the `IndexDoc`. The IM-3 rebuild therefore replaced both fields with empty
+strings across 1.56M documents: the fields boosted 2.0 and 3.0 were silently gone.
+
+Fixed in migration 0009 (`document_derived`), written in the same commit as the document and read by
+`agent0 index build`. Applied to all five roots (8 → 9). Verified live: new ingests write rows with
+content within a minute of the restart (shard-0 15, shard-2 56 and rising).
+
+Honest limitation: the 1.56M documents already crawled have no `document_derived` row and cannot
+recover their headings without a re-crawl (the old raw HTML was not retained). Their entities could be
+recovered from the pre-rebuild index's STORED `entities` field, and headings cannot. The ranking
+effect is unquantified; the 600-query set is title-derived and does not isolate it.
 
 ## Phase D — learned sparse features ✅ built, measured, weight 0.0
 
