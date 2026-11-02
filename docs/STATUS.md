@@ -9,7 +9,7 @@ Updated 2026-11-02. Every number is from this host; the commands that produced t
 
 | Fact | Value |
 | --- | --- |
-| Indexed documents | 1,592,836 (5 roots federated) |
+| Indexed documents | 1,593,844 (5 roots federated; `index audit` ratio ≥0.998 per shard) |
 | Resources in metadata | 1,595,771 |
 | Index size, all roots | 1.75 GB (1.10 KB/doc) |
 | Extracted text on disk | 18.2 GB (the ingest source; not deleted) |
@@ -47,7 +47,7 @@ Concept-first ranking (corpus-derived relatedness graph, `agent0 concepts relate
 | Set | Ranking | nDCG@10 | recall@10 |
 | --- | --- | --- | --- |
 | 600 corpus-derived | BM25 | 0.2112 | 0.4200 |
-| 600 corpus-derived | concept-only | _pending_ | _pending_ |
+| 600 corpus-derived | concept-only | 0.1328 | 0.2567 |
 | cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 |
 | cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** |
 
@@ -79,6 +79,7 @@ Routing and rerank (built, measured, off):
 | Defect | Effect | Fix |
 | --- | --- | --- |
 | Rebuild used `docver_id` as `doc_id` | index identities became `res_x:1` while the crawler writes `res_x`; graded labels (resource ids) matched nothing, nDCG read **0.0**, `/read` 404'd | `indexbuild` writes `resource_id`; rebuild re-run |
+| A rebuilt index had no manifest | `/health` reported generation 0 = `index_unpublished` for 1.59M documents | `Pipeline::publish_index`, called by `index build`, exposed as `agent0 index publish` |
 | `/read` compared only `resource_id` | 404 for every id `/search` returned | accepts either id, prefers the exact version |
 | `/read` used the primary metadata only | a federated result was never found | deep searcher consults every served root |
 | Schema change without rebuild | every index unopenable (the earlier revert) | schema + rebuild are one scripted operation |
@@ -148,7 +149,7 @@ Ordered by what unblocks what. Task detail in `docs/WORK-QUEUE.md`.
 | --- | --- | --- | --- |
 | O1 | systemd drop-ins | 5 additive files (`answer`, `federate`, `fusion`, `planner`, `search-llm`), order-dependent | 2 h |
 | O2 | boot-time env audit | absent; the boot log does not state the effective `FusionPolicy` | (= O1) |
-| O3 | `agent0 index audit` | absent (R2 done by hand) | 3 h |
+| O3 | `agent0 index audit` | **done** (2026-11-02) — prints index vs expected per root, exits non-zero below 95% | — |
 | O4 | `agent0 matrix report` | absent (every number here was a one-off script) | 4 h |
 | O5 | rebuild drill + runbook | script exists, drill not executed with rollback | 3 h |
 | O6 | rollback storage | 8 × `tantivy.fulltext-<ts>` = 19,647 MB | 1 h |

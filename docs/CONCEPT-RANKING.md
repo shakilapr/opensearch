@@ -124,14 +124,17 @@ Measured 2026-11-02, federated over five roots, crawlers active (so latencies ar
 | Set | Ranking | nDCG@10 | recall@10 | MRR |
 | --- | --- | --- | --- | --- |
 | 600 corpus-derived | BM25 | 0.2112 | 0.4200 | 0.1476 |
-| 600 corpus-derived | concept-only | _pending_ | _pending_ | _pending_ |
+| 600 corpus-derived | concept-only | **0.1328** | 0.2567 | 0.0950 |
 | cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 | 0.0833 |
 | cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** | **0.2500** |
 
 The result that matters: on queries whose words do not appear in the answer, concept-only ranking
-scores **2.6× BM25** and returns twice the relevant documents. On the title-derived set it is expected
-to lose — that set's labels are the document's own words — and the number is reported when it lands
-rather than suppressed.
+scores **2.6× BM25** and returns twice the relevant documents. On the title-derived set it loses
+(0.1328 vs 0.2112) — those labels are the document's own words, and the concept path deliberately does
+not rank on words. It is also faster (p50 135 ms vs 294 ms).
+
+The pair is the argument for a router rather than one global ranker: lexical wins title-shaped
+queries, concepts win conceptual ones, and the query's shape is observable before any ranking.*
 
 ## 6. What would make this the primary ranker
 

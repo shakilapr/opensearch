@@ -84,14 +84,19 @@ describe a contended host, not capacity.
 | Set | Ranking | nDCG@10 | recall@10 | MRR | p50 | p95 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 600 corpus | BM25 | 0.2112 | 0.4200 | 0.1476 | 294 ms | 5,101 ms |
-| 600 corpus | concept-only | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| 600 corpus | concept-only | **0.1328** | 0.2567 | 0.0950 | 135 ms | 4,814 ms |
 | cross-disciplinary (n=6) | BM25 | 0.1052 | 0.1667 | 0.0833 | 2,506 ms | 5,627 ms |
 | cross-disciplinary (n=6) | **concept-only** | **0.2718** | **0.3333** | **0.2500** | 2,031 ms | 4,594 ms |
 
-On the shape the concept layer exists for, concept-only ranking is **2.6× BM25** (0.2718 vs 0.1052)
-and finds twice the documents. On the title-derived corpus set it is expected to lose, because those
-labels are the document's own words — that measurement is pending and will be reported as it lands,
-not tuned away. The cross-disciplinary baseline here (0.1052) differs from the 0.0645 recorded on
+The two sets say opposite things, and both are true. On the shape the concept layer exists for,
+concept-only ranking is **2.6× BM25** (0.2718 vs 0.1052) and finds twice the documents. On the
+title-derived set it **loses** (0.1328 vs 0.2112), because those labels are the document's own words
+and the concept layer deliberately does not rank on words. It is also ~2× faster at p50 (135 ms vs
+294 ms) because it does not scan the lexical index on the ranking path.
+
+That is the honest trade: concepts decide order better exactly where words fail, and worse where the
+query *is* a title. A production default therefore needs a router (title-like query → lexical;
+conceptual query → concepts), which is a later task, not a weight to tune. The cross-disciplinary baseline here (0.1052) differs from the 0.0645 recorded on
 2026-11-01 because the corpus and the index both changed (1.59M documents, rebuilt index, crawlers
 committed more pages); compare within a run, not across days.
 
@@ -136,7 +141,7 @@ Vectors: 2.14 GB (1,387,584 documents). Feature postings: 180 MB.
 | `doc_feature` | 22,201,352 | 1,387,584 | 16.0 features/doc |
 | `doc_concept` | 885,364 | 506,363 | 32.5% of documents |
 | `doc_concept_dim` | 1,892,440 | — | 2.14 dims/association |
-| `concept_relation` | see run | — | `cooccur` edges, top-8/concept |
+| `concept_relation` | 222 | — | `cooccur` edges, top-8/concept, 15 concepts |
 | `source_concept`, `web_link`, `passage` | 0 | — | not built |
 | `graph_edge` | 130,359 | — | primary root only |
 
