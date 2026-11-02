@@ -12,6 +12,7 @@ import numpy as np
 
 from .config import DEFAULT_DB_PATH, DEFAULT_EMBED_CACHE_DIR, MERGE_SIMILARITY_THRESHOLD
 from .decompose import ExtractedConcept
+from .latent import LatentSpaceEngine, EMBED_MODEL_NAME, EMBED_DIM
 
 logger = logging.getLogger("concepts.resolver")
 
@@ -47,55 +48,12 @@ class ConceptResolver:
         self.threshold = threshold
         self.embed_cache_dir = Path(embed_cache_dir)
 
-        # In-memory indices
-        self.alias_to_id: dict[str, str] = {}
-        self.concept_names: dict[str, str] = {}  # concept_id -> canonical name
-        self.concept_ids: list[str] = []
-        self.embeddings_matrix: np.ndarray | None = None
-
-        # FastEmbed model
-        from fastembed import TextEmbedding
-        logger.info("Loading FastEmbed BGE-small model from %s...", self.embed_cache_dir)
-        self.embedder = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=str(self.embed_cache_dir))
-
-        self._load_existing_concepts()
-
-    def _load_existing_concepts(self):
-        """Load all concepts and aliases from SQLite into in-memory lookup and embedding matrix."""
-        con = sqlite3.connect(self.db_path)
-        try:
-            # 1. Load concepts
-            rows = con.execute("SELECT concept_id, name FROM concept WHERE status = 'active'").fetchall()
-            for cid, name in rows:
-                self.concept_names[cid] = name
-                norm = normalize_surface(name)
-                if norm:
-                    self.alias_to_id[norm] = cid
-
-            # 2. Load aliases
-            alias_rows = con.execute("SELECT concept_id, alias FROM concept_alias").fetchall()
-            for cid, alias in alias_rows:
-                norm = normalize_surface(alias)
-                if norm:
-                    self.alias_to_id[norm] = cid
-
-            self.concept_ids = list(self.concept_names.keys())
-            names = [self.concept_names[cid] for cid in self.concept_ids]
-
-            if names:
-                logger.info("Computing embeddings for %d existing concepts...", len(names))
-                raw_embeds = list(self.embedder.embed(names))
-                vecs = [np.array(e, dtype=np.float32) for e in raw_embeds]
-                # Normalize L2
-                norms = [np.linalg.norm(v) for v in vecs]
-                vecs = [v / (norm if norm > 1e-6 else 1.0) for v, norm in zip(vecs, norms)]
-                self.embeddings_matrix = np.vstack(vecs)
-            else:
-                self.embeddings_matrix = np.zeros((0, 384), dtype=np.float32)
-
-            logger.info("ConceptResolver initialized with %d concepts and %d aliases.", len(self.concept_ids), len(self.alias_to_id))
-        finally:
-            con.close()
+        # Delegate persistent vectors and embedding management to LatentSpaceEngine
+        self.latent = LatentSpaceEngine(db_path=self.db_path, embed_cache_dir=self.embed_cache_dir)
+        self.alias_to_id = self.latent.alias_to_id
+        self.concept_names = self.latent.concept_names
+        self.concept_ids = self.latent.concept_ids
+        self.embeddings_matrix = self.latent.embeddings_matrix
 
     def resolve_and_merge(
         self,
@@ -134,7 +92,7 @@ class ConceptResolver:
 
         # Step 2: Vector resolution for non-exact matches
         if candidates_to_embed:
-            cand_embeds = list(self.embedder.embed(candidates_to_embed))
+            cand_embeds = list(self.latent.embedder.embed(candidates_to_embed))
             cand_vecs = [np.array(e, dtype=np.float32) for e in cand_embeds]
             # Normalize
             for i, v in enumerate(cand_vecs):
@@ -172,12 +130,14 @@ class ConceptResolver:
                     self.concept_names[cid] = item.name
                     self.alias_to_id[norm] = cid
                     self.concept_ids.append(cid)
+                    self.latent.cid_to_row_idx[cid] = len(self.concept_ids) - 1
 
                     # Append to embedding matrix
                     if self.embeddings_matrix is None or len(self.embeddings_matrix) == 0:
                         self.embeddings_matrix = vec.reshape(1, -1)
                     else:
                         self.embeddings_matrix = np.vstack([self.embeddings_matrix, vec])
+                    self.latent.embeddings_matrix = self.embeddings_matrix
 
                     resolved_items.append(ResolveResult(cid, item.name, item.weight, True, False, best_sim))
                     doc_associations.append((resource_id, cid, item.weight, "direct", item.evidence, now, now))
@@ -188,8 +148,8 @@ class ConceptResolver:
             try:
                 con.execute("BEGIN TRANSACTION")
 
-                # Insert novel concepts
-                for cid, name, kind, _, _ in pending_novel:
+                # Insert novel concepts and persistent vectors
+                for cid, name, kind, vec, _ in pending_novel:
                     con.execute(
                         """
                         INSERT OR IGNORE INTO concept (concept_id, name, description, kind, status, created_at, updated_at)
@@ -200,6 +160,13 @@ class ConceptResolver:
                     con.execute(
                         "INSERT OR IGNORE INTO concept_alias (concept_id, alias, lang, created_at) VALUES (?, ?, 'en', ?)",
                         (cid, name, now)
+                    )
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO concept_embedding (concept_id, vector, dim, model, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (cid, vec.tobytes(), EMBED_DIM, EMBED_MODEL_NAME, now)
                     )
 
                 # Insert merged aliases
@@ -221,6 +188,25 @@ class ConceptResolver:
                     """,
                     [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in doc_associations]
                 )
+
+                # Compute document barycenter in latent space and persist to doc_embedding
+                doc_vec = np.zeros(EMBED_DIM, dtype=np.float32)
+                for item_res, cid, w, _, _, _, _ in doc_associations:
+                    v = self.latent.get_concept_vector(cid)
+                    if v is not None:
+                        doc_vec += w * v
+                norm = np.linalg.norm(doc_vec)
+                if norm > 1e-6:
+                    doc_norm_vec = doc_vec / norm
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO doc_embedding (resource_id, vector, dim, model, concept_count, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (resource_id, doc_norm_vec.tobytes(), EMBED_DIM, EMBED_MODEL_NAME, len(doc_associations), now)
+                    )
+
+                con.commit()
 
                 con.commit()
             except Exception as e:
