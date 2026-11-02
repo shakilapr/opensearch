@@ -2413,6 +2413,25 @@ impl Pipeline {
                 modified_at: doc.modified_at,
                 fetched_at: now,
             },
+            // Headings and entities are the two index fields that extracted text cannot reproduce,
+            // and the index no longer stores the article. Without this row a rebuild replaces them
+            // with empty strings and loses their 2.0/3.0 boosts (measured 2026-11-01: the IM-3
+            // rebuild did exactly that). Same batch, so the cost is one statement in a commit the
+            // document already pays.
+            Mutation::UpsertDocumentDerived {
+                docver_id: docver_id.as_str().to_string(),
+                headings: if doc.headings.is_empty() {
+                    None
+                } else {
+                    Some(doc.headings.join(" \n "))
+                },
+                entities: if doc.entities.is_empty() {
+                    None
+                } else {
+                    Some(doc.entities.join(", "))
+                },
+                at: now,
+            },
         ])?;
         Ok(())
     }

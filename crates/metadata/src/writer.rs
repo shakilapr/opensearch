@@ -150,6 +150,19 @@ pub enum Mutation {
         modified_at: Option<i64>,
         fetched_at: i64,
     },
+    /// Record the ingest-time fields that extracted text cannot reproduce (migration 0009).
+    ///
+    /// `headings` and `entities` are produced by the parser/organising model while the page is in
+    /// hand; after the raw HTML is gone they exist nowhere else, so a rebuild that reads only
+    /// `text/<hash>.txt` would silently drop the two boost-bearing fields. Upsert rather than
+    /// insert: a re-ingest of the same version may improve the extraction, and the latest write is
+    /// the one the index should be built from.
+    UpsertDocumentDerived {
+        docver_id: String,
+        headings: Option<String>,
+        entities: Option<String>,
+        at: i64,
+    },
     /// Publish a manifest row (idempotent on `manifest_id`). A re-publish of
     /// the same generation is a no-op, so the read-side projection is stable.
     UpsertManifest {
@@ -1239,6 +1252,23 @@ fn apply_one(tx: &rusqlite::Transaction<'_>, m: &Mutation) -> AppResult<()> {
                     fetched_at,
                     now
                 ],
+            )
+            .map_err(crate::db_err)?;
+        }
+        Mutation::UpsertDocumentDerived {
+            docver_id,
+            headings,
+            entities,
+            at,
+        } => {
+            tx.execute(
+                "INSERT INTO document_derived(docver_id, headings, entities, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(docver_id) DO UPDATE SET
+                     headings   = excluded.headings,
+                     entities   = excluded.entities,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![docver_id, headings, entities, at],
             )
             .map_err(crate::db_err)?;
         }

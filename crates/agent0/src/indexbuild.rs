@@ -42,6 +42,9 @@ struct Pending {
     text_path: String,
     published_at: Option<i64>,
     fetched_at: i64,
+    /// From `document_derived`: the ingest-time fields that the extracted text cannot reproduce.
+    headings: String,
+    entities: Vec<String>,
 }
 
 fn flag_usize(args: &[String], flag: &str) -> Option<usize> {
@@ -70,10 +73,12 @@ fn pending_docs_page(reader: &MetadataReader, after: &str, limit: usize) -> AppR
             // times in a rebuilt index. Search dedupes by `doc_id`, so those were five *different*
             // ids for one page — duplicate results, not versions of one result.
             "SELECT dv.docver_id, dv.resource_id, dv.content_id, r.canonical_url, dv.title,
-                    c.text_path, dv.published_at, dv.fetched_at
+                    c.text_path, dv.published_at, dv.fetched_at,
+                    COALESCE(dd.headings, ''), COALESCE(dd.entities, '')
                FROM document_version dv
                JOIN resource r ON r.resource_id = dv.resource_id
                JOIN content  c ON c.content_id = dv.content_id
+               LEFT JOIN document_derived dd ON dd.docver_id = dv.docver_id
               WHERE c.text_path IS NOT NULL
                 AND dv.docver_id > ?1
                 AND dv.version_no = (
@@ -94,6 +99,15 @@ fn pending_docs_page(reader: &MetadataReader, after: &str, limit: usize) -> AppR
                 text_path: r.get(5)?,
                 published_at: r.get(6)?,
                 fetched_at: r.get(7)?,
+                headings: r.get(8)?,
+                // Comma-joined by `UpsertDocumentDerived`, matching the index field's encoding.
+                entities: r
+                    .get::<_, String>(9)?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
             })
         })
         .map_err(search_metadata::db_err)?
@@ -165,11 +179,11 @@ async fn build_root(cfg: &Config, batch: usize, limit: usize) -> AppResult<Repor
                 content_id: Some(p.content_id),
                 url: p.url,
                 title: p.title,
-                headings: String::new(),
+                headings: p.headings,
                 // Derived from `body` by `to_tantivy`; the index keeps the excerpt, not the text.
                 excerpt: String::new(),
                 body,
-                entities: Vec::new(),
+                entities: p.entities,
                 source_id: None,
                 doc_type: "html".to_string(),
                 language: "en".to_string(),

@@ -31,7 +31,7 @@ fn count(conn: &rusqlite::Connection, table: &str) -> i64 {
 /// ledger is exactly [1, 2, 3, 4, 5, 6]; SCHEMA_VERSION is 6.
 #[test]
 fn migrations_idempotent_and_ledger_is_1_2_3() {
-    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 8);
+    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 9);
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta.db");
     let conn = search_metadata::writer::open(&path).unwrap();

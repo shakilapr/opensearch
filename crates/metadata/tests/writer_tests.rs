@@ -105,6 +105,7 @@ fn migrations_create_watermark_and_all_expected_tables() {
         "doc_concept",
         "doc_concept_dim",
         "doc_feature",
+        "document_derived",
         "document_version",
         "domain",
         "entity",
@@ -599,4 +600,73 @@ fn a_non_busy_error_is_returned_immediately() {
         "a non-busy error must not be retried ({:?})",
         started.elapsed()
     );
+}
+
+/// Migration 0009: the ingest-time fields that a rebuild cannot recompute are persisted, and a
+/// re-ingest of the same version updates them instead of leaving the first extraction forever.
+///
+/// This is what stops the IM-3 rebuild from silently emptying `headings` and `entities`, which are
+/// boosted 2.0/3.0 in the lexical index and exist nowhere else once the raw HTML is gone.
+#[test]
+fn document_derived_round_trips_and_upserts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta.db");
+    {
+        let mut w = MetadataWriter::from_path(&path).unwrap();
+        w.apply_batch(&[
+            domain("d"),
+            resource("r1", "d"),
+            Mutation::UpsertContent {
+                content_id: "cnt_1".into(),
+                exact_hash: "1".into(),
+                text_path: Some("/tmp/1.txt".into()),
+                byte_len: 10,
+            },
+            Mutation::UpsertDocumentVersion {
+                docver_id: "dv1".into(),
+                resource_id: "r1".into(),
+                version_no: 1,
+                content_id: Some("cnt_1".into()),
+                title: Some("t".into()),
+                body_hash: None,
+                parser_version: "1".into(),
+                published_at: None,
+                modified_at: None,
+                fetched_at: 1,
+            },
+            Mutation::UpsertDocumentDerived {
+                docver_id: "dv1".into(),
+                headings: Some("Intro \n Method".into()),
+                entities: Some("paged attention, transformers".into()),
+                at: 1,
+            },
+        ])
+        .unwrap();
+
+        // A re-ingest with better extraction replaces the row rather than adding a second one.
+        w.apply_batch(&[Mutation::UpsertDocumentDerived {
+            docver_id: "dv1".into(),
+            headings: Some("Intro \n Method \n Results".into()),
+            entities: Some("transformers".into()),
+            at: 2,
+        }])
+        .unwrap();
+    }
+
+    let r = MetadataReader::from_path(&path).unwrap();
+    let (headings, entities): (String, String) = r
+        .conn()
+        .query_row(
+            "SELECT headings, entities FROM document_derived WHERE docver_id = 'dv1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(headings, "Intro \n Method \n Results");
+    assert_eq!(entities, "transformers");
+    let rows: i64 = r
+        .conn()
+        .query_row("SELECT COUNT(*) FROM document_derived", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "one row per document version, updated in place");
 }

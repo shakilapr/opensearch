@@ -21,7 +21,7 @@ fn resource(rid: &str) -> Mutation {
 /// The runner applies 0001..0006 in order on a fresh DB; SCHEMA_VERSION is 6.
 #[test]
 fn migration_runner_applies_0001_through_0004_in_order() {
-    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 8);
+    assert_eq!(search_metadata::migrations::SCHEMA_VERSION, 9);
 
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta.db");
