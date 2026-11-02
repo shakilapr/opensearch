@@ -99,7 +99,7 @@ Ordered by what unblocks what. Task detail in `docs/WORK-QUEUE.md`.
 | R1 | Headings/entities backfill | 6,390 of 1,595,771 documents have a `document_derived` row (0.4%) — only documents ingested after migration 9 | the two fields boosted 2.0/3.0 are empty for 99.6% of the corpus; the ranking effect is unmeasured because the graded set is title-derived | 6 h |
 | R2 | Index vs metadata gap | index 1,592,836 / metadata 1,595,771 (−2,935) | either textless rows or un-indexed documents; checked by hand today | 3 h |
 | R3 | Weight-0 lanes still execute | `source_first` appears in `lane_ranks` despite weight 0.0; concept costs ~1.5 s/query across 5 shards | a lane that cannot change a result should not be called | 2 h |
-| R4 | `/read` fallback is silent | a missing text file returns the 500-char excerpt with no signal | a degraded read must be visible, not only documented | 1 h |
+| R4 | `/read` fallback was silent | now logged (`doc_text: source text absent, returning the indexed excerpt`) with doc id and length; the API still has no `source` field, so a client cannot see the degradation | surface it as `source: text|excerpt` in `DocResponse` | 1 h |
 
 ### 4.2 Matrices still empty or too thin
 

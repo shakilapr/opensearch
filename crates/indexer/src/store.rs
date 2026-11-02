@@ -786,7 +786,17 @@ impl Indexer {
                     }
                 }
             }
-            return Ok(Some(text(self.fields.excerpt)));
+            // Degraded read: the source file is gone (or was never written), so the caller gets the
+            // excerpt. It is real document text, but it is not the document — say so in the log,
+            // because an answer path that silently receives 500 characters cannot tell the
+            // difference and the caller's truncation looks like the whole page.
+            let excerpt = text(self.fields.excerpt);
+            tracing::debug!(
+                doc_id,
+                chars = excerpt.chars().count(),
+                "doc_text: source text absent, returning the indexed excerpt"
+            );
+            return Ok(Some(excerpt));
         }
         Ok(None)
     }
